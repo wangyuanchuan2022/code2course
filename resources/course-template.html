@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<!-- ===================================================================
+  code2course · course-template.html — 课程骨架模板
+  -------------------------------------------------------------------
+  用法：复制本文件为起点，替换所有 {{占位符}}。
+  <style> 内联 resources/base.css 全文；
+  <script> 内联 resources/app.js 全文（放在 </body> 前）。
+  本模板展示所有组件的占位骨架，不需要的整块删掉即可。
+  ⚠️ 铁律：最终交付文件中不得残留任何 {{占位符}} 或本注释块。
+  ⚠️ 转义铁律（v1.11）：代码逐字复制进 <code> 前必须做 HTML 实体转义
+  （& → &amp;、< → &lt;、> → &gt;；属性值内 " → &quot;）——转义后的
+  DOM 文本与源文件逐字一致才算合规（workflow.md §4）。
+  ⚠️ <head> 的 CSP meta 把"零外链"升级为浏览器强制，保留勿删。
+  v1.9：探照灯 / 洋葱 / 赌注 / 栈塔 / 沙盘 五类参与式控件就位；
+  群聊 / 架构图悬停 / 术语气泡 / donut / 卡片 3D 倾斜已移除。
+  v1.11：.viz-stage/.flow-svg 容器改 role="group"（可交互子元素须留在
+  无障碍树内）；赌注揭晓用独立类 is-spot-bet；新增 --on-accent 与
+  --code-hot-fg 对比度 token。
+  @version 1.11.0
+=================================================================== -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <!-- CSP：把"零外链"从作者纪律升级为浏览器强制（内联样式/脚本是本设计刚需，
+       故 style-src/script-src 用 'unsafe-inline'；connect-src 'none' 封死一切外呼） -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; base-uri 'none'; form-action 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data: blob:; connect-src 'none'">
+  <title>{{课程名}} · 交互式代码课</title>
+  <!-- 防 flash + 防滚动恢复：在 head 内先行执行。
+       注意：resources/app.js 也可整体放在 head（加 defer 语义需自行保证
+       DOM 已就绪——模板默认放在 </body> 前，其滚动复位逻辑同样有效；
+       若你把它移到 head，请保持本注释块中的手动 scrollRestoration 脚本）。 -->
+  <script>
+    /* 主题：手动选择优先于系统，避免闪白 */
+    try {
+      var t = localStorage.getItem('c2c-theme');
+      if (t === 'dark' || t === 'light') document.documentElement.dataset.theme = t;
+    } catch (e) {}
+    /* 打开时停在第一页：禁用浏览器滚动恢复 + 清除锚点 + 回顶 */
+    if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
+    if (location.hash) history.replaceState(null, '', location.pathname + location.search);
+    window.scrollTo(0, 0);
+  </script>
+  <style>
+    /* >>> 在此粘贴 resources/base.css 全文 <<< */
+    /* 课程特有样式追加在下方（尽量少） */
+  </style>
+</head>
+<body>
+  <button class="theme-toggle" type="button" aria-label="切换夜间模式">🌙</button>
+
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">📦 {{课程名}}</div>
+      <nav class="module-nav">
+        <a class="nav-item" href="#m0">0 · 封面</a>
+        <a class="nav-item" href="#m1">1 · {{模块名}}</a>
+        <a class="nav-item" href="#m2">2 · {{模块名}}</a>
+        <!-- 与 .module 一一对应 -->
+      </nav>
+      <div class="progress-track"><div class="progress-fill"></div></div>
+      <div class="progress-label"><span id="prog-text">模块 1 / N</span> · 用 ←/→ 键翻页</div>
+    </aside>
+
+    <main class="content">
+
+      <!-- ============ 模块 0：封面（元信息五件套：标题/简介/技术栈标签/目录职责导览图/开始按钮） ============ -->
+      <section class="module hero" id="m0">
+        <div class="hero-stage">
+          <div class="hero-glow" aria-hidden="true"></div>
+          <h1 class="t-hero">{{课程名}}</h1>
+          <p class="t-body hero-sub">{{一句话简介：这门课带你追一次真实点击，看懂 {{项目名}} 如何工作}}</p>
+          <div class="tp-head" style="margin-top: var(--space-3);">
+            <!-- 技术栈标签：每个 .t-tag 一个，来自第 1 步侦察结论 -->
+            <span class="t-tag">{{React}}</span>
+            <span class="t-tag">{{Node}}</span>
+            <span class="t-tag">{{PostgreSQL}}</span>
+          </div>
+          <p style="margin-top: var(--space-4);">
+            <a class="btn-start" href="#m1">开始学习 <span aria-hidden="true">↓</span></a>
+          </p>
+        </div>
+
+        <!-- 目录结构导览图（封面必备，bars 引擎渲染；不需要可整块删）
+             每个目录一栏：value = 文件数（真实清点），note = 一句话职责，
+             anchor = 数字出处。完整契约见 interactive-elements.md §10a -->
+        <div class="viz-scene scene" data-kind="bars">
+          <div class="viz-title t-h3">🗺️ {{项目名}} 的目录地图（悬停/点击看职责）</div>
+          <script type="application/json" class="viz-data">
+          {
+            "unit": "个文件",
+            "items": [
+              { "label": "{{src/}}", "value": {{真实数字}}, "note": "{{一句话职责}}", "anchor": "清点自仓库目录结构" },
+              { "label": "{{server/}}", "value": {{真实数字}}, "note": "{{一句话职责}}", "anchor": "清点自仓库目录结构" },
+              { "label": "{{tests/}}", "value": {{真实数字}}, "note": "{{一句话职责}}", "anchor": "清点自仓库目录结构" }
+            ]
+          }
+          </script>
+          <div class="viz-stage" role="group" aria-label="{{项目名}} 各目录文件数与职责"></div>
+          <div class="viz-detail t-muted" hidden></div>
+        </div>
+      </section>
+
+      <!-- ============ 模块 1（示例：完整模块骨架） ============ -->
+      <section class="module" id="m1">
+        <header>
+          <h2 class="t-h1">1 · {{模块标题}}</h2>
+          <p class="t-body">{{导语 ≤2 句，从一个真实用户操作切入}}</p>
+        </header>
+
+        <!-- 主视觉 A：执行探照灯（跨文件同步走读，部署在事件链/调用链内容处）
+             宿主是数据流动画：加 .spotlight 类 + .spot-wrap + .spot-lamp + .spot-caption，
+             站点用 data-sp-pair/data-sp-line/data-sp-file 映射到翻译块代码行。
+             完整契约见 interactive-elements.md §3；不需要探照灯就去掉这些
+             附加物，保留普通 .flow-scene -->
+        <div class="flow-scene scene spotlight">
+          <div class="spot-wrap">
+          <svg class="flow-svg" viewBox="0 0 720 140" width="100%" role="group"
+               aria-label="{{流程名}}（可拖动探照灯跨文件走读）">
+            <g class="flow-node" data-step="0"
+               data-sp-pair="{{pair-m1-a}}" data-sp-line="{{0}}" data-sp-file="{{文件 · L起-L止}}">
+              <circle cx="60" cy="70" r="26"/>
+              <text x="60" y="112" text-anchor="middle">🖱️ {{站点}}</text></g>
+            <g class="flow-node" data-step="1"
+               data-sp-pair="{{pair-m1-a}},{{pair-m1-b}}" data-sp-line="{{1}},{{0}}"
+               data-sp-file="{{文件A · L起-L止}} / {{文件B · L起-L止}}">
+              <circle cx="280" cy="70" r="26"/>
+              <text x="280" y="112" text-anchor="middle">⚙️ {{站点}}</text></g>
+            <g class="flow-node" data-step="2"
+               data-sp-pair="{{pair-m1-b}}" data-sp-line="{{1}}" data-sp-file="{{文件B · L起-L止}}">
+              <circle cx="520" cy="70" r="26"/>
+              <text x="520" y="112" text-anchor="middle">🗄️ {{站点}}</text></g>
+            <path class="flow-path" d="M86,70 L254,70"/>
+            <path class="flow-path" d="M306,70 L494,70"/>
+            <circle class="flow-dot" r="7"/>
+            <text class="flow-label" data-step="0" x="60" y="24" text-anchor="middle">{{数据形态}}</text>
+            <text class="flow-label" data-step="1" x="280" y="24" text-anchor="middle">{{变形后}}</text>
+            <text class="flow-label" data-step="2" x="520" y="24" text-anchor="middle">{{最终形态}}</text>
+          </svg>
+          <button class="spot-lamp" type="button" role="slider"
+                  aria-label="执行探照灯：用左右方向键逐站移动，点亮对应文件里的真实代码行"
+                  aria-orientation="horizontal" aria-valuemin="0" aria-valuemax="{{站点数}}"
+                  aria-valuenow="0" aria-valuetext="未点亮">🔦</button>
+          </div>
+          <div class="flow-caption t-muted">▶ 点击站点，看数据如何一步步变形</div>
+          <div class="spot-caption t-muted" aria-live="polite">🔦 拖动探照灯（或聚焦后按 ←/→）：扫过哪个站点，对应翻译块里的真实代码行就跨文件同时点亮</div>
+        </div>
+
+        <!-- 代码 ↔ 大白话对照（带 id，供探照灯 data-sp-pair / 赌注 data-bet-pair 引用） -->
+        <div class="translate-pair" id="{{pair-m1-a}}" data-file="{{路径 · 行号}}">
+          <div class="tp-head">
+            <span class="t-tag">📄 真实代码</span>
+            <span class="t-muted tp-file">{{文件路径 · L起-L止}}</span>
+          </div>
+          <div class="tp-body">
+            <div class="tp-code t-code">
+              <!-- 逐字复制 + 实体转义（& < >），渲染后 DOM 文本与源一致 -->
+              <pre class="tp-line" data-i="0"><code>{{逐字复制的代码段 1，已转义}}</code></pre>
+              <pre class="tp-line" data-i="1"><code>{{逐字复制的代码段 2，已转义}}</code></pre>
+            </div>
+            <div class="tp-plain">
+              <div class="tp-note t-body" data-i="0">{{大白话 1，1–2 句}}</div>
+              <div class="tp-note t-body" data-i="1">{{大白话 2}}</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 因果赌注（预测式探针，部署在错误边界/关键转折处、答案代码亮出之前）
+             复用 .quiz-opt 样式但用 data-bet-* 属性；data-bet-pair 指向下方要揭晓的翻译块。
+             完整契约见 interactive-elements.md §6 -->
+        <div class="bet-scene scene" data-bet-pair="{{pair-m1-b}}">
+          <div class="bet-title t-h3">🎯 {{下注场景，如：这个异常会怎么收场？先押一注}}</div>
+          <div class="quiz-opts bet-opts" aria-label="押注：{{这一注的问题}}">
+            <button class="quiz-opt" type="button" data-bet-correct="false"
+                    data-bet-why="{{押错的解释：指向真实代码依据}}">A. {{预测项}}</button>
+            <button class="quiz-opt" type="button" data-bet-correct="true"
+                    data-bet-why="{{押中的解释：依据 xxx.js L@@}}">B. {{预测项}}</button>
+            <button class="quiz-opt" type="button" data-bet-correct="false"
+                    data-bet-why="{{解释}}">C. {{预测项}}</button>
+          </div>
+          <div class="bet-actions">
+            <button class="viz-btn bet-run" type="button" disabled>▶ 运行揭晓</button>
+          </div>
+          <div class="quiz-fb t-body bet-fb" hidden></div>
+        </div>
+
+        <!-- 赌注揭晓的目标翻译块（揭晓时全部代码行点亮） -->
+        <div class="translate-pair" id="{{pair-m1-b}}" data-file="{{路径 · 行号}}">
+          <div class="tp-head">
+            <span class="t-tag">📄 真实代码</span>
+            <span class="t-muted tp-file">{{文件路径 · L起-L止}}</span>
+          </div>
+          <div class="tp-body">
+            <div class="tp-code t-code">
+              <pre class="tp-line" data-i="0"><code>{{逐字复制的代码段 1，已转义}}</code></pre>
+            </div>
+            <div class="tp-plain">
+              <div class="tp-note t-body" data-i="0">{{大白话，1–2 句}}</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 项目数据可视化（可选，真实数据驱动，三种类型：bars / timeline / steps。
+             完整模板与契约见 references/interactive-elements.md §10；不需要的整块删掉。
+             数字必须来自仓库真实统计/代码常量，并写进 anchor 标注出处，禁止编造） -->
+        <div class="viz-scene scene" data-kind="timeline">
+          <div class="viz-title t-h3">🕐 {{图表标题，如：一次请求的各环节先后}}</div>
+          <script type="application/json" class="viz-data">
+          {
+            "unit": "{{单位，如：ms}}",
+            "events": [
+              { "t": 0, "dur": 20, "label": "{{环节}}", "who": "{{文件}}", "fn": "{{函数}}", "note": "{{做了什么}}", "anchor": "{{数字出处}}" },
+              { "t": 20, "dur": 45, "label": "{{环节}}", "who": "{{文件}}", "fn": "{{函数}}", "note": "{{做了什么}}", "anchor": "{{数字出处}}" }
+            ]
+          }
+          </script>
+          <div class="viz-stage" role="group" aria-label="{{图表标题}}"></div>
+          <div class="viz-detail t-muted" hidden></div>
+        </div>
+
+        <!-- 应用型测验（模块收尾的总结性检查；与 §6 赌注分工不同，勿互相替代） -->
+        <div class="quiz" data-quiz="m1-q1">
+          <div class="quiz-q t-h3">🧪 {{应用型问题}}</div>
+          <div class="quiz-opts">
+            <button class="quiz-opt" type="button" data-correct="false"
+                    data-why="{{为什么不是这里，正确思路指向哪}}">A. {{选项}}</button>
+            <button class="quiz-opt" type="button" data-correct="true"
+                    data-why="{{依据 xxx.js 哪段代码}}">B. {{选项}}</button>
+            <button class="quiz-opt" type="button" data-correct="false"
+                    data-why="{{解释}}">C. {{选项}}</button>
+          </div>
+          <div class="quiz-fb t-body" hidden></div>
+        </div>
+      </section>
+
+      <!-- ============ 模块 2…N：复制上面的模块骨架 ============
+           其余参与式控件按内容语义就近部署（模板见 interactive-elements.md）：
+
+           · 🧅 洋葱剥层（§4）—— 数据变形链（3b）：JSON 的 layers 从最终形态排到核，
+             剥层掉"碎屑"（被丢弃字段）。块型：<div class="onion-scene scene"> + onion-data JSON。
+           · 🗼 栈塔（§12）—— 递归/回调/中间件链：tower-data JSON 预排 push/pop 脚本，
+             学习者亲手压栈/弹栈。块型：<div class="tower-scene scene"> + tower-data JSON。
+           · 🛤️ 分叉沙盘（§11）—— 分支条件/配置扩展面（3d）：fork-data JSON 预标注
+             参数与分支映射，拖令牌试验不同输入。块型：<div class="fork-scene scene"> + fork-data JSON。
+      -->
+
+      <!-- 多文件模式：册间翻页（底部固定 pager，册间边界按 ←/→ 时 JS 弹非阻断
+           .vol-hint 提示条）。单文件模式整块删除；首册没有上一册时删 prev 链接、
+           末册没有下一册时删 next 链接（留空 href="" 会点击刷新本页）。
+           ⚠️ 可删的是 .scene 级组件；.layout/.sidebar/.module-nav/.progress-track/
+           #prog-text/.theme-toggle 及 .module 的 id 锚点必须保留（脚本契约）。 -->
+      <nav class="pager">
+        <a rel="prev" href="{{上一册文件名.html，如 01-overview.html}}">← 上一册</a>
+        <a rel="index" href="index.html">📖 目录</a>
+        <a rel="next" href="{{下一册文件名.html，如 03-geometry.html}}">下一册 ↓</a>
+      </nav>
+
+    </main>
+  </div>
+
+  <script>
+    /* >>> 在此粘贴 resources/app.js 全文 <<< */
+  </script>
+</body>
+</html>
