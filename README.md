@@ -81,19 +81,19 @@ code2course/
 │   ├── design-system.md              # 设计系统：CSS 变量语义、排版、布局、暗色模式
 │   ├── examples.md                   # 详细使用示例（前端/后端/CLI + 多文件拆分 + 触发边界）
 │   └── audience.md                   # 目标用户画像 + 角色→档位建议
-└── example/
-    └── minesweeper_help_course.html  # 完整成品示例（见下文"快速开始"）
 ```
+
+> 成品示例课程（如基于真实项目生成的单文件课件）属于生成产物，不随本仓库分发——用任意代码库跑一遍执行流程即可得到自己的。
 
 ### 生成时的分工
 
 - **resources/** 是"抄"的：base.css、app.js、骨架模板原样复制内联进每个课程 HTML，只需替换占位符和内容，绝不重写外壳。app.js 内置引擎：主题切换、翻译块悬停联动与复制、懒播放调度（`window.c2cLazyPlay`）、数据流动画、测验（反馈/重试/焦点管理）、进度与键盘导航、data-viz 三类图表引擎，以及探照灯/洋葱/赌注/栈塔/沙盘五个参与式控件引擎
 - **references/** 是"查"的：设计规范与组件结构说明按需加载，仅用于回查规则，不进入成品
 
-### 发布检查项（修改 resources/ 三件套后必做）
+### 发布检查项（修改 resources/ 三件套后必做；在本地工作区进行，example/ 成品与 review/ 辅助脚本均不随仓库分发）
 
-1. 重新生成 `example/minesweeper_help_course.html`（内联新外壳，保持与 resources 逐字一致）
-2. 跑 `python validate_course.py example/minesweeper_help_course.html` 确认机械检查全绿
+1. 在本地工作区重新生成一门成品课件（如 `../example/<name>_course.html`，内联新外壳，保持与 resources 逐字一致）
+2. 跑 `python validate_course.py <成品课件路径>` 确认机械检查全绿
 3. grep 确认成品无 `{{` 残留、无已移除控件标记（如 `.tilt`）
 4. 同步 CHANGELOG.md 版本条目与 SKILL.md frontmatter `version`
 
@@ -119,7 +119,7 @@ code2course/
 
 更多用法示例见 [references/examples.md](references/examples.md)。
 
-**示例课程**：仓库 `example/minesweeper_help_course.html` 是一门完整成品课件（内联数据可视化、探照灯、洋葱剥层、因果赌注、栈塔、分叉沙盘等组件，单文件零依赖），双击即可体验。
+**示例课程**：成品课件为生成产物（单文件零依赖，含内联数据可视化、探照灯、洋葱剥层、因果赌注、栈塔、分叉沙盘等组件），不随仓库分发；按上面的用法示例对任意代码库执行即可生成交互课程。
 
 **搭配code-review-graph食用效果更佳**
 
