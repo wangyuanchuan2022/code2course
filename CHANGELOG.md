@@ -3,6 +3,17 @@
 本文件记录 code2course 技能包的版本变更（[Keep-a-Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 格式）。
 版本号唯一事实来源：SKILL.md frontmatter `version`；resources 三件套头部 `@version` 与此同步。
 
+## [1.11.1] — 2025-12-20
+
+### 新增：纯 HTML 铁律（写入 HTML 的内容禁止一切 Markdown 语法）
+
+- **动机**：智能体写入 HTML 时会混入 Markdown（代码围栏、行内反引号、`#` 标题等），产出非合法 HTML，浏览器无法正确解析
+- **SKILL.md**：frontmatter constraints 与正文硬性约束各增一条——写入 HTML 的内容必须是纯 HTML；禁令清单（```/~~~ 围栏、行内反引号对、行首 # 标题、行首 -/* 列表、** 加粗、* 斜体、> 引用、[文字](地址) 链接、|---| 表格）；结构用对应 HTML 标签（h1–h6 / ul-ol-li / strong-em / blockquote / a / table），留说明用 `<!-- -->` 注释；完整文档以 `<!DOCTYPE html>` 开头，片段以合法标签开头结尾；其他输出场景的 Markdown 绝不带入写入的 HTML
+- **workflow.md §4**：新增「纯 HTML 铁律」子节（禁令清单 / 正确写法 / pre·code·script·style 内逐字代码样例属数据不是标记的边界条款 / 判定方式）
+- **quality-gates.md**：新增陷阱 34「Markdown 混入 HTML」+ 验收项「纯 HTML 校验」
+- **validate_course.py**：新增检查 8——基于 HTMLParser 收集正文与注释文本行（排除 pre/code/script/style/textarea 与 JSON 块），八类 Markdown 标记报 ERROR（行号定位），孤立斜体星号报 WARNING 防误报；真实成品（163.8KB 多册课程）零误报通过，负例测试八类全捕获
+- **LICENSE**：补 MIT 许可证文件（用户拍板；README 既有声明自此法律生效）
+
 ## [1.11.0] — 2025-12-19
 
 本版本是六角度评审（代码质量/安全性/性能/可维护性/UI-UX/业务逻辑）后的系统性修复版：P0×3 全部修复，P1×28 全部修复，P2 按批次完成（个别长期项显式延期，见各条目；评审报告与修复说明未随公开仓库分发）。

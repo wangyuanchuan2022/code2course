@@ -20,6 +20,12 @@ validate_course.py — code2course 成品课程机械校验（零依赖，Python
       对应 .nav-item[href="#mN"]，反之亦然
   7.  --mask：脱敏机检正则扫描（邮箱 / 本机路径 / home 目录 / 常见密钥
       前缀 / 内网网段 / 密码赋值），命中仅告警（需人工判定是否教学示例）
+  8.  纯 HTML 校验（v1.11.1）：正文（pre/code/script/style/textarea 之外）
+      不得含 Markdown 语法——代码围栏、行内反引号对、行首 # 标题、
+      行首 -/* 列表、**加粗**、行首 > 引用、[文字](地址) 链接、|---| 表格
+      均为 ERROR，HTML 注释内的 Markdown 标记同样报 ERROR（写入的内容
+      一律不得含 Markdown）；孤立斜体星号为 WARNING（防误报，人工判定）
+      （pre/code/script/style 内的逐字代码样例是被展示的数据，不检查）
 
 退出码：发现 ERROR 非零退出（=1），仅 WARNING 时退出 0。
 """
@@ -45,6 +51,18 @@ class CourseChecker(HTMLParser):
         self.modules = set()           # section.module 的 id
         self.nav_items = set()         # nav-item 的 href 锚
         self._stack = []               # (tag, classes) 开标签栈
+        self._md_skip = 0              # pre/code/script/style/textarea 嵌套深度
+        self.prose_lines = []          # (line_no, text) 正文文本行
+        self.comment_lines = []        # (line_no, text) HTML 注释行
+        self._line = 1                 # 当前行号（按已 feed 的原始文本估算）
+
+    # ---- Markdown 纯度：正文/注释收集（getpos 取当前行号） ----
+    def _md_note(self, target, data):
+        line = self.getpos()[0]
+        for ln in data.split('\n'):
+            if ln.strip():
+                target.append((line, ln))
+            line += 1
 
     # ---- 标签进入 ----
     def handle_starttag(self, tag, attrs):
@@ -52,6 +70,8 @@ class CourseChecker(HTMLParser):
         cls = a.get('class', '') or ''
         classes = cls.split()
         self._stack.append((tag, classes))
+        if tag in ('pre', 'code', 'script', 'style', 'textarea'):
+            self._md_skip += 1
 
         # JSON 数据块
         if tag == 'script' and a.get('type') == 'application/json':
@@ -113,9 +133,20 @@ class CourseChecker(HTMLParser):
     def handle_data(self, data):
         if self._json_cls is not None:
             self._json_buf.append(data)
+        elif not self._md_skip and data.strip():
+            self._md_note(self.prose_lines, data)
+
+    # ---- HTML 注释：说明性文字，同样不得用 Markdown 标记 ----
+    def handle_comment(self, data):
+        if data.strip() and data.strip() not in ('ng-instance',):
+            self._md_note(self.comment_lines, data)
 
     # ---- 标签退出 ----
     def handle_endtag(self, tag):
+        # Markdown 纯度：离开代码/脚本区
+        if tag in ('pre', 'code', 'script', 'style', 'textarea') \
+                and self._md_skip:
+            self._md_skip -= 1
         # 弹栈到最近的同名开标签（容错：void 元素不入栈）
         for i in range(len(self._stack) - 1, -1, -1):
             if self._stack[i][0] == tag:
@@ -180,6 +211,36 @@ def mask_scan(raw, warnings):
             warnings.append('脱敏疑点[%s]：%s' % (name, frag[:60]))
 
 
+MD_ERROR_RULES = [
+    ('代码围栏', re.compile(r'```|~~~')),
+    ('行首井号标题', re.compile(r'^\s{0,3}#{1,6}\s+\S')),
+    ('行首星号/横线列表', re.compile(r'^\s{0,3}[-*]\s+\S')),
+    ('行首引用', re.compile(r'^\s{0,3}>\s*\S')),
+    ('Markdown 链接', re.compile(r'\[[^\]\n]{1,80}\]\([^)\n]{1,200}\)')),
+    ('表格分隔线', re.compile(r'\|\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|')),
+    ('加粗星号', re.compile(r'\*\*[^*\n]{1,120}?\*\*')),
+    ('行内反引号对', re.compile(r'`[^`\n]{1,120}`')),
+]
+MD_WARN_RULES = [
+    ('疑似斜体星号', re.compile(r'(?<![\w*])\*[^*\s][^*\n]{0,80}?\*(?![\w*])')),
+]
+
+
+def markdown_scan(lines, errors, warnings, where):
+    """对收集到的正文/注释行做 Markdown 标记扫描。"""
+    for line_no, text in lines:
+        for name, pat in MD_ERROR_RULES:
+            m = pat.search(text)
+            if m:
+                errors.append('Markdown 混入[%s]（%s L%d）：%s'
+                              % (name, where, line_no, m.group(0)[:50]))
+        for name, pat in MD_WARN_RULES:
+            m = pat.search(text)
+            if m:
+                warnings.append('Markdown 疑点[%s]（%s L%d）：%s（人工判定）'
+                                % (name, where, line_no, m.group(0)[:50]))
+
+
 def main(argv):
     # Windows 控制台常见 GBK 编码：强制 UTF-8 输出，emoji 不再炸打印
     try:
@@ -242,6 +303,10 @@ def main(argv):
     # 7. --mask
     if '--mask' in flags:
         mask_scan(raw, warnings)
+
+    # 8. 纯 HTML 校验：正文与注释不得含 Markdown 语法
+    markdown_scan(chk.prose_lines, errors, warnings, '正文')
+    markdown_scan(chk.comment_lines, errors, warnings, '注释')
 
     quiet = '--quiet' in flags
     if not quiet:
