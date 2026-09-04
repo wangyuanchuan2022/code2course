@@ -16,12 +16,28 @@
   v1.11：.viz-stage/.flow-svg 容器改 role="group"（可交互子元素须留在
   无障碍树内）；赌注揭晓用独立类 is-spot-bet；新增 --on-accent 与
   --code-hot-fg 对比度 token。
-  @version 1.11.1
+  @version 1.11.2
 =================================================================== -->
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <!-- 版本自证（v1.11.2）：组装时把 {{C2C_VERSION}} 替换为 SKILL.md frontmatter 的
+       实际版本号（与三件套 @version 一致）；validate_course.py 会核对一致性，
+       残留占位符会被 {{ 检查拦截 -->
+  <meta name="generator" content="code2course" data-version="{{C2C_VERSION}}">
+  <!-- JS 禁用 / 严格 CSP 时的图表降级提示：noscript 内容仅在 JS 禁用时生效，
+       JS 可用时浏览器自动忽略，无需任何脚本配合 -->
+  <noscript>
+    <style>
+      .viz-stage::before, .flow-scene::before, .onion-scene::before,
+      .bet-scene::before, .tower-scene::before, .fork-scene::before {
+        content: "⚙ 此处为交互演示，需启用 JavaScript 显示（正文文字不受影响）";
+        display: block; padding: var(--space-3); color: var(--text-muted);
+        font-size: 0.85rem;
+      }
+    </style>
+  </noscript>
   <!-- CSP：把"零外链"从作者纪律升级为浏览器强制（内联样式/脚本是本设计刚需，
        故 style-src/script-src 用 'unsafe-inline'；connect-src 'none' 封死一切外呼） -->
   <meta http-equiv="Content-Security-Policy"
@@ -71,7 +87,8 @@
           <div class="hero-glow" aria-hidden="true"></div>
           <h1 class="t-hero">{{课程名}}</h1>
           <p class="t-body hero-sub">{{一句话简介：这门课带你追一次真实点击，看懂 {{项目名}} 如何工作}}</p>
-          <div class="tp-head" style="margin-top: var(--space-3);">
+          <p class="t-muted hero-meta">{{12 个正式模块 · 预计 2–3 小时（估） · 写给刚接手的工程师}}</p>
+          <div class="tag-row">
             <!-- 技术栈标签：每个 .t-tag 一个，来自第 1 步侦察结论 -->
             <span class="t-tag">{{React}}</span>
             <span class="t-tag">{{Node}}</span>
@@ -255,6 +272,33 @@
         <a rel="index" href="index.html">📖 目录</a>
         <a rel="next" href="{{下一册文件名.html，如 03-geometry.html}}">下一册 ↓</a>
       </nav>
+
+      <!-- ============ 结业收束段（v1.11.2 起为默认结构，删除才需要理由） ============
+           独立于最后一个主题模块并进入目录导航；必含三件：主线回顾（优先可视化回放）、
+           ≥1 道跨模块综合题、下一步行动指引。收束段里的 mN 引用必须与各模块标题核对 -->
+      <section class="module" id="m-finale">
+        <header>
+          <h2 class="t-h1">🏁 结业：你现在应该能接手它了</h2>
+          <p class="t-body">{{主线回顾：按课程主线把 3–5 个流程族串成一段话，优先复用各模块标题原文}}</p>
+        </header>
+        <div class="quiz" data-quiz="finale-q1">
+          <div class="quiz-q t-h3">🧪 {{跨模块综合题：加一个新功能，该改哪些文件？为什么这样改？}}</div>
+          <div class="quiz-opts">
+            <button class="quiz-opt" type="button" data-correct="true"
+                    data-why="{{正确项解释：指向具体文件与行号}}">A. {{正确项}}</button>
+            <button class="quiz-opt" type="button" data-correct="false"
+                    data-why="{{为什么不对：正确的思路指向哪里}}">B. {{干扰项}}</button>
+            <button class="quiz-opt" type="button" data-correct="false" data-why="{{解释}}">C. {{干扰项}}</button>
+          </div>
+          <div class="quiz-fb t-body" hidden></div>
+        </div>
+        <p class="t-body">{{下一步行动指引：先读哪个文件、跑哪条命令、从哪个小改动开始}}</p>
+      </section>
+
+      <!-- 出品信息页脚（v1.11.2）：让第一触点自己会说话；按实际生成情况替换 -->
+      <footer class="course-footer">
+        <span>📦 由 code2course {{C2C_VERSION}} 生成 · {{N}} 个模块 · 代码逐字可溯源 · 离线可用</span>
+      </footer>
 
     </main>
   </div>

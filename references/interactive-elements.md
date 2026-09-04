@@ -40,8 +40,9 @@
 
 - 悬停/聚焦 `data-i` 相同的两侧同时点亮（`.is-hot`，橙色）；探照灯（§3）给 `.tp-line` 加 `.is-spot`（绿色行级点亮）、因果赌注（§6）揭晓加 `.is-spot-bet`（同为绿色但独立存在，探照灯清不掉它），三者颜色语义不同、可共存。
 - 需要被探照灯/赌注点亮的翻译块必须带 `id`（如 `id="pair-m2-chain"`），供 `data-sp-pair` / `data-bet-pair` 引用。
-- 「复制代码」按钮由 app.js 自动注入到 `.tp-head` 末尾，模板里无需书写。
-- **全部 `data-*` 属性值（含 `data-why`/`data-bet-why`/`data-sp-file`）是纯文本**：运行时经 textContent 渲染，不要在属性值里写 HTML 标签；含 `"` 时写作 `&quot;`。
+- 「复制代码」按钮由 app.js 自动注入到 `.tp-head` 末尾，模板里无需书写。`.tp-head` 仅限在 `.translate-pair` 内使用（翻译块头），封面/模块头的标签行不要挪用它——用 `.t-tag` 直排或自定义容器，避免审计脚本误计翻译块。
+- **模板类名分两类**：样式类（base.css 有规则，动了就变样）与结构钩子（workflow.md §8「无样式语义钩子」清单：`.tp-plain`、`.quiz-q`、`.bet-opts`、`*-title` 等——无样式，仅供选择器/审计，可改名）。写模板时对号入座，别把钩子当样式依赖。
+- **全部 `data-*` 属性值（含 `data-why`/`data-bet-why`/`data-sp-file`）是纯文本**：运行时经 textContent 渲染，不要在属性值里写 HTML 标签；含 `"` 时写作 `&quot;`。同理，`data-why` 建议长度 ≤3 句——超长拆成"结论 + 指路"（结论给为什么错/对，指路给"去看哪个模块哪块"）。
 
 <details>
 <summary>组件原理（仅供理解，禁止粘贴进成品）</summary>
@@ -83,7 +84,7 @@ document.querySelectorAll('.translate-pair').forEach(pair => {
 
 ```html
 <div class="flow-scene scene">
-  <svg class="flow-svg" viewBox="0 0 720 140" width="100%" role="img"
+  <svg class="flow-svg" viewBox="0 0 720 140" width="100%" role="group"
        aria-label="{{流程名，如：一次点击从按钮到数据库的旅程}}">
     <!-- 3–5 个站点：节点圆 + 名称 -->
     <g class="flow-node" data-step="0"><circle cx="60"  cy="70" r="26"/>
@@ -140,7 +141,7 @@ document.querySelectorAll('.translate-pair').forEach(pair => {
 <!-- ① 流程图宿主：普通 flow-scene 加 .spotlight 类，结构再包一层 .spot-wrap -->
 <div class="flow-scene scene spotlight">
   <div class="spot-wrap">
-    <svg class="flow-svg" viewBox="0 0 720 140" width="100%" role="img"
+    <svg class="flow-svg" viewBox="0 0 720 140" width="100%" role="group"
          aria-label="{{流程名}}（可拖动探照灯跨文件走读）">
       <!-- 站点映射表：data-sp-pair = 目标翻译块 id（逗号分隔可多个）
            data-sp-line = 与之一一对应的 .tp-line[data-i]（逗号分隔）
@@ -478,6 +479,7 @@ document.querySelectorAll('.translate-pair').forEach(pair => {
 - **懒播放内建**：滚入视口才动画/步进、滚出复位——app.js 已接入 `c2cLazyPlay`，**不要再手写绑定**
 - **键盘**：bars/timeline 可 Tab 聚焦 + Enter/Space 选中；timeline 段上、steps 场景内的 ←/→ 已阻止冒泡，不会触发模块翻页
 - **无障碍**：`.viz-stage` 带 `role="group"` + `aria-label`（**不用 role="img"**——stage 内有可交互子元素，role="img" 会把它们从无障碍树剔除；纯展示的帧内 SVG 才用 role="img"）；选中态有可见高亮；动画尊重 `prefers-reduced-motion`（base.css 全局规则覆盖）
+- **JSON 字段是纯文本**：`items[].note`/`anchor`（含 onion/tower/fork 的 note）由引擎以 textContent 渲染，**禁止写 HTML 实体**（`&gt;` 会显示成字面 "&gt;"）——需要 `>` `<` `&` 时直接写字符；转义铁律只适用于 HTML 标记层，不适用于 JSON 数据层
 - **JSON 转义**：字符串用双引号、无尾逗号、数字不带引号、**绝不允许出现裸 `</script`**（需要时写作 `<\/script`）——本铁律同样适用于 `.onion-data`/`.tower-data`/`.fork-data`（fork 的 `code` 数组是逐字复制的真实代码，最容易踩中）
 - **出错提示**：JSON 无法解析时 `.viz-stage` 显示红色错误提示——交付前自查应看到完整图表而非该提示
 
@@ -527,7 +529,8 @@ document.querySelectorAll('.translate-pair').forEach(pair => {
 
 约定与自查：
 
-- 分支 2–4 条，`branches` **按真实代码的分支顺序排列**；`when` 是"参数 id → 值集合"的匹配表（`"0|100"` 表示命中 0 或 100，`"*"` 任意），从上到下第一个全命中者胜出；最后一条应写空 `when` 作兜底。
+- 分支 2–4 条，`branches` **按真实代码的分支顺序排列**；`when` 是"参数 id → 值集合"的匹配表（`"0|100"` 表示命中 0 或 100，`"*"` 任意），从上到下第一个全命中者胜出；三分支及以上最后一条写空 `when` 作兜底，穷举式双分支（if/else 两态）允许两条都写显式 `when`。
+- 反例（不是沙盘场景）：两个并列调用点/双模式对照——没有参数组合空间，用翻译块并排或对照表即可；纯公式展开（y=k/x 类连续关系）不是 bars 场景，公式在翻译块里讲清即可。部署前过"删掉测试"：删掉该组件后模块正文一字不用改 = 凑数，删或换。
 - `cond` 展示真实条件表达式；`code` 逐字复制自真实分支代码（预标注）；`fx` 芯片写沿途被改写的字段/调用——三者必须与真实代码一致。
 - 参数用滑块（`type:"range"`）或离散预设（`type:"radio"`）；令牌文字显示第一个 range 参数的当前值。
 - 交互由 app.js §11 内建：拖令牌 / 键盘 ←/→ 推移 / 「投放令牌」滑入；命中分支的滑道、结果卡、代码行同步点亮；改参数即重路由。全程零 eval、零真实执行。

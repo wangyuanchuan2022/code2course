@@ -96,6 +96,7 @@ code2course/
 2. 跑 `python validate_course.py <成品课件路径>` 确认机械检查全绿
 3. grep 确认成品无 `{{` 残留、无已移除控件标记（如 `.tilt`）
 4. 同步 CHANGELOG.md 版本条目与 SKILL.md frontmatter `version`
+5. 逐字一致性比对**先归一化行尾再 diff**（LF/CRLF）：拼接脚本文本模式写盘会把外壳的 LF 转成 CRLF，直接 diff 产生整文件假差异
 
 ### 按需加载策略
 
