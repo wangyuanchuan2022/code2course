@@ -483,6 +483,22 @@ def _cg_resolution_check(e, i, where, errors):
                               % (where, i))
 
 
+# 同尾名告警的形态守卫：文件级/模块级节点的 id 是路径形态，其 split('.')
+# 末段是扩展名（如 py）而非符号名——拿它比较会把任意两条同扩展名文件的边
+# 误判成「疑似同一符号」。符号级 id（无 '/'、末段非扩展名）行为不变（D6-8②
+# 语义保留）。此闭集与 resources/app.js 的 cgIsPathish 两侧口径必须同步演化。
+_CG_TAIL_EXT = {
+    'py', 'js', 'ts', 'tsx', 'jsx', 'go', 'rs', 'java', 'c', 'cc', 'cpp',
+    'h', 'hpp', 'cs', 'rb', 'lua', 'php', 'kt', 'swift', 'm',
+    'json', 'md', 'css',
+}
+
+
+def _cg_is_pathish(node_id):
+    """id 是否为路径/文件形态（含 '/'，或 split 末段落在已知扩展名闭集）"""
+    return '/' in node_id or node_id.rsplit('.', 1)[-1].lower() in _CG_TAIL_EXT
+
+
 def callgraph_check(data, where, errors, warnings=None):
     """调用图数据契约机检（规格 §7 四条 + v1.13.4 前提的 about/call 三检
     + B3 全键白名单与 facts v3 字段语义）。
@@ -584,10 +600,14 @@ def callgraph_check(data, where, errors, warnings=None):
         if _cg_str(frm) and frm == to:
             errors.append('%s 调用图 links[%d] 是自环（from == to，规格禁止）'
                           % (where, i))
-        elif _cg_str(frm) and _cg_str(to) \
-                and frm.split('.')[-1] == to.split('.')[-1] and warnings is not None:
+        elif _cg_str(frm) and _cg_str(to) and warnings is not None \
+                and not _cg_is_pathish(frm) and not _cg_is_pathish(to) \
+                and frm.split('.')[-1] == to.split('.')[-1]:
             # D6-8②：两端 id 不同但末段名相同——facts 里带 self_ref 的边
-            # （如同一符号被写成「限定名 → 末段名」）就是这种形态，必须剔除
+            # （如同一符号被写成「限定名 → 末段名」）就是这种形态，必须剔除。
+            # 形态守卫：文件级/模块级 id（含 '/' 或末段为扩展名）不参与本
+            # 告警——它们的 split 末段是 py/js 这类扩展名而非符号名，否则
+            # 任意两条同扩展名文件的边都会被误报（口径见 _cg_is_pathish）。
             warnings.append('%s 调用图 links[%d]（%s → %s）两端末段名相同，'
                             '很可能是同一符号的自环（analyze 产物里 self_ref: true '
                             '的边必须剔除），请人工核对' % (where, i, frm, to))

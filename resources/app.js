@@ -17,7 +17,7 @@
    辅助函数合并（vizEl/ctrlEl 等成为共享实现的别名）；栈塔弹空恢复
    空栈提示；赌注支持"再押一注"。
    ===================================================================
-   @version 1.14.0 */
+   @version 1.14.1 */
 (function () {
   'use strict';
 
@@ -1777,6 +1777,17 @@
      时谁算回边"（weightOf + 2-cycle break），**不是层跨**——照做，否则一条
      700 次调用的边会把画布撑成 700 层。
      所有查表用 Object.create(null)：节点 id 可能是 `constructor` 这类原型键。 */
+  /* 20b-0. 同尾名守卫：文件级/模块级节点的 id 是路径形态，split('.') 末段是
+     扩展名（如 py）而非符号名——拿它比较会把任意两条同扩展名文件的边误判成
+     「同名疑义边」。符号级 id（无斜杠、末段非扩展名）行为不变。口径与
+     validate_course.py 的 _cg_is_pathish 两侧必须同步演化。 */
+  var CG_TAIL_EXTS = { py: 1, js: 1, ts: 1, tsx: 1, jsx: 1, go: 1, rs: 1,
+    java: 1, c: 1, cc: 1, cpp: 1, h: 1, hpp: 1, cs: 1, rb: 1, lua: 1,
+    php: 1, kt: 1, swift: 1, m: 1, json: 1, md: 1, css: 1 };
+  function cgIsPathish(id) {
+    return id.indexOf('/') !== -1 ||
+      CG_TAIL_EXTS[id.slice(id.lastIndexOf('.') + 1).toLowerCase()] === 1;
+  }
   function cgLayout(data) {
     var cmpStr = function (a, b) { return a < b ? -1 : (a > b ? 1 : 0); };
     var nodes = Object.create(null), order = [];
@@ -1806,8 +1817,12 @@
       if (!l || typeof l.from !== 'string' || typeof l.to !== 'string') return;
       if (!nodes[l.from] || !nodes[l.to]) return;   /* 端点不存在：渲染器跳过，校验器报错 */
       if (l.from === l.to) { droppedSelfLoops++; return; }   /* 自环禁止（规格 §2）：不画，但计入事实面板的「未画」声明 */
-      var ft = l.from.split('.'), tt = l.to.split('.');
-      if (ft[ft.length - 1] === tt[tt.length - 1]) sameTailCount++;
+      /* 同名疑义边计数：仅符号级 id 参与——文件级/模块级 id 的 split 末段是
+         扩展名而非符号名（守卫见 cgIsPathish，口径与 validate_course.py 同步） */
+      if (!cgIsPathish(l.from) && !cgIsPathish(l.to)) {
+        var ft = l.from.split('.'), tt = l.to.split('.');
+        if (ft[ft.length - 1] === tt[tt.length - 1]) sameTailCount++;
+      }
       var rec = {
         i: links.length, from: l.from, to: l.to,
         count: (typeof l.count === 'number' && l.count >= 1) ? l.count : 1,

@@ -665,6 +665,8 @@ document.querySelectorAll('.translate-pair').forEach(pair => {
 | `resolved_by` | enum | 可选（v3 派生字段）。**闭集** `name`（实锤·按末段名唯一命中）/ `binding`（按导入绑定）/ `qualified`（按限定名精确匹配）；仅 `verified` 边可携带，且 verified 边携带时必为三值之一——校验器机检 |
 | `resolution` | enum | 可选（v3 派生字段）。**闭集** `unique` / `ambiguous` / `unresolved` / `self_ref`；调用图数据禁用 `self_ref`，`unresolved`/`ambiguous` 恒为 `inferred`——校验器机检 |
 
+结构事实 `calls[]` 的 `caller` **可为 `null`**：模块级调用——调用点位于模块顶层、不属于任何函数/方法时的形态（真实仓库实测可达数千条量级），是正常形态而非缺失数据；查询层 `callers` 将其显示为 `(module)`，`callees`/`impact`/`path` 不为它产生符号级边。
+
 `about` / `call` 只属于**节点**：不允许写在 `links[]` 上——边可能成倍于节点，且"这条边为什么存在"本就该写在节点的 `about` 里；写错位置校验器直接报错。
 
 ### 14b. 布局与渲染（引擎内建，确定性）
@@ -701,7 +703,7 @@ python analyze_structure.py <仓库> query callees <符号> --facts work/structu
 3. **同名消歧**：末段名相同的符号多个时（工具会在 `notes` 里回显解析到谁），用 `qualname` 而不是末段名做 id，规则写进图的 `label`；
 4. **按边聚合**：`(from, to)` 相同的多条边合成一条，`count` 累加，`confidence` 取其中**最弱**的一条（有 `inferred` 就是 `inferred`）；
 5. **反查声明行**：边的 `file`/`line` 是**调用行**，节点要的是**声明行**——从 `symbols[]` 反查（别把调用行填进节点）；
-6. **剔除自环**：`from` 与 `to` 解析后是同一符号的边必须丢掉——**`self_ref: true` 的边一律不画**（跨 FFI 边界调用与同名误消解的主要形态；`validate_course.py` 检查 16 对 `from == to` 报错、对"两端末段名相同"报告警）。
+6. **剔除自环**：`from` 与 `to` 解析后是同一符号的边必须丢掉——**`self_ref: true` 的边一律不画**（跨 FFI 边界调用与同名误消解的主要形态；`validate_course.py` 检查 16 对 `from == to` 报错、对"两端末段名相同"报告警）。该告警只针对符号级 id：路径形态 id（文件级/模块级节点，id 含 `/` 或末段为 `py`/`js` 这类扩展名）不参与——它们的 split 末段是扩展名而非符号名。
 
 **模块级聚合（封面全项目图用，workflow 第 5 步「调用图前置」）**：封面图的节点是模块/文件（`kind: "module"` / `"file"` / `"entry"`），由符号级 facts 二次聚合派生——节点 `file` 填代表文件、`line` 填该文件首个符号声明行（"节点必须有出处"契约不豁免）；边按两端节点的归属聚合（`count` 累加、`confidence` 取最弱），聚合后重跑一遍自环检查。粒度选择服从节点 4–20 契约：项目大就升到目录级聚合，不许把符号级全仓灌进封面。
 
