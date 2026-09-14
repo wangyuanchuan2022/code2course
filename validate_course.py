@@ -48,6 +48,13 @@ validate_course.py — code2course 成品课程机械校验（零依赖，Python
       且只属于 verified 边；resolution=self_ref 的边禁入调用图数据；
       resolution ∈ {unresolved, ambiguous} 恒 inferred，resolution=unique
       必须 verified 且带合法 resolved_by
+  17. 调用图前置（v1.14.0 结构契约，workflow 第 5 步「调用图前置」）：
+      封面（hero 模块）必须含 ≥1 张 .callgraph-scene（全项目图，模块/文件
+      粒度）；每个正式模块（非封面、非结业段）必须含 ≥1 张 .callgraph-scene
+      （本模块图，符号级）；结业段豁免（由结业三件专用口径把关）
+  18. script 块完整性：任何 <script> 块的原文（含注释与字符串）不得含字面
+      "<script" / "</script" 序列——浏览器会在此截断/嵌套解析，整个外壳
+      脚本静默失效（v1.14.0 真实事故：app.js 头注释含字面 <script>）
 
 退出码：发现 ERROR 非零退出（=1），仅 WARNING 时退出 0。
 """
@@ -89,6 +96,9 @@ class CourseChecker(HTMLParser):
         self._in_tp_code = 0           # translate-pair 代码列
         self.module_stack = []         # 运行中的 section.module 记录
         self.module_stats = []         # 每个模块的组件计数（--tier 用）
+        self.cg_scenes = 0             # .callgraph-scene 全文档计数（检查 17 汇总行用）
+        self._script_depth = 0         # script 元素深度（检查 18 原文收集用）
+        self._script_text = []         # 当前 script 块原文累积
         # translate-pair 元数据（--source 逐字校验用）
         self.pair_meta = []            # 工作栈：运行中的翻译块
         self.pair_meta_all = []        # 持久列表：全部翻译块元数据
@@ -125,8 +135,10 @@ class CourseChecker(HTMLParser):
         # 模块段（--tier 计数作用域）
         if tag == 'section' and 'module' in classes:
             self.module_stack.append({'id': a.get('id'), 'hero': 'hero' in classes,
-                                      'pairs': 0, 'eng': 0, 'quiz': 0,
+                                      'pairs': 0, 'eng': 0, 'quiz': 0, 'cg': 0,
                                       'text': []})
+        if 'callgraph-scene' in classes:
+            self.cg_scenes += 1
         if self.module_stack:
             top = self.module_stack[-1]
             if 'translate-pair' in classes:
@@ -135,8 +147,15 @@ class CourseChecker(HTMLParser):
                                'fork-scene', 'bet-scene', 'viz-scene',
                                'callgraph-scene'}:
                 top['eng'] += 1
+            if 'callgraph-scene' in classes:
+                top['cg'] += 1
             if tag == 'div' and 'quiz' in classes and 'bet-scene' not in classes:
                 top['quiz'] += 1
+
+        # script 块原文收集（检查 18：块文本内的字面标签序列会被浏览器截断）
+        if tag == 'script':
+            self._script_depth += 1
+            self._script_text = []
 
         # JSON 数据块
         if tag == 'script' and a.get('type') == 'application/json':
@@ -207,6 +226,8 @@ class CourseChecker(HTMLParser):
 
     # ---- 文本 ----
     def handle_data(self, data):
+        if self._script_depth:
+            self._script_text.append(data)
         if self._json_cls is not None:
             self._json_buf.append(data)
             return
@@ -266,6 +287,14 @@ class CourseChecker(HTMLParser):
                             })
                         self._pending_opts = others
                 break
+        if tag == 'script' and self._script_depth:
+            self._script_depth -= 1
+            blob = ''.join(self._script_text)
+            if ('<script' in blob) or ('</script' in blob):
+                self.errors.append(
+                    'script 块文本含字面标签序列 "<script"/"</script>"'
+                    '（浏览器会在此截断或嵌套解析该块，注释与字符串请改用'
+                    '无尖括号写法）——块结束于约 L%d' % self.getpos()[0])
         if tag == 'script' and self._json_cls is not None:
             raw = ''.join(self._json_buf)
             self._check_json(self._json_cls, raw, self._json_where)
@@ -695,6 +724,26 @@ def finale_check(module_stats, errors):
                           % (label, '/'.join(FINALE_NEXT_KEYS)))
 
 
+def callgraph_coverage_check(module_stats, errors):
+    """调用图前置结构契约（workflow 第 5 步「调用图前置」，v1.14.0 起）。
+
+    封面（hero）必须含 ≥1 张全项目调用图；每个正式模块（非封面、非结业段）
+    开头必须含 ≥1 张本模块调用图。结业段豁免——由 finale_check 三件套
+    专用口径把关（豁免口径与 tier_check 一致）。
+    """
+    for m in module_stats:
+        if m['hero']:
+            if m['cg'] < 1:
+                errors.append('封面[%s] 缺全项目调用图（workflow 第 5 步'
+                              '「调用图前置」：封面必须放模块/文件粒度的'
+                              '全项目调用图）' % (m['id'] or '?'))
+        elif m['id'] and not is_finale(m):
+            if m['cg'] < 1:
+                errors.append('模块[%s] 缺前置调用图（workflow 第 5 步'
+                              '「调用图前置」：每个正式模块开头必须放'
+                              '本模块调用图）' % m['id'])
+
+
 def tier_check(module_stats, tier, errors):
     rule = TIER_RULES.get(tier)
     if rule is None:
@@ -839,11 +888,14 @@ def main(argv):
     # 11b. 结业收束段「结业三件」（P1-f：与 --tier 无关的内容契约）
     finale_check(chk.module_stats, errors)
 
+    # 17. 调用图前置（封面全项目图 + 每正式模块模块图；v1.14.0 结构契约）
+    callgraph_coverage_check(chk.module_stats, errors)
+
     quiet = '--quiet' in flags
     if not quiet:
         print('文件：%s（%.1f KB）' % (path, len(raw.encode("utf-8")) / 1024))
-        print('检查：翻译块 %d 个 / 测验+赌注 %d 处 / JSON 块见上 / 模块 %d 个'
-              % (len(chk.pairs), len(chk.quizzes), len(chk.modules)))
+        print('检查：翻译块 %d 个 / 测验+赌注 %d 处 / JSON 块见上 / 模块 %d 个 / 调用图 %d 张'
+              % (len(chk.pairs), len(chk.quizzes), len(chk.modules), chk.cg_scenes))
     for w in warnings:
         print('  ⚠️  %s' % w)
     for e in errors:

@@ -16,7 +16,7 @@
   v1.11：.viz-stage/.flow-svg 容器改 role="group"（可交互子元素须留在
   无障碍树内）；赌注揭晓用独立类 is-spot-bet；新增 --on-accent 与
   --code-hot-fg 对比度 token。
-  @version 1.13.3
+  @version 1.14.0
 =================================================================== -->
 <html lang="zh-CN">
 <head>
@@ -117,6 +117,30 @@
           <div class="viz-stage" role="group" aria-label="{{项目名}} 各目录文件数与职责"></div>
           <div class="viz-detail t-muted" hidden></div>
         </div>
+
+        <!-- 全项目调用图（封面必备，v1.14.0 结构契约；模块/文件粒度聚合）
+             节点用 kind:"module"/"file"/"entry"（聚合到目录级，4–20 个），
+             覆盖项目主要子系统与入口；数据来自 analyze_structure.py 结构事实，
+             模块级聚合规则见 interactive-elements.md §14d，完整契约见 §14 -->
+        <div class="callgraph-scene scene">
+          <div class="callgraph-title t-h3">🕸️ {{项目名}} 全景调用图（实线=实锤，虚线=推断）</div>
+          <p class="t-body">{{1–2 句引子：先看整个项目的调用骨架，后面每个模块都会放大其中一块}}</p>
+          <script type="application/json" class="callgraph-data">
+          {
+            "nodes": [
+              { "id": "entry", "label": "{{入口，如 main()}}", "kind": "entry", "file": "{{入口文件}}", "line": 1 },
+              { "id": "mod-ui", "label": "{{UI 层}}", "kind": "module", "file": "{{代表文件}}", "line": 1 },
+              { "id": "mod-core", "label": "{{核心层}}", "kind": "module", "file": "{{代表文件}}", "line": 1 }
+            ],
+            "links": [
+              { "from": "entry", "to": "mod-ui", "count": 1, "confidence": "verified", "file": "{{入口文件}}", "line": {{调用行号}} },
+              { "from": "mod-ui", "to": "mod-core", "count": {{真实调用点数}}, "confidence": "inferred" }
+            ]
+          }
+          </script>
+          <div class="callgraph-stage" role="group" aria-label="{{项目名}} 全景调用图"></div>
+          <div class="callgraph-facts t-muted" aria-live="polite">{{初始提示，如：悬停节点或连线看事实}}</div>
+        </div>
       </section>
 
       <!-- ============ 模块 1（示例：完整模块骨架） ============ -->
@@ -125,6 +149,11 @@
           <h2 class="t-h1">1 · {{模块标题}}</h2>
           <p class="t-body">{{导语 ≤2 句，从一个真实用户操作切入}}</p>
         </header>
+
+        <!-- v1.14.0 结构契约（workflow 第 5 步「调用图前置」）：每个正式模块正文开始前，
+             先放本模块调用图（§14 模板块，符号级 4–20 节点），引子点明本图对应封面
+             全景图的哪一块。下方模板里的调用图块可整体挪到此处作为本模块开篇；
+             结业段豁免。 -->
 
         <!-- 主视觉 A：执行探照灯（跨文件同步走读，部署在事件链/调用链内容处）
              宿主是数据流动画：加 .spotlight 类 + .spot-wrap + .spot-lamp + .spot-caption，
@@ -236,12 +265,13 @@
           <div class="viz-detail t-muted" hidden></div>
         </div>
 
-        <!-- 调用图（v1.13.1）：把结构事实（analyze_structure.py 的 calls/imports 边）渲染成
+        <!-- 调用图（v1.13.1；v1.14.0 起为结构契约必配）：把结构事实（analyze_structure.py 的 calls/imports 边）渲染成
              一张确定性的节点-边图——看"谁调用了谁"的整体形状与疏密，是探照灯（跨文件走读）、
              栈塔（运行时纵深）之外的第三种调用链表达。数据必须来自真实结构事实，逐边标注
              confidence：verified（实锤，必带发起行 file:line）/ inferred（推断，命名或导入推测）；
-             禁止把 inferred 改写成 verified。完整契约与自查见 interactive-elements.md §14，
-             不需要的整块删掉。 -->
+             禁止把 inferred 改写成 verified。完整契约与自查见 interactive-elements.md §14。
+             必配位：封面放全项目图（模块/文件粒度聚合）、每个正式模块开头放本模块图（符号级），
+             两种粒度都不可删（结业段可省）——validate_course.py 检查 17 机检。 -->
         <div class="callgraph-scene scene">
           <div class="callgraph-title t-h3">🕸️ {{标题，如：一次登录请求的调用图}}</div>
           <p class="t-body">{{1–2 句引子：这张图回答什么问题、实锤与推断怎么区分}}</p>

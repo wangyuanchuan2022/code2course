@@ -68,7 +68,7 @@ course/
 code2course/
 ├── SKILL.md                          # 主技能指令（YAML 元数据 + 执行流程 + 设计哲学）
 ├── CHANGELOG.md                      # 版本变更记录（Keep-a-Changelog 格式）
-├── validate_course.py                # 可选：零依赖成品机械校验脚本（占位符/外链/JSON/配对）
+├── validate_course.py                # 可选：零依赖成品机械校验脚本（占位符/外链/JSON 配对/模块锚点/脱敏/调用图契约等 18 项，含档位与结业专用口径）
 ├── analyze_structure.py              # 可选：零依赖结构事实底稿生成 + 项目地图查询（map/callers/callees/impact/path/entry/search）
 ├── resources/                        # 现成基础外壳，生成课程时直接复制内联、禁止重写
 │   ├── base.css                      # 全部通用样式（变量/排版/布局/组件 CSS）

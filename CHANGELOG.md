@@ -3,6 +3,30 @@
 本文件记录 code2course 技能包的版本变更（[Keep-a-Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 格式）。
 版本号唯一事实来源：SKILL.md frontmatter `version`；resources 三件套头部 `@version` 与此同步。
 
+## [1.14.0] — 2026-09-14
+
+本版本来自对借鉴对象 CodeGraph（MIT）源码的四方向源码级评审（62 条发现）：把其中强化诚实性的部分落成 **facts schema v3**（破坏性变更，schema_version 2→3，旧查询层读新底稿会响亮失败），配套机检门与调用图 UI 的发布前提。selftest 291→364 断言；真实仓库（minesweeper_help）双口径全量回归计数逐位一致、双跑哈希一致，verified 边 3578→2163 全部为诚实降级（自环 168 条、点链多候选 42 条 verified 归零）。
+
+### Changed（breaking）
+
+- **facts schema v3**：顶层新增 `engine_version`（与 schema_version 独立的内容版本，bump 规则见常量注释）；`files[]` 新增 `generated`（生成文件双信号标注，只提示不排除）；`calls[]` 新增 `to`/`to_candidates`/`candidates_total`（目标身份与候选集）、`resolution`（unique|ambiguous|unresolved|self_ref 四值闭集）、`resolved_by`（name|binding|qualified 证据来源）、`unresolved_reason`（external|not_extracted_here|builtin_filtered）；warnings 新增 `name-cap-exceeded`（同名候选上限 500）
+- **消解诚实性**：「实锤」标签分级为 实锤(名)/实锤(绑定)/实锤(限定)（凭名字命中不再冒充解析确认）；自引用形态无条件降级 inferred 并带 `self_ref` 标（含 receiver=null 的 `super().__init__` 形态，真实仓库 168 条全部抓出）；多候选收不窄即拒绝判实锤（拒绝即未解析）
+- **查询层输出契约**：列表表头计数=最终保留条目数（全量后截断，`total` 恒真数）；截断在触发点就地报告并给放宽参数；`--format json` 外壳 6→9 键（+`total`/`limit`/`truncated`）且 stdout 纯 JSON（人类提示走 stderr）；「无结果」收敛单一形状判定函数，exit 0 + SUCCESS 形状指引
+
+### Added
+
+- 生成文件双信号检测（路径约定 + 注释行 banner，8192 字符/60 行窗口，附自分类防呆自测）
+- 调用图契约：节点可选 `about`（作者综述，须可指回依据）/ `call`（结构事实，须能在 facts 边找到对应），校验器三检配注入必红变异体；事实面板空闲态多句降级声明（未画自环/截断/疑义边，零项不出现）
+- validate_course.py 检查 16 升级：nodes/links 逐字段键白名单 + verified⟺resolved_by 等四谓词（出现即校验，旧式手写块向后兼容）
+- 断点清单降噪与分级标签、规格 F8/F9/H 组同步（AC-58–62）
+- **调用图前置结构契约**（workflow 第 5 步「调用图前置」）：封面必放**全项目调用图**（模块/文件粒度聚合，节点 4–20 契约不豁免）、每个正式模块开头必放**本模块调用图**（符号级、正文前），结业段豁免；`validate_course.py` 新增检查 17 机检缺位；SKILL.md 硬性约束、quality-gates（陷阱 39 + 验收项）、interactive-elements §14（结构契约必配位 + §14d 模块级聚合条款）同步
+
+### Fixed
+
+- **P0：内联外壳被自身注释截断 + 骨架缺 script 开标签，成品交互全灭**——app.js 头注释与各节契约注释含字面 `<script` 序列（5 处）、base.css §20 注释 1 处；组装骨架缺 app.js 的 `<script>` 开标签，旧成品全靠注释字面 `<script>` 凑巧顶位且注释头被切，外壳脚本成为以中文注释开头的残块（SyntaxError）——全部交互组件与 JS 渲染图表（调用图/目录地图/数据流）静默瘫痪（真实成品事故：minesweeper_help L2 课件，validate 静态检查全绿但浏览器 0 个组件可用）。修复：6 处注释改无尖括号写法；validate_course.py 新增检查 18（script 块文本含字面标签序列即 ERROR，配注入必红负测）；组装骨架改三段哨兵结构（正文进 `<main>`、app.js 进尾部 script）并加「app.js 前必有生效开标签 + script 开闭配平」结构守卫；workflow §8 组装自检同步并增补「交付前无头浏览器核验 0 pageerror + 交互冒烟」终检项；成品已重组装并无头浏览器复验（0 pageerror、6/6 调用图渲染、交互冒烟全过）
+- 事实面板 `pre-line` 样式同步遗漏补齐（多行事实不再塌成一行）
+- workflow §3/§3a 口径与分级标签同步，附三句边诚实性引用原文（MIT 出处）
+
 ## [1.13.3] — 2026-09-14
 
 本版本消化结构事实工具在真实课件生成实验（C++/Python 混合仓库）里暴露的 backlog：修掉一处**诚实性 P0**（跨 FFI 边界调用被消解成"实锤自环"）、C++ 提取的两类系统性失真（漏抽自有函数、把构造函数初始化列表登记成方法），并把机检与文档接上（结业段口径、跨 FFI 诚实性、调用图数据加工 SOP）。

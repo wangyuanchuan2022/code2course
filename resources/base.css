@@ -21,7 +21,7 @@
    移动端 SVG 文字放大；触摸目标 ≥44px；代码行号 sticky。
    赌注揭晓行改用独立类 .is-spot-bet（与探照灯 .is-spot 分离）。
    ===================================================================
-   @version 1.13.3 */
+   @version 1.14.0 */
 
 /* ---------- 1. 变量 ---------- */
 :root {
@@ -998,7 +998,7 @@ fieldset.fork-param { border: 1px dashed var(--border);
                  display: flex; justify-content: center; text-align: center; }
 
 /* ---------- 20. 调用图（结构事实的节点-边图，v1.13.1） ----------
-   宿主：.callgraph-scene + <script type="application/json" class="callgraph-data">
+   宿主：.callgraph-scene + script(type=application/json) 的 callgraph-data 数据块
    （布局与渲染引擎见 app.js §20；用法见 interactive-elements.md §14）
    颜色只用既有 token，不引入新色；线型承载诚实性——verified 实线、
    inferred 虚线、回边强调色虚线。

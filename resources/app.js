@@ -1,7 +1,7 @@
 /* ===================================================================
    code2course · app.js — 课程通用交互脚本
    -------------------------------------------------------------------
-   用法：生成课程时把本文件内容原样复制进每个 HTML 的 <script>（多文件
+   用法：生成课程时把本文件内容原样复制进每个 HTML 尾部的 script 标签内（多文件
    模式下每册都要内联一份）。无需配置：脚本自动扫描页面上的组件结构
    并绑定行为。课程内容只需按约定类名/属性写 HTML。
    约定的结构见 references/interactive-elements.md 各节模板（项目数据
@@ -17,7 +17,7 @@
    辅助函数合并（vizEl/ctrlEl 等成为共享实现的别名）；栈塔弹空恢复
    空栈提示；赌注支持"再押一注"。
    ===================================================================
-   @version 1.13.3 */
+   @version 1.14.0 */
 (function () {
   'use strict';
 
@@ -867,7 +867,7 @@
   });
 
   /* ---------- 8. 洋葱剥层：同一份数据的纵向演化，剥层掉碎屑 ----------
-     契约：.onion-scene 内含 <script class="onion-data"> JSON（layers
+     契约：.onion-scene 内含 class="onion-data" 的 JSON 数据块（layers
      数组从最外层排到核，每层 name/shape/who/use/crumbs[]）+ 空 .onion-board。
      引擎自动生成同心圆 SVG 与事实面板；点外圈剥一层，被丢弃字段以
      "碎屑"掉进碎屑盘；←/→ 在未剥的圈间移动焦点，Enter/Space 剥层。 */
@@ -1149,7 +1149,7 @@
   });
 
   /* ---------- 10. 栈塔：调用/返回推演器（预标注脚本驱动的 push/pop） ----------
-     契约：.tower-scene 内含 <script class="tower-data"> JSON + 空
+     契约：.tower-scene 内含 class="tower-data" 的 JSON 数据块 + 空
      .tower-stack + 空 .tower-side + .tower-controls（.tower-push /
      .tower-pop / .tower-reset 按钮）。JSON：
        base（地基说明）/ collect{title,empty}（返回值收集盘，可省）/
@@ -1319,7 +1319,7 @@
   });
 
   /* ---------- 11. 分叉沙盘：拖令牌过预标注的岔路口（不执行真实代码） ----------
-     契约：.fork-scene 内含 <script class="fork-data"> JSON + 空
+     契约：.fork-scene 内含 class="fork-data" 的 JSON 数据块 + 空
      .fork-board。引擎自动生成：参数区（滑块/单选组）、岔路 SVG（入口轨道
      + 闸门 + 每分支一条滑道）、分支结果卡、预标注代码行、字幕与投放按钮。
      JSON：
@@ -1701,7 +1701,7 @@
   /* ===================================================================
      20. 调用图（call-graph）—— 把结构事实渲染成一张节点-边图（v1.13.1）
      -------------------------------------------------------------------
-     宿主：.callgraph-scene + <script type="application/json" class="callgraph-data">
+     宿主：.callgraph-scene + script(type=application/json) 的 callgraph-data 数据块
      数据契约（闭集，见 references/interactive-elements.md §14）：
        nodes[{id,label,kind,file,line}]
        links[{from,to,count,confidence,file,line,declared,back}]
