@@ -118,7 +118,8 @@ class CourseChecker(HTMLParser):
         # 模块段（--tier 计数作用域）
         if tag == 'section' and 'module' in classes:
             self.module_stack.append({'id': a.get('id'), 'hero': 'hero' in classes,
-                                      'pairs': 0, 'eng': 0, 'quiz': 0})
+                                      'pairs': 0, 'eng': 0, 'quiz': 0,
+                                      'text': []})
         if self.module_stack:
             top = self.module_stack[-1]
             if 'translate-pair' in classes:
@@ -211,6 +212,9 @@ class CourseChecker(HTMLParser):
             self.pair_meta[-1]['head'].append(data)
         if not self._md_skip and data.strip():
             self._md_note(self.prose_lines, data)
+        if self.module_stack and not self._md_skip:
+            # 模块正文（供结业三件检查；代码样例不计——它们在 _md_skip 内）
+            self.module_stack[-1]['text'].append(data)
 
     # ---- HTML 注释：说明性文字，同样不得用 Markdown 标记 ----
     def handle_comment(self, data):
@@ -279,7 +283,8 @@ class CourseChecker(HTMLParser):
                 '.%s JSON 值含 HTML 实体字面 %s（textContent 原样显示，'
                 '直接写 > < & 字符）' % (cls, m.group(0)))
         if cls == 'callgraph-data':
-            callgraph_check(data, '.callgraph-data' + where, self.errors)
+            callgraph_check(data, '.callgraph-data' + where, self.errors,
+                            self.warnings)
 
 
 def check_raw_text(raw, errors):
@@ -377,7 +382,7 @@ def _cg_int(v):
     return isinstance(v, int) and not isinstance(v, bool) and v >= 1
 
 
-def callgraph_check(data, where, errors):
+def callgraph_check(data, where, errors, warnings=None):
     """调用图数据契约机检（规格 §7 四条）。
 
     每条独立成错、各自定位到具体节点/连线，便于"注入必红"逐条命中：
@@ -439,6 +444,13 @@ def callgraph_check(data, where, errors):
         if _cg_str(frm) and frm == to:
             errors.append('%s 调用图 links[%d] 是自环（from == to，规格禁止）'
                           % (where, i))
+        elif _cg_str(frm) and _cg_str(to) \
+                and frm.split('.')[-1] == to.split('.')[-1] and warnings is not None:
+            # D6-8②：两端 id 不同但末段名相同——facts 里带 self_ref 的边
+            # （如同一符号被写成「限定名 → 末段名」）就是这种形态，必须剔除
+            warnings.append('%s 调用图 links[%d]（%s → %s）两端末段名相同，'
+                            '很可能是同一符号的自环（analyze 产物里 self_ref: true '
+                            '的边必须剔除），请人工核对' % (where, i, frm, to))
         # 3. verified link 必须有 file 与 line
         if conf == 'verified':
             pair = '%s → %s' % (frm, to)
@@ -534,6 +546,41 @@ TIER_RULES = {
     'L3': {'pairs': 3, 'eng': 2, 'quiz': 2},
 }
 
+# 结业收束段（P1-f）：id 含 finale 即认定；豁免档位数量下限，改走「结业三件」。
+# 标记集是**已文档化的机检契约**（workflow §8 同列），刻意收全自然措辞——R6 实测稿
+# 用的是「串回一条线 / 主线回放 / 一句话总结」，短表会误报
+FINALE_ID_MARK = 'finale'
+FINALE_RECAP_KEYS = ('回顾', '回放', '回望', '回主线', '主线', '串联', '串起',
+                     '串回', '一条线', '小结', '总结', '复盘', '收束', '贯穿')
+FINALE_NEXT_KEYS = ('下一步', '接下来', '继续', '延伸', '后续')
+
+
+def is_finale(module):
+    """是否结业收束段（workflow §8：结业段允许轻量）。"""
+    mid = module.get('id') or ''
+    return FINALE_ID_MARK in mid.lower()
+
+
+def finale_check(module_stats, errors):
+    """结业收束段的「结业三件」专用检查（P1-f，与 workflow §8 文本契约同源）。
+
+    结业段豁免档位数量下限后，改用三件套核对：主线回顾 / 跨模块综合题 /
+    下一步指引——三件缺一即红（README 与 workflow §8 已写明机检口径）。
+    """
+    for m in module_stats:
+        if not is_finale(m):
+            continue
+        label = '结业段[%s]' % m['id']
+        text = ''.join(m.get('text') or ())
+        if not any(k in text for k in FINALE_RECAP_KEYS):
+            errors.append('%s 缺「主线回顾」（§8 结业三件之一：正文需出现 %s 之一）'
+                          % (label, '/'.join(FINALE_RECAP_KEYS)))
+        if m['quiz'] < 1:
+            errors.append('%s 缺「跨模块综合题」（§8 结业三件之一）' % label)
+        if not any(k in text for k in FINALE_NEXT_KEYS):
+            errors.append('%s 缺「下一步指引」（§8 结业三件之一：正文需出现 %s 之一）'
+                          % (label, '/'.join(FINALE_NEXT_KEYS)))
+
 
 def tier_check(module_stats, tier, errors):
     rule = TIER_RULES.get(tier)
@@ -542,6 +589,8 @@ def tier_check(module_stats, tier, errors):
     for m in module_stats:
         if m['hero'] or not m['id']:
             continue   # 封面不参与内容量下限
+        if is_finale(m):
+            continue   # P1-f：结业段豁免档位下限，由 finale_check 专用口径把关
         label = '档位下限[%s %s]' % (tier, m['id'])
         if m['pairs'] < rule['pairs']:
             errors.append('%s 翻译块 %d < %d' % (label, m['pairs'], rule['pairs']))
@@ -598,6 +647,9 @@ def main(argv):
     except Exception as e:
         errors.append('HTML 解析异常：%s' % e)
     errors.extend(chk.errors)
+    # 既有缺陷修复：解析器侧告警（JSON 实体字面 / 调用图同尾名自环）原先被静默丢弃——
+    # 只 extend 了 errors，没接 warnings；D6-8② 的新门线依赖这条接线
+    warnings.extend(chk.warnings)
 
     # 4. data-i 配对
     for i, p in enumerate(chk.pairs, 1):
@@ -671,6 +723,9 @@ def main(argv):
     if opts['--tier']:
         tier_check(chk.module_stats, opts['--tier'], errors)
 
+    # 11b. 结业收束段「结业三件」（P1-f：与 --tier 无关的内容契约）
+    finale_check(chk.module_stats, errors)
+
     quiet = '--quiet' in flags
     if not quiet:
         print('文件：%s（%.1f KB）' % (path, len(raw.encode("utf-8")) / 1024))
@@ -684,7 +739,7 @@ def main(argv):
         if errors:
             print('结果：✖ %d 个错误，%d 条告警' % (len(errors), len(warnings)))
         elif warnings:
-            print('结果：⚠️ 通过（%d 条脱敏疑点待人工判定）' % len(warnings))
+            print('结果：⚠️ 通过（%d 条告警待人工判定）' % len(warnings))
         else:
             print('结果：✅ 全部通过')
     return 1 if errors else 0

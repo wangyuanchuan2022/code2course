@@ -354,8 +354,20 @@ LANG_TABLES = {
             (r'\benum(?:\s+class)?\s+(?P<n>\w+)\s*\{', K_ENUM, 'type'),
             (r'\btypedef\b[^;]*?\b(?P<n>\w+)\s*;', K_TYPE_ALIAS, 'bodyless'),
             (r'^[ \t]*#\s*define\s+(?P<n>\w+)(?!\s*\()', K_CONSTANT, 'value'),
+            # P1-b：模块唯一出口（pybind11 / Boost.Python 的宏式模块初始化函数）
+            (r'^[ \t]*(?P<n>PYBIND11_MODULE|PYBIND11_PLUGIN|BOOST_PYTHON_MODULE)\s*\(',
+             K_FUNCTION, 'func'),
             (r'\b(?P<recv>\w+)::(?P<n>\w+)\s*\([^;{}]*\)\s*\{', K_METHOD, 'func'),
-            (r'\b(?:[\w\*]+\s+)+\**(?P<n>\w+)\s*\([^;{}]*\)\s*\{', K_FUNCTION, 'func'),
+            # P1-b：`const` / `noexcept` / `override` 限定的成员函数
+            # （`bool check_leaf(const std::vector<Coord>& cslist) const {`）。
+            # 类型词里的冒号必须成对（`::`），否则 `public:` / `private:` 标号会被
+            # 当成类型吃掉（实测伪符号 MD5.MD5 / MD5.rol）
+            (r'\b(?:[\w\*&]+(?:::+[\w\*&]+)*(?:<[^;{}()]*>)?[\s\*&]+)+\**(?P<n>\w+)'
+             r'\s*\([^;{}]*\)\s*(?:const|noexcept|override|final)\b[^;{}]*\{',
+             K_FUNCTION, 'func'),
+            # P1-b：带限定名/模板参数的返回类型（`std::vector<Coord> f(...) {`）
+            (r'\b(?:[\w\*&]+(?:::+[\w\*&]+)*(?:<[^;{}()]*>)?[\s\*&]+)+\**(?P<n>\w+)'
+             r'\s*\([^;{}]*\)\s*\{', K_FUNCTION, 'func'),
         ),
         'imports': (
             (r'^[ \t]*#\s*include\s*"([^"]+)"', IMP_INCLUDE, 'c_quote'),
@@ -749,7 +761,13 @@ HONESTY_BLOCK = '''> 本底稿由 analyze_structure.py 自动生成。Python 部
 > Rust 宏与 trait 默认方法、Ruby define_method 与单行修饰形式、Lua 表方法的两种调用形态、
 > JS/TS 对象字面量方法与装饰器、`)` 或 `]` 之后的链式方法调用（`fetch(x).then(h)`、
 > `arr[0].push(v)` 形态）。以上均不保证被识别。
-> 每条 import 边与调用边都标注了「实锤」（可在源码定位出处）或「推断」（未能对上本仓库符号表）；
+> `.h` 一律按 C 的模式表处理（`.hpp` / `.hh` / `.hxx` 才是 C++）：header-only 或大量用 `.h`
+> 写 C++ 的工程，模板/命名空间/类语义会走 C 的口径，语言统计也随之为 c——需人工复核。
+> 每条 import 边与调用边都标注了「实锤·名」或「推断」：「实锤·名」= callee 的**末段名**在本仓库
+> 符号表命中（是名字对上，不是解析确认）。跨 FFI 边界（pybind11 / ctypes / Cython / JNI）的调用
+> 静态不可见：同名命中可能指向同语言同名符号自身，此类边（receiver 为含点属性链的自名调用）已
+> 降级为「推断」并标 `self_ref`，下游调用图不得画自环。
+> 断点清单的「符号表未命中」既可能是真外部调用，也可能是本文件内的抽漏（启发式引擎不保证抽全）。
 > 入口点中的命名启发式、manifest 声明与 listen( 调用均属启发式而非事实。
 > 底稿与源码冲突时，以源码为准。'''
 
@@ -786,6 +804,49 @@ def _line_at(src_lines, lineno):
 
 def _warn(rel, kind, message):
     return {'file': rel, 'kind': kind, 'message': message}
+
+
+# 疑似 vendored（第三方内嵌）目录的常见名（P1-a/P2-c：**只提示不自动排除**——
+# D-10 的默认排除清单是冻结契约，加名单需 spec 修订；提示走 stdout / map notes）
+VENDOR_HINTS = frozenset((
+    'third_party', 'thirdparty', '3rdparty', 'extern', 'external', 'deps',
+    'depends', 'vendor', 'vendored', 'subprojects', 'inc', 'include',
+))
+
+
+def vendored_hints(facts):
+    """疑似 vendored 目录探测（P1-a/P2-c）。
+
+    `--exclude` 的匹配语义是「任意层级同名目录」，故按**目录 basename** 归并
+    （一条符号路径里的同名单目录只计一次）。两类信号：
+      ('exclude', 名, 数, 占比) —— 目录名命中第三方常见名（inc/third_party/…）：
+                                   可直接 `--exclude <名>`；
+      ('review', 顶层名, 数, 占比) —— 某顶层目录符号占比 > 50% 但名字不像第三方：
+                                   只提示复核，**不建议排除**（可能是项目主代码）。
+    只作建议，绝不自动排除（D-10 默认排除清单是冻结契约）。
+    """
+    total = len(facts['symbols'])
+    if not total:
+        return []
+    by_name = {}
+    top = {}
+    for sym in facts['symbols']:
+        parts = sym['file'].split('/')[:-1]
+        if parts:
+            top[parts[0]] = top.get(parts[0], 0) + 1
+        for name in set(p.lower() for p in parts if p):
+            by_name[name] = by_name.get(name, 0) + 1
+    out = []
+    for name in sorted(by_name, key=lambda k: (-by_name[k], k)):
+        share = 100.0 * by_name[name] / total
+        if name in VENDOR_HINTS:
+            out.append(('exclude', name, by_name[name], share))
+    for name in sorted(top, key=lambda k: (-top[k], k)):
+        share = 100.0 * top[name] / total
+        if share > 50.0 and name.lower() not in VENDOR_HINTS:
+            out.append(('review', name, top[name], share))
+    out.sort(key=lambda item: (item[0] != 'exclude', -item[2]))
+    return out
 
 
 def _rmtree(path):
@@ -1463,6 +1524,24 @@ def end_block_end_pos(stripped, table, scan_from):
     return None
 
 
+def _balanced_parens(text):
+    """匹配文本的圆括号是否配平（P1-c：跨语句吞并的伪声明判据）。
+
+    `explicit Progress(py::object c) : cb(std::move(c)), cb_none(cb.is_none()) {}`
+    的 `std::move(...)` 一类匹配会因 `[^;{}]*` 贪婪跨过右括号吞到函数体的 `{`——
+    括号不配平即可识别。构造函数本身的匹配（同一行）是配平的，不受影响。
+    """
+    depth = 0
+    for ch in text:
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0
+
+
 def _line_offsets(text):
     offsets = [0]
     for m in re.finditer('\n', text):
@@ -1708,6 +1787,14 @@ def analyze_generic(root, rel, lang, data, text, symbols, imports,
     decl_text = comments_only if table.get('decl_on_comments') else stripped
     for rx, kind, role in decls_compiled:
         for m in rx.finditer(decl_text):
+            # P1-c 守卫只对「跨到块体 `{`」的模式生效：多数语言的声明模式只匹配
+            # 到 `(` 为止（天然不配平），不能一并否掉
+            mtext = m.group(0)
+            if '{' in mtext and not _balanced_parens(mtext):
+                # 括号不配平的匹配是跨语句吞并的伪声明（C++ 构造函数初始化列表、
+                # 多行 std::stable_sort 调用的 lambda 体）——不进符号表，其区间也
+                # 不当「声明自身」过滤（该行里的真实调用应照常产出）
+                continue
             decl_spans.append((m.start(), m.end()))
             name = m.groupdict().get('n')
             if not name:
@@ -2019,6 +2106,9 @@ def build_facts(repo, selected_langs=None, extra_excludes=None):
 
     for rel, lang, raw_calls in call_units:
         seen = set()
+        # A3-3：调用边的 extractor 与语言一致（原先硬编码 'ast'，brace/end 语言
+        # 的调用边被标成 ast，与同一批文件的符号表口径矛盾）
+        extractor = EXT_AST if lang == 'python' else lang_extractor(lang)
         for line, caller, callee, receiver in raw_calls:
             if lang == 'python' and callee in BUILTIN_NAMES:
                 # P2-8/D-21：Python 内建清单只配 Python（ast 引擎）；其余 15 门
@@ -2031,14 +2121,25 @@ def build_facts(repo, selected_langs=None, extra_excludes=None):
                 continue
             seen.add(key)
             candidates = last_segment.get(callee, 0)
-            calls.append({
+            # P0-1：callee 消解纳入 receiver。「同名唯一候选 = 调用者自己」且
+            # receiver 是含点属性链（`native.mscore.win_rate(...)`）时，这多半是
+            # 跨 FFI 边界的外部调用，不是自调——降级 inferred（receiver 证据保留），
+            # 不再产「实锤自环」；同符号边另给显式标记供下游剔除。
+            self_ref = bool(caller) and _lastseg(caller) == callee \
+                and candidates <= 1
+            boundary = self_ref and bool(receiver) and '.' in receiver
+            edge = {
                 'file': rel, 'line': line, 'caller': caller, 'callee': callee,
                 'receiver': receiver,
-                'confidence': CONF_VERIFIED if candidates else CONF_INFERRED,
+                'confidence': CONF_INFERRED if boundary or not candidates
+                else CONF_VERIFIED,
                 'candidates': candidates,
                 'ambiguous': candidates > 1,
-                'extractor': EXT_AST,
-            })
+                'extractor': extractor,
+            }
+            if self_ref:
+                edge['self_ref'] = True
+            calls.append(edge)
 
     files.sort(key=lambda r: r['path'])
     symbols.sort(key=lambda s: (s['file'], s['start_line'], s['qualname']))
@@ -2086,7 +2187,8 @@ def dumps_facts(facts):
 
 # ---------------------------------------------------------------- 人读底稿（F3）
 def _conf_label(confidence):
-    return '实锤' if confidence == CONF_VERIFIED else '推断'
+    """P1-d：标签暴露口径——「实锤·名」= callee 末段名在符号表命中，非解析确认。"""
+    return '实锤·名' if confidence == CONF_VERIFIED else '推断'
 
 
 def render_md(facts):
@@ -2148,6 +2250,9 @@ def render_md(facts):
 
     add('## 调用边')
     add('')
+    add('「实锤·名」= callee 末段名在本仓库符号表命中（名字对上，非解析确认）；'
+        '「推断」= 未命中。')
+    add('')
     add('| 位置 | callee | caller | receiver | 置信 | 候选 |')
     add('|---|---|---|---|---|---|')
     for call in facts['calls']:
@@ -2161,6 +2266,8 @@ def render_md(facts):
 
     add('## 断点清单（Where the graph stops）')
     add('')
+    add('「符号表未命中」既可能是真外部调用，也可能是本文件内的抽漏（启发式引擎不保证抽全）。')
+    add('')
     inferred = [c for c in facts['calls'] if c['confidence'] == CONF_INFERRED]
     if not inferred:
         add('（无推断调用边：所有调用点都能对上本仓库符号表）')
@@ -2172,7 +2279,8 @@ def render_md(facts):
             add('### %s' % _md_cell(path))
             add('')
             for call in sorted(by_file[path], key=lambda c: (c['line'], c['callee'])):
-                add('- 行 %d 调用 `%s` — 断因：未在本仓库符号表中找到同名符号'
+                add('- 行 %d 调用 `%s` — 断因：符号表未命中'
+                    '（外部符号、跨语言绑定或本文件抽漏皆可能）'
                     % (call['line'], _md_cell(call['callee'])))
             add('')
 
@@ -2326,6 +2434,17 @@ def main(argv):
                  counts['entry_points'], len(facts['warnings'])))
         print('[OK] wrote %s' % json_path)
         print('[OK] wrote %s' % md_path)
+        for kind, vdir, vsyms, vshare in vendored_hints(facts)[:3]:
+            # P1-a / P2-c：疑似 vendored 目录只提示不自动排除（默认排除清单是
+            # 冻结契约），把「跑完 map 才知道该 exclude 什么」的返工前置
+            if kind == 'exclude':
+                print('[WARN] suspected vendored directory %r (%d/%d symbols, '
+                      '%.0f%%) — consider re-running analyze with --exclude %s'
+                      % (vdir, vsyms, counts['symbols'], vshare, vdir))
+            else:
+                print('[WARN] top-level directory %r holds %d/%d symbols '
+                      '(%.0f%%) — check whether it is vendored or project code'
+                      % (vdir, vsyms, counts['symbols'], vshare))
     if counts['files'] == 0 or counts['files'] == counts['unsupported_files']:
         print('[WARN] zero supported source files (artifacts written anyway)')
         return 1
@@ -2456,6 +2575,23 @@ def _call_graph(facts, include_inferred):
     return fwd, rev
 
 
+def _resolved_note(index, name, exact):
+    """P2-b：同名多候选时回显「解析到谁」（写进 notes，不新增 schema 字段）。
+
+    单候选/零候选返回 None（无歧义可言）；多候选时给出首个命中（按 file:line 排序，
+    与图节点排序口径一致），避免读者以为 impact/path 命中的是唯一同名符号。
+    """
+    hits = resolve_symbols(index, name, exact)
+    if len(hits) <= 1:
+        return None
+    first = sorted(hits, key=lambda s: (s['file'], s['start_line'],
+                                        s['qualname']))[0]
+    return ('%d symbols share the name %r; anchors resolve by tail name '
+            '(first: %s at %s:%d)'
+            % (len(hits), name, first['qualname'], first['file'],
+               first['start_line']))
+
+
 def cmd_map(facts, depth, subdir, file_granular):
     """项目地图（AC-43）：目录/文件级节点 + 跨节点 import 边聚合。
 
@@ -2484,7 +2620,10 @@ def cmd_map(facts, depth, subdir, file_granular):
                                  'symbols': 0, 'lines': 0}
         node['files'] += 1
         node['symbols'] += sym_count.get(path, 0)
-        node['lines'] += rec.get('lines') or 0
+        if rec.get('language'):
+            # P1-h：未支持/二进制文件的「行数」是字节里的换行计数（图标、日志、
+            # zip 各能贡献十万级），不进 lines 聚合——语义见 notes
+            node['lines'] += rec.get('lines') or 0
 
     file_set = set(rec['path'] for rec in facts['files'])
     edges = {}
@@ -2516,6 +2655,20 @@ def cmd_map(facts, depth, subdir, file_granular):
     if unmapped:
         notes.append('%d import(s) without an in-repo target are not mapped'
                      % unmapped)
+    unlang = sum(1 for rec in facts['files'] if not rec.get('language'))
+    if unlang:
+        notes.append('%d file(s) without a supported language are excluded from '
+                     'line counts (binary/unparsed; their line count is '
+                     'byte-derived, not code lines)' % unlang)
+    for kind, vdir, vsyms, vshare in vendored_hints(facts)[:3]:
+        if kind == 'exclude':
+            notes.append('suspected vendored directory %r (%d/%d symbols, %.0f%%); '
+                         'consider re-running analyze with --exclude %s'
+                         % (vdir, vsyms, len(facts['symbols']), vshare, vdir))
+        else:
+            notes.append('top-level directory %r holds %d/%d symbols (%.0f%%); '
+                         'check whether it is vendored or project code'
+                         % (vdir, vsyms, len(facts['symbols']), vshare))
     return bool(node_list), 0, None, {'nodes': node_list, 'edges': edge_list}, notes
 
 
@@ -2593,6 +2746,9 @@ def cmd_impact(facts, index, name, exact, depth, include_inferred):
     elif not include_inferred:
         notes.append('default follows verified edges only; '
                      'retry with --include-inferred to widen')
+    rnote = _resolved_note(index, name, exact)
+    if rnote:
+        notes.insert(0, rnote)
     return bool(levels), matched, name, {'levels': levels}, notes
 
 
@@ -2640,7 +2796,12 @@ def cmd_path(facts, index, a, b, exact, include_inferred):
         note = '未找到实锤路径 (no verified call path); try --include-inferred' \
             if not include_inferred \
             else 'no call path even with inferred edges included'
-        return False, matched, a, empty, [note]
+        pnotes = [note]
+        for who in (a, b):
+            rn = _resolved_note(index, who, exact)
+            if rn:
+                pnotes.append(rn)
+        return False, matched, a, empty, pnotes
     hops = []
     node = end
     while parent[node] is not None:
@@ -2649,7 +2810,12 @@ def cmd_path(facts, index, a, b, exact, include_inferred):
                      'confidence': rec[2]})
         node = u
     hops.reverse()
-    return True, matched, a, {'from': a, 'to': b, 'hops': hops}, []
+    pnotes = []
+    for who in (a, b):
+        rn = _resolved_note(index, who, exact)
+        if rn:
+            pnotes.append(rn)
+    return True, matched, a, {'from': a, 'to': b, 'hops': hops}, pnotes
 
 
 def cmd_entry(facts, kind):
@@ -2697,7 +2863,11 @@ def render_query_md(shell):
     res = shell['results']
     out = []
     add = out.append
-    if shell['matched'] > 1:
+    if cmd == 'search':
+        # P2-a：表头口径与列出条目一致（原先只报 symbols 数，calls/files 不计数）
+        add('matched: %d symbols, %d calls, %d files'
+            % (shell['matched'], len(res['calls']), len(res['files'])))
+    elif shell['matched'] > 1:
         add('matched: %d symbols' % shell['matched'])
     if cmd == 'map':
         for n in res['nodes']:
@@ -3454,6 +3624,71 @@ FIXTURE_COMPOSER = '''\
 }
 '''
 
+# P0-1：FFI 边界形态（照 experiment-report D5-P0-1 的 :1075/:1332 真实形状构造）
+FIXTURE_FFI = '''\
+class Ffi:
+    def win_rate(self, seq):
+        return native.mscore.win_rate(seq)
+
+    def helper(self, seq):
+        return native.mscore.other(seq)
+
+    def recurse_like(self, seq):
+        return self.recurse_like(seq)
+'''
+
+# P1-b：模板/限定返回类型、const / noexcept 限定成员、访问标号、pybind 模块出口
+FIXTURE_CPP_FORMS = '''\
+namespace forms {
+
+struct Labeled {
+public:
+  int get() { return 1; }
+private:
+  int secret() const { return 2; }
+};
+
+struct Grid {
+  std::vector<int> get_sizes(int n) {
+    return {};
+  }
+  std::vector<std::vector<int>> make_grid(int n) {
+    return {};
+  }
+  bool check_any(const std::vector<int>& xs) const {
+    return true;
+  }
+  int safe() noexcept {
+    return 0;
+  }
+};
+
+}  // namespace forms
+
+PYBIND11_MODULE(demo, m) {
+  m.attr("x") = 1;
+}
+'''
+
+# P1-c：构造函数初始化列表 + 多行 std::stable_sort(lambda) 两种跨语句吞并形态
+FIXTURE_CPP_CTOR = '''\
+struct Box {
+  explicit Box(int c) : val(std::move(c)), flag(cb_none(c.is_none())) {}
+  int val;
+};
+
+inline void sorter(std::vector<int>& v) {
+  std::stable_sort(v.begin(), v.end(),
+                   [](int a, int b) { return a < b; });
+}
+'''
+
+# P1-a/P2-c：第三方目录名命中（vendored 提示信号）
+FIXTURE_THIRD_PARTY = '''\
+def vendored_helper(x):
+    return x
+'''
+
 
 def _write_bytes(root, rel, data):
     full = os.path.join(root, *rel.split('/'))
@@ -3504,6 +3739,10 @@ def _materialize_fixture(root):
         'langs/main.dart': FIXTURE_DART,
         'langs/main.lua': FIXTURE_LUA,
         'langs/lhelper.lua': FIXTURE_LUA_HELPER,
+        'langs/cppforms.hpp': FIXTURE_CPP_FORMS,
+        'langs/box.hpp': FIXTURE_CPP_CTOR,
+        'third_party/lib.py': FIXTURE_THIRD_PARTY,
+        'src/ffi.py': FIXTURE_FFI,
         'langs/skip.vue': FIXTURE_VUE,
         'langs/skip.erl': FIXTURE_ERL,
         'apps/pkg/package.json': FIXTURE_PKG_JSON,
@@ -3866,6 +4105,15 @@ def run_selftest():
             ('lua', 'lx2', 'function', 10, 12),
             ('lua', 'M.loopy', 'method', 14, 21),
             ('lua', 'M.driver', 'method', 23, 26),
+            ('cpp', 'forms.Labeled', 'struct', 3, 8),
+            ('cpp', 'forms.Labeled.get', 'method', 5, 5),
+            ('cpp', 'forms.Labeled.secret', 'method', 7, 7),
+            ('cpp', 'forms.Grid', 'struct', 10, 23),
+            ('cpp', 'forms.Grid.get_sizes', 'method', 11, 13),
+            ('cpp', 'forms.Grid.make_grid', 'method', 14, 16),
+            ('cpp', 'forms.Grid.check_any', 'method', 17, 19),
+            ('cpp', 'forms.Grid.safe', 'method', 20, 22),
+            ('cpp', 'PYBIND11_MODULE', 'function', 27, 29),
             ('lua', 'LIMIT', 'variable', 3, 3),
         )
         sym_langs = set()
@@ -4239,6 +4487,69 @@ def run_selftest():
                       'AC-37 soft gate (10k lines, wall < 60s): %.2fs CPU'
                       % ac_cpu)
 
+        # ---- v1.13.3 修订批次探针（R6 实验 backlog）----
+        # P0-1：FFI 边界调用不得消解成「实锤自环」（报告 :1075/:1332 的真实形状）
+        ffi_self = _find_call(facts, 'src/ffi.py', 3, 'win_rate')
+        checker.check(ffi_self is not None
+                      and ffi_self['confidence'] == CONF_INFERRED
+                      and ffi_self.get('self_ref') is True
+                      and ffi_self['receiver'] == 'native.mscore',
+                      'P0-1 dotted-receiver self-name call -> inferred + '
+                      'self_ref (got %r)' % (ffi_self,))
+        ffi_other = _find_call(facts, 'src/ffi.py', 6, 'other')
+        checker.check(ffi_other is not None and not ffi_other.get('self_ref')
+                      and ffi_other['confidence'] == CONF_INFERRED,
+                      'P0-1 control: a non-self FFI call carries no self_ref')
+        ffi_selfcall = _find_call(facts, 'src/ffi.py', 9, 'recurse_like')
+        checker.check(ffi_selfcall is not None
+                      and ffi_selfcall.get('self_ref') is True
+                      and ffi_selfcall['confidence'] == CONF_VERIFIED,
+                      'P0-1 control: same-name call with a non-dotted receiver '
+                      'stays verified')
+        checker.check('self_ref' in HONESTY_BLOCK and 'FFI' in HONESTY_BLOCK,
+                      'P0-1 honesty block documents the FFI boundary / self_ref')
+        # P1-b：模板/限定返回类型、const / noexcept 成员、pybind 模块出口；
+        # 访问标号（public:/private:）不得被当成返回类型（实测踩过的回归）
+        cpp_rows = [s for s in facts['symbols']
+                    if s['file'] == 'langs/cppforms.hpp']
+        checker.check(bool(cpp_rows)
+                      and not [s for s in cpp_rows
+                               if s['signature'].startswith(('public:',
+                                                             'private:'))],
+                      'P1-b access labels are not treated as return types')
+        checker.check(_find_symbol(facts, 'PYBIND11_MODULE') is not None,
+                      'P1-b pybind11 module init function is extracted')
+        # P1-c：跨语句吞并的伪声明不进符号表；其行内的真实调用照常产出
+        box_rows = [s for s in facts['symbols'] if s['file'] == 'langs/box.hpp']
+        checker.check(bool(box_rows)
+                      and not [s for s in box_rows
+                               if s['qualname'].startswith('std.')],
+                      'P1-c greedy-paren pseudo declarations dropped (got %r)'
+                      % ([s['qualname'] for s in box_rows],))
+        checker.check(_find_symbol(facts, 'Box.Box') is not None,
+                      'P1-c control: the constructor itself is still a symbol')
+        checker.check(_find_call(facts, 'langs/box.hpp', 7,
+                                 'begin') is not None
+                      and _find_call(facts, 'langs/box.hpp', 7,
+                                     'end') is not None,
+                      'P1-c control: calls inside the previously swallowed '
+                      'multi-line call stay listed')
+        # P1-d / A3-3：标签暴露口径 + 调用边 extractor 归属
+        checker.check(_conf_label(CONF_VERIFIED) == '实锤·名',
+                      'P1-d verified label exposes the tail-name criterion')
+        hpp_calls = [c for c in facts['calls'] if c['file'].endswith('.hpp')]
+        checker.check(bool(hpp_calls)
+                      and all(c['extractor'] == 'brace' for c in hpp_calls)
+                      and any(c['extractor'] == 'ast' for c in facts['calls']),
+                      'A3-3 call edges carry the per-language extractor')
+        # P1-a / P2-c：vendored 提示（只建议不自动排除）
+        hints = vendored_hints(facts)
+        checker.check(any(h[0] == 'exclude' and h[1] == 'third_party'
+                          for h in hints),
+                      'P1-a/P2-c vendored hint detects a third-party-named dir')
+        checker.check(vendored_hints({'symbols': []}) == [],
+                      'P1-a/P2-c vendored hint is empty when there are no symbols')
+
         # AC-25：入口点八类各 ≥1（F-a：多 manifest 各自产条目，evidence 带相对路径）
         entry_kinds = set(e['kind'] for e in facts['entry_points'])
         checker.check(entry_kinds == set(ENTRY_KINDS),
@@ -4391,6 +4702,30 @@ def run_selftest():
                       '(resolve_symbols driver -> M.driver)')
         checker.check(_find_call(facts, 'langs/main.lua', 24, 'shout') is not None,
                       'P2-9 the diverging call edge is present (M.driver -> shout)')
+
+        # P1-h / P2-b（v1.13.3）：map 行数聚合口径 + 多候选回显
+        _mfh, _xh, _sh, mres_h, mnotes_h = cmd_map(facts, 1, None, False)
+        checker.check(
+            sum(n['lines'] for n in mres_h['nodes'])
+            == sum(r['lines'] for r in facts['files'] if r['language']),
+            'P1-h map line aggregate excludes unsupported/binary files')
+        checker.check(any('without a supported language' in n
+                          for n in mnotes_h),
+                      'P1-h map note explains the line-count exclusion')
+        multi_name = None
+        for tail in sorted(index['by_last']):
+            if len(index['by_last'][tail]) > 1 and tail not in index['by_qual']:
+                multi_name = tail
+                break
+        checker.check(multi_name is not None,
+                      'P2-b fixture provides a multi-candidate tail name')
+        imp_notes = cmd_impact(facts, index, multi_name, False, 2, False)[4]
+        checker.check(any('symbols share the name' in n for n in imp_notes),
+                      'P2-b multi-candidate impact echoes the resolved symbol')
+        pth_notes = cmd_path(facts, index, multi_name, 'compute_total', False,
+                             False)[4]
+        checker.check(any('symbols share the name' in n for n in pth_notes),
+                      'P2-b multi-candidate path echoes the resolved symbol')
         prog = sys.argv[0] or 'analyze_structure.py'
         outdir_w = _writable_dir(tmp)
         facts_path = os.path.join(outdir_w, 'structure-facts.json')
@@ -4636,6 +4971,12 @@ def run_selftest():
                       'AC-46 md form carries symbol and file:line')
         checker.check('实锤' in out,
                       'AC-46 md marks verified rows (实锤/推断 labels)')
+        code, out = _quiet_main([prog, 'search', callee_n, '--facts', facts_path,
+                                 '--format', 'md'])
+        checker.check(code == 0
+                      and re.search(r'matched: \d+ symbols, \d+ calls, \d+ files',
+                                    out) is not None,
+                      'P2-a search header counts symbols/calls/files')
         checker.check(dumps_facts(facts) == snapshot,
                       'AC-47 query functions never mutate facts (byte-identical)')
 
