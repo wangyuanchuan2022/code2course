@@ -124,7 +124,8 @@ class CourseChecker(HTMLParser):
             if 'translate-pair' in classes:
                 top['pairs'] += 1
             if set(classes) & {'flow-scene', 'onion-scene', 'tower-scene',
-                               'fork-scene', 'bet-scene', 'viz-scene'}:
+                               'fork-scene', 'bet-scene', 'viz-scene',
+                               'callgraph-scene'}:
                 top['eng'] += 1
             if tag == 'div' and 'quiz' in classes and 'bet-scene' not in classes:
                 top['quiz'] += 1

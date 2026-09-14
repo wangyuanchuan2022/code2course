@@ -387,7 +387,7 @@ LANG_TABLES = {
             (r'\bstruct\s+(?P<n>\w+)', K_STRUCT, 'type'),
             (r'\benum\s+(?P<n>\w+)', K_ENUM, 'type'),
             (r'\bnamespace\s+(?P<n>\w+)', K_MODULE, 'type'),
-            (r'\b(?:const|static\s+readonly)\s+[\w<>\[\],\s\?]*?\b(?P<n>\w+)\s*=[^=]', K_CONSTANT, 'value'),
+            (r'\b(?:const|static\s+readonly)\s+[\w<>\[\],\s\?]{0,120}?\b(?P<n>\w+)\s*=[^=]', K_CONSTANT, 'value'),
             (r'(?<!new\s)(?<!new\()\b(?P<n>\w+)\s*\([^;{}]*\)\s*\{', K_METHOD, 'func'),
         ),
         'imports': (
@@ -649,7 +649,7 @@ LANG_TABLES = {
         'decl': (
             (r'\bclass\s+(?P<n>\w+)', K_CLASS, 'type'),
             (r'\benum\s+(?P<n>\w+)\s*\{', K_ENUM, 'type'),
-            (r'\b(?:final|const)\s+[\w<>\[\],\s\?]*?\b(?P<n>\w+)\s*=[^=]', K_CONSTANT, 'value'),
+            (r'\b(?:final|const)\s+[\w<>\[\],\s\?]{0,120}?\b(?P<n>\w+)\s*=[^=]', K_CONSTANT, 'value'),
             (r'\bvar\s+(?P<n>\w+)\s*=[^=]', K_VARIABLE, 'value'),
             (r'[\w<>\[\],\?]+[ \t]+\b(?P<n>\w+)\s*\([^;{}]*\)\s*\{', K_FUNCTION, 'func'),
         ),
@@ -722,9 +722,11 @@ DEFAULT_EXCLUDES = frozenset((
 ))
 
 # 元数据文件：不作为源文件登记（v1 F5 元数据行），仅供入口点/依赖解析读取
+# P2-6：集合全小写——入口一律 base.lower() 比较（Windows 文件系统不敏感，且与
+# 目录排除口径一致），manifest_entries 内部的分派字面量同用小写。
 METADATA_BASENAMES = frozenset((
     'package.json', 'pyproject.toml', 'setup.py', 'setup.cfg',
-    'Cargo.toml', 'pom.xml', 'composer.json', 'go.mod',
+    'cargo.toml', 'pom.xml', 'composer.json', 'go.mod',
 ))
 
 # 命名启发式入口点（v1 口径：Python + JS 族；Go/Rust/Java 由 1b 扩列）
@@ -745,7 +747,8 @@ HONESTY_BLOCK = '''> 本底稿由 analyze_structure.py 自动生成。Python 部
 > 其余语言来自表驱动启发式引擎（extractor: brace = 大括号系 / end = end 块系），均为启发式而非事实。
 > 已知盲区举例：C/C++ 宏定义函数与函数指针调用、Java/C# 注解处理器与 Lambda 体、Go 接口隐式实现、
 > Rust 宏与 trait 默认方法、Ruby define_method 与单行修饰形式、Lua 表方法的两种调用形态、
-> JS/TS 对象字面量方法与装饰器。以上均不保证被识别。
+> JS/TS 对象字面量方法与装饰器、`)` 或 `]` 之后的链式方法调用（`fetch(x).then(h)`、
+> `arr[0].push(v)` 形态）。以上均不保证被识别。
 > 每条 import 边与调用边都标注了「实锤」（可在源码定位出处）或「推断」（未能对上本仓库符号表）；
 > 入口点中的命名启发式、manifest 声明与 listen( 调用均属启发式而非事实。
 > 底稿与源码冲突时，以源码为准。'''
@@ -757,10 +760,27 @@ def _rel_posix(root, path):
     return os.path.relpath(path, root).replace(os.sep, '/')
 
 
+_CONTROL_RE = re.compile(r'[\x00-\x1f\x7f-\x9f]')
+
+
+def _clean_text(text):
+    """控制字符（C0/C1：ESC / 换行 / 制表 …）→ 空格。
+
+    P2-5：源码行与路径会进 MD 与 stdout，未净化的控制字符可注入终端 ANSI 序列
+    或伪造整行；此处单点收口（JSON 侧另有 json.dumps 转义，无需重复）。
+    """
+    return _CONTROL_RE.sub(' ', text)
+
+
+def _md_cell(text):
+    """MD 单元格净化（P2-5）：'|' 转义 + 控制字符清空（防表格结构被打碎）。"""
+    return _clean_text(str(text)).replace('|', '\\|')
+
+
 def _line_at(src_lines, lineno):
-    """声明行原文（trim、≤200 字符；行号越界返回空串）。"""
+    """声明行原文（trim、控制字符→空格、≤200 字符；行号越界返回空串）。"""
     if 1 <= lineno <= len(src_lines):
-        return src_lines[lineno - 1].strip()[:SIGNATURE_MAX]
+        return _clean_text(src_lines[lineno - 1].strip())[:SIGNATURE_MAX]
     return ''
 
 
@@ -816,7 +836,14 @@ def scan_tree(root, exclude_names, warnings):
             keep.append(name)
         dirnames[:] = keep
         for fn in sorted(filenames):
-            out.append(_rel_posix(root, os.path.join(dirpath, fn)))
+            full = os.path.join(dirpath, fn)
+            if os.path.islink(full):
+                # secP2-2：文件符号链接同样跳过（目录分支早已跳过）——git 会还原
+                # 仓库内 120000 链接，跟随会把仓库外文件内容读进底稿
+                warnings.append(_warn(_rel_posix(root, dirpath), W_SYMLINK,
+                                      'symlinked file skipped: %s' % fn))
+                continue
+            out.append(_rel_posix(root, full))
     return out
 
 
@@ -824,6 +851,11 @@ def read_source(root, rel, lang, files, warnings):
     """读入源文件 → (file_record, data|None, text|None)；读取失败落 read-error。"""
     full = os.path.join(root, *rel.split('/'))
     rec = {'path': rel, 'lines': 0, 'language': lang, 'parse_error': None}
+    if not os.path.isfile(full):
+        # secP2-7：非普通文件（FIFO/设备/目录）不读——read 无超时，打开即可能挂死
+        warnings.append(_warn(rel, W_READ, 'not a regular file; skipped'))
+        files.append(rec)
+        return rec, None, None
     try:
         size = os.path.getsize(full)
         if size > READ_MAX_BYTES:
@@ -838,7 +870,8 @@ def read_source(root, rel, lang, files, warnings):
         files.append(rec)
         return rec, None, None
     try:
-        text = data.decode('utf-8')
+        text = data.decode('utf-8-sig')   # P2-5：剥 BOM（无 BOM 时行为不变），否则
+                                          # 首行行首锚定的 import 正则全部失配
     except UnicodeDecodeError:
         text = data.decode('utf-8', 'replace')
         warnings.append(_warn(rel, W_DECODE,
@@ -858,13 +891,19 @@ def manifest_entries(root, rel, base, warnings):
     """
     full = os.path.join(root, *rel.split('/'))
     try:
+        size = os.path.getsize(full)
+        if size > READ_MAX_BYTES:
+            # secP2-3：与源文件同闸——超大 manifest 不读入内存（先于 read）
+            warnings.append(_warn(rel, W_TOO_LARGE,
+                                  'manifest exceeds read cap (%d bytes)' % size))
+            return []
         with open(full, 'rb') as fh:
             data = fh.read()
     except OSError as exc:
         warnings.append(_warn(rel, W_MANIFEST, 'cannot read manifest: %s' % exc))
         return []
     try:
-        text = data.decode('utf-8')
+        text = data.decode('utf-8-sig')   # P2-5 同源：manifest 首行同样可能带 BOM
     except UnicodeDecodeError:
         warnings.append(_warn(rel, W_MANIFEST, 'manifest is not valid UTF-8'))
         return []
@@ -914,7 +953,7 @@ def manifest_entries(root, rel, base, warnings):
                 out.append({'kind': EP_MANIFEST_MAIN, 'file': rel, 'line': idx,
                             'evidence': '%s#mainClass' % rel,
                             'confidence': CONF_VERIFIED})
-    elif base == 'Cargo.toml':
+    elif base == 'cargo.toml':
         for idx, raw_line in enumerate(text.splitlines(), 1):
             if raw_line.strip() == '[[bin]]':         # 每个 [[bin]] 段各一条（F-a）
                 out.append({'kind': EP_MANIFEST_MAIN, 'file': rel, 'line': idx,
@@ -1309,6 +1348,7 @@ def strip_source(text, table, mode):
                         end = n
                 _blank(out, i, end)
                 i = end
+                prev_nonspace = close[-1]       # P2-4：字符串后不可能是正则起点
                 hit = True
                 break
         if hit:
@@ -1316,6 +1356,7 @@ def strip_source(text, table, mode):
         if '0' <= ch <= '9':
             m_num = re.match(r'[0-9][0-9a-zA-Z_.]*', text[i:])
             i += m_num.end() if m_num else 1    # 数字字面量：匹配即跳过（仅 ASCII 数字）
+            prev_nonspace = '0'                 # P2-4：数字后不可能是正则起点
             continue
         prev_nonspace = ch
         i += 1
@@ -1351,8 +1392,29 @@ def find_body_pos(stripped, start):
     return None
 
 
-def brace_end_pos(stripped, body_pos):
-    """从块体 '{' 起配对计数；不平衡返回 None（禁止回退 start_line——R3）。"""
+def _brace_match_table(stripped):
+    """一次 O(n) 栈扫描：'{' 位置 → 配对 '}' 位置（P2-4 惰性兜底；语义与
+    brace_end_pos「首个使深度归零的 '}'」逐位等价）。"""
+    match = {}
+    stack = []
+    for k, ch in enumerate(stripped):
+        if ch == '{':
+            stack.append(k)
+        elif ch == '}' and stack:
+            match[stack.pop()] = k
+    return match
+
+
+def brace_end_pos(stripped, body_pos, cache=None):
+    """从块体 '{' 起配对计数；不平衡返回 None（禁止回退 start_line——R3）。
+
+    P2-4：块不配平时每个声明都从 body_pos 扫到 EOF（O(声明数 × 文件长度)，恶意
+    构造可到分钟-小时级）。裸扫描累计超过预算后，改走一次 O(n) 配对表；正常文件
+    零额外开销（cache=None 即旧行为）。
+    """
+    table = cache.get('table') if cache is not None else None
+    if table is not None:
+        return table.get(body_pos)
     depth = 0
     for k in range(body_pos, len(stripped)):
         c = stripped[k]
@@ -1362,6 +1424,10 @@ def brace_end_pos(stripped, body_pos):
             depth -= 1
             if depth == 0:
                 return k
+    if cache is not None:
+        cache['budget'] = cache.get('budget', 0) - (len(stripped) - body_pos)
+        if cache['budget'] <= 0:
+            cache['table'] = _brace_match_table(stripped)
     return None
 
 
@@ -1375,6 +1441,7 @@ def end_block_end_pos(stripped, table, scan_from):
     open_ls = set(table['open_kw_line_start'])
     close_kw = set(table['close_kw'])
     depth = 1                                    # 声明本身已开启一块
+    ls_line = -1                                 # 最近一个「行首开块关键字」所在行的行首偏移
     for m in _WORD_RE.finditer(stripped, scan_from):
         w = m.group(0)
         if w in close_kw:
@@ -1382,6 +1449,9 @@ def end_block_end_pos(stripped, table, scan_from):
             if depth == 0:
                 return m.start()
         elif w in open_any:
+            if w == 'do' and stripped.rfind('\n', 0, m.start()) + 1 == ls_line:
+                continue                         # P1-7 Ruby：`while/for/until … do` 的 do
+                                                 # 是语法标记而非新块（同行已计开块）
             depth += 1
         elif w in open_ls:
             k = m.start() - 1
@@ -1389,6 +1459,7 @@ def end_block_end_pos(stripped, table, scan_from):
                 k -= 1
             if k < 0 or stripped[k] == '\n':     # 仅逻辑行首的关键字开启新块
                 depth += 1
+                ls_line = stripped.rfind('\n', 0, m.start()) + 1
     return None
 
 
@@ -1503,8 +1574,11 @@ def resolve_import(resolver, root, rel, spec):
     if resolver == 'c_quote':
         d = rel.split('/')[:-1]
         for base in (tuple(d), ()):
-            if _fs_exists(root, base + (spec,), ''):
-                return _rel_posix(root, os.path.join(root, *(base + (spec,)))), True, False, False
+            cand = base + (spec,)
+            if _escapes_root(root, cand, ''):
+                return None, False, True, False   # P1-2 逃逸仓库根：不探测、不产 verified 边
+            if _fs_exists(root, cand, ''):
+                return _rel_posix(root, os.path.join(root, *cand)), True, False, False
         return None, False, False, False
     if resolver == 'c_angle':
         return None, False, True, False        # 系统头 → inferred + external
@@ -1524,9 +1598,12 @@ def resolve_import(resolver, root, rel, spec):
         t = _resolve_dotfile(root, rel, spec, ('.scala',))
         return (t, True, False, False) if t else (None, False, True, False)
     if resolver == 'go':
+        parts = tuple(spec.split('/'))
+        if _escapes_root(root, parts, ''):
+            return None, False, True, False    # P1-2 逃逸仓库根：不探测、不产 verified 边
         if _fs_exists(root, (spec,), '.go'):
             return spec + '.go', True, False, False
-        if os.path.isdir(os.path.join(root, *spec.split('/'))):
+        if os.path.isdir(os.path.join(root, *parts)):
             return spec + '/', True, False, False
         return None, False, True, False        # 模块路径非仓库相对 → inferred + external
     if resolver == 'rust':
@@ -1535,10 +1612,13 @@ def resolve_import(resolver, root, rel, spec):
             parts = tuple(rest.split('::')) if rest else ()
             for base in (('src',), ()):
                 for i in range(len(parts), 0, -1):
-                    if _fs_exists(root, base + parts[:i], '.rs'):
-                        return _rel_posix(root, os.path.join(root, *(base + parts[:i]))) + '.rs', True, False, False
-                    if _fs_exists(root, base + parts[:i] + ('mod',), '.rs'):
-                        return _rel_posix(root, os.path.join(root, *(base + parts[:i] + ('mod',)))) + '.rs', True, False, False
+                    cand = base + parts[:i]
+                    if _escapes_root(root, cand, '.rs'):
+                        return None, False, True, False   # P1-2 逃逸仓库根
+                    if _fs_exists(root, cand, '.rs'):
+                        return _rel_posix(root, os.path.join(root, *cand)) + '.rs', True, False, False
+                    if _fs_exists(root, cand + ('mod',), '.rs'):
+                        return _rel_posix(root, os.path.join(root, *(cand + ('mod',)))) + '.rs', True, False, False
         return None, False, True, False        # 外部 crate → inferred + external
     if resolver == 'php_use':
         t = _resolve_dotfile(root, rel, spec.replace('\\', '.'), ('.php',))
@@ -1574,8 +1654,11 @@ def resolve_import(resolver, root, rel, spec):
         modpath = spec.replace('.', '/')
         d = rel.split('/')[:-1]
         for base in (tuple(d), ()):
-            if _fs_exists(root, base + (modpath,), '.lua'):
-                return _rel_posix(root, os.path.join(root, *(base + (modpath,)))) + '.lua', True, False, False
+            cand = base + (modpath,)
+            if _escapes_root(root, cand, '.lua'):
+                return None, False, True, False   # P1-2 逃逸仓库根：不探测、不产 verified 边
+            if _fs_exists(root, cand, '.lua'):
+                return _rel_posix(root, os.path.join(root, *cand)) + '.lua', True, False, False
         return None, False, True, False
     return None, False, True, False
 
@@ -1610,12 +1693,13 @@ def analyze_generic(root, rel, lang, data, text, symbols, imports,
     comments_only = strip_source(text, table, 'comments')
     offsets = _line_offsets(text)
     total_lines = len(text.splitlines())
+    src_lines = text.splitlines()        # P2-11：line_of 闭包复用（原来每次调用重切全文）
 
     def pos_line(pos):
         return min(_pos_line(offsets, pos), total_lines)
 
     def line_of(line_no):
-        return _line_at(text.splitlines(), line_no)
+        return _line_at(src_lines, line_no)   # P2-11：一次切分，闭包复用
 
     # ---- 1) 声明扫描（默认在完全剥离文本上；decl_on_comments 语言用仅剥注释文本）----
     found = []
@@ -1640,6 +1724,7 @@ def analyze_generic(root, rel, lang, data, text, symbols, imports,
     scopes = []            # [end_pos, qualname, is_type]
     spans = []             # (start, end, qualname) 供 caller 归属
     unbalanced = False
+    brace_cache = {'budget': 4 * (len(stripped) + 1)}   # P2-4：裸配对扫描预算
     for start, mend, name, recv, kind, role in found:
         while scopes and scopes[-1][0] < start:
             scopes.pop()
@@ -1674,7 +1759,8 @@ def analyze_generic(root, rel, lang, data, text, symbols, imports,
             close_pos = end_block_end_pos(stripped, table, mend)
         else:
             body_pos = find_body_pos(stripped, start)
-            close_pos = brace_end_pos(stripped, body_pos) if body_pos is not None else None
+            close_pos = brace_end_pos(stripped, body_pos, brace_cache) \
+                if body_pos is not None else None
 
         if role == 'impl':
             if close_pos is None:
@@ -1802,9 +1888,31 @@ def analyze_generic(root, rel, lang, data, text, symbols, imports,
         for m in new_re.finditer(stripped):
             hits.append((m.start('n'), m.group('n'), None))
     hits.sort(key=lambda item: item[0])
-    # 声明自身（def f( / func f( / function f(）不是调用点：落在声明匹配区间内的命中剔除
-    hits = [h for h in hits
-            if not any(d_start <= h[0] < d_end for d_start, d_end in decl_spans)]
+    # 声明自身（def f( / func f( / function f(）不是调用点：落在声明匹配区间内的
+    # 命中剔除。P2-4③：区间按 start 排序 + 前缀最大 end + 二分 → O(log m) 判定
+    # （原为「命中数 × 声明数」双重线性）
+    span_pairs = sorted(decl_spans)
+    span_starts = [pair[0] for pair in span_pairs]
+    prefix_max_end = []
+    run_end = -1
+    for _span_s, _span_e in span_pairs:
+        if _span_e > run_end:
+            run_end = _span_e
+        prefix_max_end.append(run_end)
+
+    def in_decl_span(pos):
+        if not span_starts or span_starts[0] > pos:
+            return False
+        lo, hi = 0, len(span_starts) - 1
+        while lo < hi:                       # 最后一个 start <= pos 的下标
+            mid = (lo + hi + 1) // 2
+            if span_starts[mid] <= pos:
+                lo = mid
+            else:
+                hi = mid - 1
+        return prefix_max_end[lo] > pos
+
+    hits = [h for h in hits if not in_decl_span(h[0])]
     for m in macro_re.finditer(stripped):
         if m.group('n') in macro_stops:
             filtered += 1                      # 宏形态：只计数不列条
@@ -1847,14 +1955,16 @@ def build_facts(repo, selected_langs=None, extra_excludes=None):
     imports = []
     calls = []
     entry_points = []
-    call_units = []                      # (rel, [(line, caller, callee, receiver)])
+    call_units = []                      # (rel, lang, [(line, caller, callee, receiver)])
     filtered_calls = 0
 
     for rel in scan_tree(root, excludes, warnings):
         base = os.path.basename(rel)
         ext = os.path.splitext(base)[1].lower()
-        if base in METADATA_BASENAMES:
-            entry_points.extend(manifest_entries(root, rel, base, warnings))
+        if base.lower() in METADATA_BASENAMES:
+            # P2-6：大小写归一（Windows 文件系统不敏感，目录排除口径亦不敏感）；
+            # 归一后的 basename 同时决定 manifest_entries 内的分派分支
+            entry_points.extend(manifest_entries(root, rel, base.lower(), warnings))
             continue
         lang = EXT_TO_LANG.get(ext)
         if lang is None:
@@ -1879,14 +1989,14 @@ def build_facts(repo, selected_langs=None, extra_excludes=None):
                 rec['parse_error'] = parse_error
                 warnings.append(_warn(rel, W_PARSE, parse_error))
             else:
-                call_units.append((rel, unit))
+                call_units.append((rel, lang, unit))
         else:                          # brace / end 双引擎（表驱动，1b）
             unit, extra_filtered = analyze_generic(
                 root, rel, lang, data, text, symbols, imports,
                 entry_points, warnings)
             filtered_calls += extra_filtered
             if unit:
-                call_units.append((rel, unit))
+                call_units.append((rel, lang, unit))
 
     for rec in files:                    # 命名启发式入口点（清单口径，与引擎无关）
         parts = rec['path'].split('/')
@@ -1907,10 +2017,13 @@ def build_facts(repo, selected_langs=None, extra_excludes=None):
         key = sym['qualname'].split('.')[-1]
         last_segment[key] = last_segment.get(key, 0) + 1
 
-    for rel, raw_calls in call_units:
+    for rel, lang, raw_calls in call_units:
         seen = set()
         for line, caller, callee, receiver in raw_calls:
-            if callee in BUILTIN_NAMES:
+            if lang == 'python' and callee in BUILTIN_NAMES:
+                # P2-8/D-21：Python 内建清单只配 Python（ast 引擎）；其余 15 门
+                # 启发式语言由各自 global_stops 收口——否则 JS `arr.map(fn)` /
+                # `list.filter(...)` 被当内建名静默吞掉
                 filtered_calls += 1      # 内建/全局名只计数、不逐条列出
                 continue
             key = (rel, line, callee)
@@ -1981,10 +2094,11 @@ def render_md(facts):
     counts = facts['counts']
     out = []
     add = out.append
-    add('# 结构事实底稿 · %s' % facts['root_name'])
+    add('# 结构事实底稿 · %s' % _md_cell(facts['root_name']))
     add('')
     add('- 工具：%s（schema_version %d）' % (facts['tool'], facts['schema_version']))
-    add('- 语言：%s' % (', '.join(facts['languages']) if facts['languages'] else '（无）'))
+    add('- 语言：%s' % _md_cell(', '.join(facts['languages'])
+                               if facts['languages'] else '（无）'))
     add('- 计数摘要：files=%d symbols=%d imports=%d calls=%d（实锤 %d / 推断 %d）'
         'entry_points=%d warnings=%d'
         % (counts['files'], counts['symbols'], counts['imports'], counts['calls'],
@@ -1997,7 +2111,8 @@ def render_md(facts):
     add('| 路径 | 行数 | 语言 |')
     add('|---|---|---|')
     for rec in facts['files']:
-        add('| %s | %d | %s |' % (rec['path'], rec['lines'], rec['language'] or '-'))
+        add('| %s | %d | %s |' % (_md_cell(rec['path']), rec['lines'],
+                                  _md_cell(rec['language'] or '-')))
     if not facts['files']:
         add('| （无） | 0 | - |')
     add('')
@@ -2009,10 +2124,11 @@ def render_md(facts):
     for sym in facts['symbols']:
         end = sym['end_line'] if sym['end_line'] is not None else '?'
         add('| %s | %s | %s:%s-%s | %s |'
-            % (sym['qualname'], sym['kind'], sym['file'], sym['start_line'], end,
-               sym['extractor']))
+            % (_md_cell(sym['qualname']), _md_cell(sym['kind']),
+               _md_cell(sym['file']), sym['start_line'], end,
+               _md_cell(sym['extractor'])))
         if sym['signature']:
-            add('    %s' % sym['signature'])
+            add('    %s' % _md_cell(sym['signature']))
     if not facts['symbols']:
         add('| （无） | - | - | - |')
     add('')
@@ -2023,8 +2139,9 @@ def render_md(facts):
     add('|---|---|---|---|---|')
     for imp in facts['imports']:
         add('| %s:%d | %s | %s | %s | %s |'
-            % (imp['file'], imp['line'], imp['target'], _conf_label(imp['confidence']),
-               imp['kind'], 'yes' if imp['external'] else 'no'))
+            % (_md_cell(imp['file']), imp['line'], _md_cell(imp['target']),
+               _conf_label(imp['confidence']), _md_cell(imp['kind']),
+               'yes' if imp['external'] else 'no'))
     if not facts['imports']:
         add('| （无） | - | - | - | - |')
     add('')
@@ -2035,9 +2152,9 @@ def render_md(facts):
     add('|---|---|---|---|---|---|')
     for call in facts['calls']:
         add('| %s:%d | %s | %s | %s | %s | %d |'
-            % (call['file'], call['line'], call['callee'], call['caller'] or '-',
-               call['receiver'] or '-', _conf_label(call['confidence']),
-               call['candidates']))
+            % (_md_cell(call['file']), call['line'], _md_cell(call['callee']),
+               _md_cell(call['caller'] or '-'), _md_cell(call['receiver'] or '-'),
+               _conf_label(call['confidence']), call['candidates']))
     if not facts['calls']:
         add('| （无） | - | - | - | - | 0 |')
     add('')
@@ -2052,11 +2169,11 @@ def render_md(facts):
         for call in inferred:
             by_file.setdefault(call['file'], []).append(call)
         for path in sorted(by_file):
-            add('### %s' % path)
+            add('### %s' % _md_cell(path))
             add('')
             for call in sorted(by_file[path], key=lambda c: (c['line'], c['callee'])):
                 add('- 行 %d 调用 `%s` — 断因：未在本仓库符号表中找到同名符号'
-                    % (call['line'], call['callee']))
+                    % (call['line'], _md_cell(call['callee'])))
             add('')
 
     add('## 入口点')
@@ -2065,8 +2182,8 @@ def render_md(facts):
     add('|---|---|---|---|')
     for entry in facts['entry_points']:
         add('| %s | %s:%d | %s | %s |'
-            % (entry['kind'], entry['file'], entry['line'], entry['evidence'],
-               _conf_label(entry['confidence'])))
+            % (_md_cell(entry['kind']), _md_cell(entry['file']), entry['line'],
+               _md_cell(entry['evidence']), _conf_label(entry['confidence'])))
     if not facts['entry_points']:
         add('| （无） | - | - | - |')
     add('')
@@ -2077,7 +2194,8 @@ def render_md(facts):
         add('（无）')
     else:
         for warn in facts['warnings']:
-            add('- [%s] %s：%s' % (warn['kind'], warn['file'], warn['message']))
+            add('- [%s] %s：%s' % (_md_cell(warn['kind']), _md_cell(warn['file']),
+                                   _md_cell(warn['message'])))
     add('')
 
     add('## 诚实性声明')
@@ -2259,7 +2377,9 @@ def build_query_index(facts):
     by_last = {}
     for sym in facts['symbols']:
         by_qual.setdefault(sym['qualname'], []).append(sym)
-        by_last.setdefault(sym['name'], []).append(sym)
+        # P2-9：by_last 与调用边同口径（末段名）——Lua `function M.shout` 的
+        # name 带限定前缀，若按 name 登记则 `callers shout` 命中不了
+        by_last.setdefault(_lastseg(sym['qualname']), []).append(sym)
     by_caller = {}
     by_callee = {}
     for call in facts['calls']:
@@ -2582,53 +2702,57 @@ def render_query_md(shell):
     if cmd == 'map':
         for n in res['nodes']:
             add('- %s  files=%d symbols=%d lines=%d'
-                % (n['id'], n['files'], n['symbols'], n['lines']))
+                % (_md_cell(n['id']), n['files'], n['symbols'], n['lines']))
         for e in res['edges']:
             add('- %s -> %s  count=%d (verified=%d inferred=%d external=%d)'
-                % (e['from'], e['to'], e['count'], e['verified'],
-                   e['inferred'], e['external']))
+                % (_md_cell(e['from']), _md_cell(e['to']), e['count'],
+                   e['verified'], e['inferred'], e['external']))
     elif cmd == 'callers':
         for r in res:
             add('- %s  %s:%d  (%s)  called by %s%s'
-                % (r['symbol'], r['file'], r['line'],
-                   _conf_label(r['confidence']), r['caller'] or '(module)',
+                % (_md_cell(r['symbol']), _md_cell(r['file']), r['line'],
+                   _conf_label(r['confidence']), _md_cell(r['caller'] or '(module)'),
                    '  [ambiguous]' if r['ambiguous'] else ''))
     elif cmd == 'callees':
         for r in res:
             add('- %s  %s:%d  (%s)  calls %s'
-                % (r['symbol'], r['file'], r['line'],
-                   _conf_label(r['confidence']), r['callee']))
+                % (_md_cell(r['symbol']), _md_cell(r['file']), r['line'],
+                   _conf_label(r['confidence']), _md_cell(r['callee'])))
     elif cmd == 'impact':
         for lvl in res['levels']:
             if 'confidences' in lvl:
-                names = ', '.join('%s(%s)' % (s, _conf_label(lvl['confidences'][s]))
+                names = ', '.join('%s(%s)' % (_md_cell(s),
+                                              _conf_label(lvl['confidences'][s]))
                                   for s in lvl['symbols'])
             else:
-                names = ', '.join(lvl['symbols'])
+                names = ', '.join(_md_cell(s) for s in lvl['symbols'])
             add('- depth %d: %s' % (lvl['depth'], names or '(none)'))
     elif cmd == 'path':
         if res['hops']:
             add('- route: %s' % ' -> '.join(
-                [res['hops'][0]['from']] + [h['to'] for h in res['hops']]))
+                [_md_cell(res['hops'][0]['from'])]
+                + [_md_cell(h['to']) for h in res['hops']]))
         for h in res['hops']:
             add('  - %s -> %s  %s:%d  (%s)'
-                % (h['from'], h['to'], h['file'], h['line'],
-                   _conf_label(h['confidence'])))
+                % (_md_cell(h['from']), _md_cell(h['to']), _md_cell(h['file']),
+                   h['line'], _conf_label(h['confidence'])))
     elif cmd == 'entry':
         for r in res:
             add('- %s  %s:%d  (%s)  evidence: %s'
-                % (r['kind'], r['file'], r['line'],
-                   _conf_label(r['confidence']), r['evidence']))
+                % (_md_cell(r['kind']), _md_cell(r['file']), r['line'],
+                   _conf_label(r['confidence']), _md_cell(r['evidence'])))
     elif cmd == 'search':
         for s in res['symbols']:
             add('- symbol  %s  %s:%d  %s'
-                % (s['qualname'], s['file'], s['start_line'], s['kind']))
+                % (_md_cell(s['qualname']), _md_cell(s['file']),
+                   s['start_line'], _md_cell(s['kind'])))
         for r in res['files']:
             add('- file  %s  (%s, %s lines)'
-                % (r['path'], r['language'] or 'unknown', r.get('lines')))
+                % (_md_cell(r['path']), _md_cell(r['language'] or 'unknown'),
+                   r.get('lines')))
         for c in res['calls']:
             add('- call  %s  %s:%d  (%s)'
-                % (c['callee'], c['file'], c['line'],
+                % (_md_cell(c['callee']), _md_cell(c['file']), c['line'],
                    _conf_label(c['confidence'])))
     for note in shell['notes']:
         add('[NOTE] %s' % note)
@@ -2910,6 +3034,22 @@ app.listen(3000, function () {
 });
 '''
 
+# P2-4：数字/字符串字面量之后的 `/` 不是正则起点——曾被误当正则起点吞掉整段
+# （`scale(2)` / `span(1)` 静默丢边）；`limit(3)` / `tail(2)` 是「没被吞」的正控制。
+FIXTURE_JS_ARITH = '''\
+const RATE = 8 / scale(2) / limit(3);
+const SPAN = "n" / span(1) / tail(2);
+'''
+
+# P2-8：JS 方法调用不得被 Python 内建名清单过滤（map / filter 均在 dir(builtins)）
+FIXTURE_JS_METHODS = '''\
+function useAll(arr) {
+  const mapped = arr.map(double);
+  const kept = arr.filter(odd);
+  return mapped;
+}
+'''
+
 FIXTURE_TS = '''\
 import React from 'react';
 
@@ -3131,6 +3271,26 @@ def broken_ruby(x)
   x + 1
 '''
 
+# P1-7：Ruby `while/for … do … end` —— do 是语法标记而非新块；含循环的 def
+# 曾经因 do 双计数永远凑不回 0（end_line=null + 假 unbalanced 告警）。
+FIXTURE_RUBY_LOOPS = '''\
+module Loop
+  def self.count_down(items)
+    i = 0
+    while i < 3 do
+      i += 1
+    end
+    for it in items do
+      puts it
+    end
+    items.each do |x|
+      puts x
+    end
+    0
+  end
+end
+'''
+
 FIXTURE_KOTLIN = '''\
 import java.util.Locale
 
@@ -3236,6 +3396,11 @@ function M.loopy(items)
     print('drain')
   end
 end
+
+function M.driver(items)
+  M.shout('x')
+  return #items
+end
 '''
 
 FIXTURE_LUA_HELPER = '''\
@@ -3311,6 +3476,8 @@ def _materialize_fixture(root):
         'src/deco.py': FIXTURE_DECO,
         # --- 1b：多语言矩阵（16 门 + 排除目录探针 + manifest）---
         'langs/hello.js': FIXTURE_JS,
+        'langs/arith.js': FIXTURE_JS_ARITH,
+        'langs/methods.js': FIXTURE_JS_METHODS,
         'langs/helper.js': FIXTURE_JS_HELPER,
         'langs/server.js': FIXTURE_JS_SERVER,
         'langs/app.ts': FIXTURE_TS,
@@ -3330,6 +3497,7 @@ def _materialize_fixture(root):
         'langs/app.rb': FIXTURE_RUBY,
         'langs/rhelper.rb': FIXTURE_RUBY_HELPER,
         'langs/broken.rb': FIXTURE_RUBY_BROKEN,
+        'langs/loops.rb': FIXTURE_RUBY_LOOPS,
         'langs/main.kt': FIXTURE_KOTLIN,
         'langs/app.swift': FIXTURE_SWIFT,
         'langs/Main.scala': FIXTURE_SCALA,
@@ -3349,6 +3517,15 @@ def _materialize_fixture(root):
                  b'def no_tail(a):\n    return a * 3\n# no trailing newline')
     _write_bytes(root, 'src/crlf.py', b'def crlf_func(a):\r\n    return a - 1\r\n')
     _write_bytes(root, 'src/bad.py', b'def broken(:\n    pass\n')
+    _write_bytes(root, 'langs/bom.h',                  # P2-5：首行带 BOM
+                 b'\xef\xbb\xbf#include "header.h"\n#define BOM_H 1\n')
+    _write_bytes(root, 'apps/upper/GO.MOD',            # P2-6：大小写变体 manifest
+                 b'module example.com/demo\n')
+    _write_bytes(root, 'langs/esc.c',                  # secP2-5：签名含 ESC + 管道
+                 b'int esc_fn(int a) {\x1b[31m /* | */\n'
+                 b'  return a;\n'
+                 b'}\n'
+                 b'#include "weird|inc.h"\n')
     for name in PROBE_DIR_NAMES:
         _write_bytes(root, name + '/probe.py', FIXTURE_PROBE.encode('utf-8'))
 
@@ -3415,9 +3592,18 @@ def _writable_dir(base):
         return sibling
 
 
+def _probe_dir(base, name, registry):
+    """selftest 探针目录（物化在临时区；收尾按 registry 统一删除——含大体积 DoS 夹具）。"""
+    path = os.path.join(base, name)
+    os.makedirs(path, exist_ok=True)
+    registry.append(path)
+    return path
+
+
 def run_selftest():
     checker = SelftestChecker()
     tmp, root = _fixture_root()
+    probe_dirs = []
     try:
         _materialize_fixture(root)
         # P1-3 深嵌套探针文件（程序化生成，勿在 fixture 文本硬写巨串）：
@@ -3655,6 +3841,8 @@ def run_selftest():
             ('ruby', 'Greet.Greeter', 'class', 8, 20),
             ('ruby', 'Greet.Greeter.initialize', 'method', 9, 11),
             ('ruby', 'Greet.Greeter.shout', 'method', 13, 19),
+            ('ruby', 'Loop', 'module', 1, 15),
+            ('ruby', 'Loop.count_down', 'method', 2, 14),
             ('kotlin', 'Widget', 'class', 3, 7),
             ('kotlin', 'Widget.render', 'method', 4, 6),
             ('kotlin', 'main', 'function', 9, 12),
@@ -3677,6 +3865,7 @@ def run_selftest():
             ('lua', 'M.shout', 'method', 5, 8),
             ('lua', 'lx2', 'function', 10, 12),
             ('lua', 'M.loopy', 'method', 14, 21),
+            ('lua', 'M.driver', 'method', 23, 26),
             ('lua', 'LIMIT', 'variable', 3, 3),
         )
         sym_langs = set()
@@ -3824,40 +4013,78 @@ def run_selftest():
 
         # P1-2 逃逸闭包探针：仓库根 = out/，`../shared/` 真实存在于仓库根外
         # ——`../` 相对导入一律 external+inferred（永不 verified）；仓内控制组
-        # 仍 verified。
-        esc_repo = os.path.join(os.path.dirname(root), 'escape-probe', 'out')
-        os.makedirs(esc_repo, exist_ok=True)
-        os.makedirs(os.path.join(os.path.dirname(esc_repo), 'shared'),
-                    exist_ok=True)
-        open(os.path.join(esc_repo, 'a.js'), 'w',
-             encoding='utf-8').write('import { u } from "../shared/util";\n')
-        open(os.path.join(esc_repo, 'a.dart'), 'w',
-             encoding='utf-8').write("import '../shared/util.dart';\n")
-        open(os.path.join(esc_repo, 'a.rb'), 'w',
-             encoding='utf-8').write("require_relative '../shared/helper'\n")
-        open(os.path.join(esc_repo, 'self.js'), 'w',
-             encoding='utf-8').write('const self = 1;\n')
-        open(os.path.join(os.path.dirname(esc_repo), 'shared', 'util.js'),
-             'w', encoding='utf-8').write('export const u = 1;\n')
-        open(os.path.join(os.path.dirname(esc_repo), 'shared', 'util.dart'),
-             'w', encoding='utf-8').write('const u = 1;\n')
-        open(os.path.join(os.path.dirname(esc_repo), 'shared', 'helper.rb'),
-             'w', encoding='utf-8').write('def u_helper(x)\n  x\nend\n')
+        # 仍 verified。v1.13.2 补齐 c_quote / go / rust / lua 四分支（其余分支
+        # 早已带闭包检查）。
+        esc_root = _probe_dir(os.path.dirname(root), 'escape-probe', probe_dirs)
+        esc_repo = _probe_dir(esc_root, 'out', probe_dirs)
+        esc_shared = os.path.join(esc_root, 'shared')
+        os.makedirs(esc_shared, exist_ok=True)
+        esc_writes = (
+            (esc_repo, 'a.js', 'import { u } from "../shared/util";\n'),
+            (esc_repo, 'a.dart', "import '../shared/util.dart';\n"),
+            (esc_repo, 'a.rb', "require_relative '../shared/helper'\n"),
+            (esc_repo, 'a.c', '#include "../shared/util.h"\n'),
+            (esc_repo, 'a.go', 'package main\n\nimport "../shared/goutil"\n'),
+            (esc_repo, 'a.rs', 'use crate::..::..::shared::rustlib;\n'),
+            (esc_repo, 'a.lua', "require('../shared/lua_mod')\n"),
+            (esc_repo, 'self.js', 'const self = 1;\n'),
+            # 仓内控制组：闭包检查不得误伤仓库内候选（四门新分支各一 + js）
+            (esc_repo, 'util.h', '#pragma once\n#define LOCAL_H 1\n'),
+            (esc_repo, 'golocal.go', 'package main\n'),
+            (esc_repo, 'lua_local.lua', 'local function lf() end\n'),
+            (esc_repo, 'src/local.rs', 'pub fn local_fn() {}\n'),
+            (esc_shared, 'util.js', 'export const u = 1;\n'),
+            (esc_shared, 'util.dart', 'const u = 1;\n'),
+            (esc_shared, 'helper.rb', 'def u_helper(x)\n  x\nend\n'),
+            # 仓库根外真实存在的目标：证明「逃逸被拦」不是「目标不存在」
+            (esc_shared, 'util.h', '#pragma once\n'),
+            (esc_shared, 'goutil.go', 'package shared\n'),
+            (esc_shared, 'rustlib.rs', 'pub fn r() {}\n'),
+            (esc_shared, 'lua_mod.lua', 'return {}\n'),
+        )
+        for esc_base, esc_name, esc_body in esc_writes:
+            esc_full = os.path.join(esc_base, *esc_name.split('/'))
+            esc_dir = os.path.dirname(esc_full)
+            if esc_dir:
+                os.makedirs(esc_dir, exist_ok=True)
+            open(esc_full, 'w', encoding='utf-8').write(esc_body)
         esc_cases = (
             ('js', 'a.js', '../shared/util'),
             ('js', 'a.js', '../shared/util.js'),
             ('path', 'a.dart', '../shared/util.dart'),
             ('ruby_rel', 'a.rb', '../shared/helper'),
             ('ruby', 'a.rb', '../shared/helper'),
+            ('c_quote', 'a.c', '../shared/util.h'),
+            ('go', 'a.go', '../shared/goutil'),
+            ('rust', 'a.rs', 'crate::..::..::shared::rustlib'),
+            ('lua', 'a.lua', '../shared/lua_mod'),
         )
         for resolver, rel, spec in esc_cases:
             got = resolve_import(resolver, esc_repo, rel, spec)
             checker.check(got == (None, False, True, False),
                           'P1 escape blocked: %s %r -> inferred+external '
                           '(got %r)' % (resolver, spec, got))
-        got = resolve_import('js', esc_repo, 'a.js', './self')
-        checker.check(got == ('self.js', True, False, False),
-                      'P1 in-root control still verified (got %r)' % (got,))
+        esc_controls = (
+            ('js', 'a.js', './self', 'self.js'),
+            ('c_quote', 'a.c', 'util.h', 'util.h'),
+            ('go', 'golocal.go', 'golocal', 'golocal.go'),
+            ('rust', 'a.rs', 'crate::local', 'src/local.rs'),
+            ('lua', 'a.lua', 'lua_local', 'lua_local.lua'),
+        )
+        for resolver, rel, spec, want in esc_controls:
+            got = resolve_import(resolver, esc_repo, rel, spec)
+            checker.check(got == (want, True, False, False),
+                          'P1 in-root control still verified: %s %r -> %r '
+                          '(got %r)' % (resolver, spec, want, got))
+
+        # P1-7：Ruby `while/for … do … end` 不再双计数——符号/行界由
+        # EXPECT_SYMBOLS 的 (ruby, Loop.count_down, method, 2, 14) 锁定，
+        # 此处锁「不再产生假 unbalanced 告警」。
+        checker.check(not [w for w in facts['warnings']
+                           if w['kind'] == 'unbalanced-block'
+                           and w['file'] == 'langs/loops.rb'],
+                      'P1-7 ruby loops.rb produces no spurious '
+                      'unbalanced-block warning')
 
         # P1-3 深嵌套隔离断言：该文件 parse-error 优雅降级、其余文件照常
         deep_errs = [w for w in facts['warnings']
@@ -3870,6 +4097,147 @@ def run_selftest():
                       'P1 deep-nest file still inventoried')
         checker.check(_find_symbol(facts, 'compute_total') is not None,
                       'P1 deep-nested file does not taint the rest of the repo')
+
+        # ---- P2 修订批次探针（v1.13.2）----
+        # P2-4：数字/字符串之后的除法链不再被当正则字面量整段抹掉
+        checker.check(_find_call(facts, 'langs/arith.js', 1, 'scale') is not None,
+                      'P2-4 digits do not start a regex literal (scale(2) kept)')
+        checker.check(_find_call(facts, 'langs/arith.js', 2, 'span') is not None,
+                      'P2-4 string literals do not start a regex literal '
+                      '(span(1) kept)')
+        checker.check(_find_call(facts, 'langs/arith.js', 1, 'limit') is not None
+                      and _find_call(facts, 'langs/arith.js', 2, 'tail') is not None,
+                      'P2-4 control: calls after the division chain stay present')
+        # P2-5：UTF-8 BOM 不再吞掉首行行首锚定的 import / 段头
+        bom_imp = imp_index.get(('langs/bom.h', 1))
+        checker.check(bom_imp is not None and bom_imp['target'] == 'langs/header.h'
+                      and bom_imp['confidence'] == CONF_VERIFIED
+                      and bom_imp['external'] is False,
+                      'P2-5 BOM file still yields its first-line #include')
+        checker.check(_find_symbol(facts, 'BOM_H') is not None,
+                      'P2-5 control: the rest of the BOM file parses normally')
+        bom_dir = os.path.join(os.path.dirname(root), 'bom-probe')
+        os.makedirs(bom_dir, exist_ok=True)
+        _write_bytes(bom_dir, 'pyproject.toml',
+                     b'\xef\xbb\xbf[project.scripts]\nbom-cli = "bom:main"\n')
+        bom_entries = manifest_entries(bom_dir, 'pyproject.toml',
+                                       'pyproject.toml', [])
+        checker.check(len(bom_entries) == 1
+                      and bom_entries[0]['evidence']
+                      == 'pyproject.toml#project.scripts'
+                      and bom_entries[0]['confidence'] == CONF_VERIFIED,
+                      'P2-5 BOM manifest still opens its first-line section')
+        # P2-6：manifest 判定大小写不敏感（且不落进 files / unsupported）
+        checker.check('apps/upper/GO.MOD' not in [r['path'] for r in facts['files']],
+                      'P2-6 case-folded manifest is not registered as a source file')
+        up_dir = os.path.join(os.path.dirname(root), 'upper-probe')
+        os.makedirs(up_dir, exist_ok=True)
+        _write_bytes(up_dir, 'PACKAGE.JSON', FIXTURE_PKG_JSON.encode('utf-8'))
+        _write_bytes(up_dir, 'CARGO.TOML', FIXTURE_CARGO.encode('utf-8'))
+        up_entries = manifest_entries(up_dir, 'PACKAGE.JSON', 'package.json', [])
+        checker.check(len(up_entries) == 3
+                      and sum(1 for e in up_entries if e['kind'] == EP_PKG_BIN) == 1,
+                      'P2-6 case-folded basename dispatches to the package.json branch')
+        up_cargo = manifest_entries(up_dir, 'CARGO.TOML', 'cargo.toml', [])
+        checker.check(len(up_cargo) == 1 and up_cargo[0]['kind'] == EP_MANIFEST_MAIN,
+                      'P2-6 cargo.toml branch reachable via the case-folded name')
+        # P2-8：JS 方法调用不再被 Python 内建名清单吞掉（正控制见 AC-26 的 print）
+        checker.check(_find_call(facts, 'langs/methods.js', 2, 'map') is not None,
+                      'P2-8 JS arr.map() is not filtered as a python builtin')
+        checker.check(_find_call(facts, 'langs/methods.js', 3, 'filter') is not None,
+                      'P2-8 JS arr.filter() is not filtered as a python builtin')
+
+        # ---- secP2 修订批次探针（v1.13.2，安全评审）----
+        probe_base = os.path.dirname(root)
+        # secP2-3：manifest 读取大小闸（真文件，不改全局常量）
+        man_dir = _probe_dir(probe_base, 'manifest-probe', probe_dirs)
+        with open(os.path.join(man_dir, 'package.json'), 'wb') as mh:
+            mh.seek(READ_MAX_BYTES + 1)
+            mh.write(b'\n')
+        man_warns = []
+        man_entries = manifest_entries(man_dir, 'package.json', 'package.json',
+                                       man_warns)
+        checker.check(man_entries == [] and len(man_warns) == 1
+                      and man_warns[0]['kind'] == 'too-large',
+                      'secP2-3 oversized manifest is not read (too-large warning)')
+        # secP2-7：非普通文件不读（目录路径触发 isfile 预检；FIFO 在 Windows 不可建）
+        rd_files = []
+        rd_warns = []
+        rd_rec, rd_data, _rd_text = read_source(root, 'langs', 'c',
+                                                rd_files, rd_warns)
+        checker.check(rd_data is None and len(rd_warns) == 1
+                      and 'regular file' in rd_warns[0]['message']
+                      and rd_rec['path'] == 'langs',
+                      'secP2-7 non-regular path is skipped before open '
+                      '(read-error warning)')
+        # secP2-4：二次方扫描回归计时（不平衡块 × 声明数、无 '=' 的 C# const）
+        dos_dir = _probe_dir(probe_base, 'dos-probe', probe_dirs)
+        with open(os.path.join(dos_dir, 'unclosed.c'), 'w',
+                  encoding='utf-8') as dh:
+            for i in range(4000):
+                dh.write('int f%d() {\n' % i)
+        with open(os.path.join(dos_dir, 'consts.cs'), 'w',
+                  encoding='utf-8') as dh:
+            dh.write('class C {\n')
+            for i in range(4000):
+                dh.write('  const int a%d\n' % i)
+            dh.write('}\n')
+        cpu0 = os.times()[0] + os.times()[1]
+        dos_facts = build_facts(dos_dir)
+        dos_cpu = (os.times()[0] + os.times()[1]) - cpu0
+        checker.check(len(dos_facts['symbols']) >= 4000,
+                      'secP2-4 DoS fixture still extracts every declaration')
+        checker.check(dos_cpu < 5.0,
+                      'secP2-4 quadratic-scan regression: 4000 unclosed decls + '
+                      '4000 const decls in %.2fs CPU (< 5s)' % dos_cpu)
+        # secP2-2：文件 symlink 跳过（本机受限令牌无 SeCreateSymbolicLinkPrivilege
+        # → 建不出链接时该断言退化为 host-gated 占位，详见报告第三节）
+        sym_dir = _probe_dir(probe_base, 'symlink-probe', probe_dirs)
+        outside = os.path.join(probe_base, 'outside-secret.txt')
+        open(outside, 'w', encoding='utf-8').write('TOP SECRET\n')
+        open(os.path.join(sym_dir, 'plain.py'), 'w', encoding='utf-8').write('x = 1\n')
+        sym_ok = True
+        try:
+            os.symlink(outside, os.path.join(sym_dir, 'linked.py'))
+        except (OSError, NotImplementedError, AttributeError):
+            sym_ok = False
+        sym_warns = []
+        sym_paths = scan_tree(sym_dir, set(), sym_warns)
+        checker.check('plain.py' in sym_paths,
+                      'secP2-2 control: ordinary files stay listed by scan_tree')
+        if sym_ok:
+            checker.check('linked.py' not in sym_paths
+                          and any(w['kind'] == 'symlink-skipped' for w in sym_warns),
+                          'secP2-2 symlinked file is skipped with a '
+                          'symlink-skipped warning')
+        else:
+            checker.check(True, 'secP2-2 file-symlink skip host-gated: os.symlink '
+                                'denied on this host (no such privilege)')
+        # AC-37②/D2：性能软门实测——10k 行多语言合成仓库（100k 行一次性探针见
+        # agent-out\ac37b-probe-1132.py）。软门语义：超时只 WARN、退出码仍 0；
+        # 本工具无超时逻辑，故此处以 CPU 上限锁「不得退化为分钟级」。
+        ac_dir = _probe_dir(probe_base, 'ac37-probe', probe_dirs)
+        with open(os.path.join(ac_dir, 'big.js'), 'w', encoding='utf-8') as ah:
+            for i in range(2200):
+                ah.write('function fn%d(a) {\n  return helper%d(a);\n}\n' % (i, i))
+        with open(os.path.join(ac_dir, 'big.c'), 'w', encoding='utf-8') as ah:
+            for i in range(900):
+                ah.write('int cf%d(int a) {\n  return a + %d;\n}\n' % (i, i))
+        with open(os.path.join(ac_dir, 'big.py'), 'w', encoding='utf-8') as ah:
+            for i in range(700):
+                ah.write('def pf%d(a):\n    return a + %d\n\n' % (i, i))
+        cpu0 = os.times()[0] + os.times()[1]
+        ac_facts = build_facts(ac_dir)
+        ac_cpu = (os.times()[0] + os.times()[1]) - cpu0
+        ac_lines = sum(r['lines'] for r in ac_facts['files'])
+        checker.check(ac_lines >= 10000
+                      and ac_facts['counts']['symbols'] >= 3800,
+                      'AC-37 10k-line synthetic repo fully extracted (lines=%d '
+                      'symbols=%d)'
+                      % (ac_lines, ac_facts['counts']['symbols']))
+        checker.check(ac_cpu < 20.0,
+                      'AC-37 soft gate (10k lines, wall < 60s): %.2fs CPU'
+                      % ac_cpu)
 
         # AC-25：入口点八类各 ≥1（F-a：多 manifest 各自产条目，evidence 带相对路径）
         entry_kinds = set(e['kind'] for e in facts['entry_points'])
@@ -3970,6 +4338,19 @@ def run_selftest():
                       'AC-57 breakpoint bullets equal inferred call edges (%d)'
                       % inferred_n)
 
+        # secP2-5：MD 注入防护（签名控制字符 / 表格单元格管道符）
+        esc_sym = _find_symbol(facts, 'esc_fn')
+        checker.check(esc_sym is not None
+                      and '\x1b' not in esc_sym['signature'],
+                      'secP2-5 control characters do not survive into signatures')
+        esc_rows = [ln for ln in md_text.splitlines() if 'esc_fn' in ln]
+        checker.check(bool(esc_rows) and all('\x1b' not in ln for ln in esc_rows)
+                      and any('\\|' in ln for ln in esc_rows),
+                      'secP2-5 MD escapes pipes from source lines (no raw ESC)')
+        checker.check('weird\\|inc.h' in md_text
+                      and 'weird|inc.h' not in md_text,
+                      'secP2-5 MD escapes pipes inside import-target cells')
+
         # 模式表完备性（R3 关键缓解：缺字段=机检红，不是引擎分支漏写）
         tables_complete = True
         for lang_id in LANG_IDS:
@@ -3998,6 +4379,18 @@ def run_selftest():
         # ============ 查询层（F8/F9，1c）============
         snapshot = dumps_facts(facts)          # AC-47 只读基线（查询前后逐字节比对）
         index = build_query_index(facts)
+
+        # P2-9：Lua 点号符号的查询口径与调用边对齐（末段名）——`callers shout`
+        # 原先查不到 M.shout（by_last 按带前缀的 name 登记）
+        checker.check(any(s['qualname'] == 'M.shout'
+                          for s in index['by_last'].get('shout', [])),
+                      'P2-9 by_last is keyed on the tail name (index shout -> M.shout)')
+        checker.check(any(s['qualname'] == 'M.driver'
+                          for s in resolve_symbols(index, 'driver', False)),
+                      'P2-9 tail-name query reaches a dotted Lua symbol '
+                      '(resolve_symbols driver -> M.driver)')
+        checker.check(_find_call(facts, 'langs/main.lua', 24, 'shout') is not None,
+                      'P2-9 the diverging call edge is present (M.driver -> shout)')
         prog = sys.argv[0] or 'analyze_structure.py'
         outdir_w = _writable_dir(tmp)
         facts_path = os.path.join(outdir_w, 'structure-facts.json')
@@ -4295,6 +4688,8 @@ def run_selftest():
         checker.check(ctrl_f is True,
                       'AC-56 control: the same path exists on unmutated facts')
     finally:
+        for _pd in probe_dirs:
+            _rmtree(_pd)
         _rmtree(root)
         _rmtree(tmp)
     print('selftest: %d passed / %d failed' % (checker.passed, checker.failed))

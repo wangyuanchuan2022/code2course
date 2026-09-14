@@ -93,7 +93,7 @@ code2course/
 
 ### 发布检查项（修改 resources/ 三件套后必做；在本地工作区进行，example/ 成品与 review/ 辅助脚本均不随仓库分发）
 
-1. 在本地工作区重新生成一门成品课件（如 `../example/<name>_course.html`，内联新外壳，保持与 resources 逐字一致）
+1. 在本地工作区重新生成一门成品课件（路径自选，如本地任意工作目录下的 `<name>_course.html`——`example/` 与 `review/` 均不随仓库分发，**不要假定仓库旁存在 `example/`**；内联新外壳，保持与 resources 逐字一致）
 2. 跑 `python validate_course.py <成品课件路径>` 确认机械检查全绿
 3. grep 确认成品无 `{{` 残留、无已移除控件标记（如 `.tilt`）
 4. 同步 CHANGELOG.md 版本条目与 SKILL.md frontmatter `version`

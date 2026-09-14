@@ -3,6 +3,39 @@
 本文件记录 code2course 技能包的版本变更（[Keep-a-Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 格式）。
 版本号唯一事实来源：SKILL.md frontmatter `version`；resources 三件套头部 `@version` 与此同步。
 
+## [1.13.2] — 2026-09-14
+
+本版本消化 v1.13.x 的评审 backlog（代码评审 P1×4 + P2×8、安全评审 P2×7）：修掉四类**静默失真**（import 逃逸、Ruby 循环块误判、JS 除法链误剥、BOM 首行失配）与三类**资源滥用**（不平衡块二次方扫描、C# const 惰性正则、manifest 无界读），每处修复都配了常驻夹具或探针（含正反两向）。
+
+### Fixed
+
+- **import 逃逸仓库根（P1-2 / 安全 P2-1）**：`c_quote` / `go` / `rust` / `lua` 四个 resolver 分支补仓库根闭包检查，且判定**前置于**存在性探测——仓库外 `..` 目标不再产出 `verified + external:false` 的假实锤边，也不再被用于仓库外存在性探测
+- **Ruby `while/for … do` 双计数（P1-7）**：`end` 引擎对「同一逻辑行内已由行首开块关键字计过块」的 `do` 不再计块——含循环的 `def` 曾系统性 `end_line: null` + 假 `unbalanced-block` 告警
+- **JS 除法链被当正则字面量剥离（P2-4）**：数字/字符串字面量之后不再被判定为正则起点（`8 / scale(2) / limit(3)` 一类语句的调用边不再静默丢失）
+- **UTF-8 BOM（P2-5）**：源文件与 manifest 一律按 `utf-8-sig` 解码——带 BOM 文件的首行行首锚定 import 与 `[section]` 段头不再失配（无 BOM 时行为不变）
+- **元数据文件名大小写（P2-6）**：`METADATA_BASENAMES` 与 manifest 分派字面量统一小写化（`Package.json` / `Cargo.toml` 等大小写变体同样识别为清单，不再误登记为 unsupported 源文件）
+- **内建名过滤跨语言误用（P2-8）**：Python 内建清单只作用于 ast 引擎；其余 15 门语言由各自 `global_stops` 收口——JS 的 `arr.map()` / `arr.filter()` 不再被当内建名静默吞掉
+- **Lua 点号符号查询口径（P2-9）**：查询索引 `by_last` 改按末段名登记，与调用边命中判定同口径（`callers shout` 能命中 `M.shout`，不再出现「调用边说有、查询说没有」）
+- **文件符号链接（安全 P2-2）**：目录分支之外，文件 symlink 同样跳过并记 `symlink-skipped`（不再跟随读到仓库外内容）
+- **manifest 读取大小闸（安全 P2-3）**：超大清单不再整份读入内存，超限记 `too-large`
+- **二次方扫描（安全 P2-4）**：不平衡块的配对扫描改惰性配对表（语义与裸扫描逐位等价）；C#/Dart `const` 惰性匹配类加长度上界；声明区间过滤改「按 start 排序 + 前缀最大 end + 二分」。同一批恶意构造夹具实测：未闭合声明 4000 个 23.8s → 0.45s，无 `=` 的 `const` 声明 4000 条 29.1s → 0.48s
+- **输出注入（安全 P2-5）**：新增控制字符净化单点收口（源码行/证据进 JSON、MD、stdout 三路同源），MD 表格单元格与行内值统一转义——底稿不再携带 ANSI 转义序列、表格结构不再被管道符打碎
+- **FIFO/设备文件（安全 P2-7）**：读取前 `isfile` 预检，非普通文件直接跳过并记 `read-error`（不再可能因无超时 open 而挂死）
+- **`line_of` 重复切分（P2-11）**：单文件只切一次行供闭包复用（3000 符号单文件实测 3.80s → 0.83s）
+- **诚实性声明**：盲区清单增列「`)` 或 `]` 之后的链式方法调用」（`fetch(x).then(h)`、`arr[0].push(v)` 形态）——诚实性声明的覆盖面也是契约
+- **README 发布检查项**：不再假定本地工作区旁存在 `example/`（该目录不随仓库分发）
+- **CHANGELOG 措辞**：断点清单描述补「调用」二字（`inferred` **调用**边），与规格 F3§6 / AC-57 契约逐字对齐
+
+### Added
+
+- **常驻夹具与探针**：越根探针扩至九条（补四门 resolver，并各配一条仓内正控制）、Ruby 循环夹具、JS 除法链夹具、JS 方法调用夹具、带 BOM 的 `.h` 与 manifest 夹具、ESC/管道注入夹具、大小写变体 manifest 夹具、DoS 回归计时夹具、万行级性能软门夹具；断言总数以每次运行的实时统计行为准（不写死）
+
+### 已知限制
+
+- Ruby `do` 判据是启发式：同一逻辑行内既有行首开块关键字（`if/unless/while/until/for/case`）又有方法块 `do` 时（如 `if x; xs.each do |i|`），该 `do` 会被少计一次块——属该文件的不平衡判定边界，已在诚实性声明覆盖范围内
+- 调用点归属仍在符号区间表上线性扫（`hits × spans`）：万行级单文件实测仍在软门内，超大单文件（十万行级）下会显现；再往下压需改为区间排序 + 二分
+- 安全评审 P2-2 的文件 symlink 夹具在无法创建符号链接的主机上退化为 host-gated 占位（断言存在但未真正执行）
+
 ## [1.13.1] — 2026-09-14
 
 本版本给课件补上第三种调用链表达——**确定性调用图**：数据契约与布局算法借鉴 CodeGraph（MIT）的最长路径分层 + 重心法排序（禁力导向/随机布点），渲染沿用 v1.12.0 立下的「线型=置信度」诚实边基准。
@@ -31,7 +64,7 @@
 - **`analyze_structure.py` 结构事实底稿 + 项目地图查询**（技能根目录新文件）：analyze 产出底稿（文件清单/符号表/import 边/调用边/入口点五件套 + 断点清单 + 诚实性声明，schema_version=2，连跑两次字节一致）；查询层 7 子命令 `map` / `callers` / `callees` / `impact` / `path` / `entry` / `search`（统一 JSON 输出外壳，`impact`/`path` 缺省只走实锤边、`--include-inferred` 才纳且逐跳标注；无结果不是错误）
 - **16 门 Tier-1 语言三引擎**：python 走 ast 确定性提取，其余 15 门走表驱动启发式（brace/end 双引擎）；token 模式校准自 Pygments 2.21.0（BSD-2-Clause）lexer，出处注记见脚本 docstring（https://pygments.org/docs/lexers/）
 - **kind / 语言闭集契约**：符号类型、extractor、入口点 kind 等枚举闭集随 schema_version=2 冻结，只增不改名
-- **MD 断点清单**：底稿新增「断点清单（Where the graph stops）」小节，逐条列出推断边及其调用点
+- **MD 断点清单**：底稿新增「断点清单（Where the graph stops）」小节，逐条列出推断调用边及其调用点
 - **自测 ≥60 断言**：`--selftest` 内联多语言 fixture 自证（语言矩阵/查询层/确定性/边诚实性/负例含注入必红），断言总数以每次运行的实时统计行为准，不在文档写死具体数字
 - **workflow §3 可选辅助段落**（只增不改）：底稿 + 查询用法，明确「可选的加速器，不是替代品——手工读码仍完全合法；底稿与源码冲突时以源码为准」
 - **README 文件结构表**新增 `analyze_structure.py` 条目
