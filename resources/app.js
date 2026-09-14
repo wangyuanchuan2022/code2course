@@ -17,7 +17,7 @@
    辅助函数合并（vizEl/ctrlEl 等成为共享实现的别名）；栈塔弹空恢复
    空栈提示；赌注支持"再押一注"。
    ===================================================================
-   @version 1.13.0 */
+   @version 1.13.1 */
 (function () {
   'use strict';
 
@@ -1696,6 +1696,487 @@
     });
     syncOutputs();
     route();
+  });
+
+  /* ===================================================================
+     20. 调用图（call-graph）—— 把结构事实渲染成一张节点-边图（v1.13.1）
+     -------------------------------------------------------------------
+     宿主：.callgraph-scene + <script type="application/json" class="callgraph-data">
+     数据契约（闭集，见 references/interactive-elements.md §14）：
+       nodes[{id,label,kind,file,line}]
+       links[{from,to,count,confidence,file,line,declared,back}]
+       confidence 为闭集 verified|inferred 且**不可缺省**；verified 边必须带
+       发起行 file:line（诚实边不允许含糊）。
+     定位：探照灯讲"跨文件怎么走"、栈塔讲"运行时纵深"，调用图讲"整体形状"——
+     谁调谁、谁被最多人调、哪些边只是推断。
+     确定性：布局是纯函数，不依赖时间/随机数/DOM 测量顺序——同一份 JSON 必然
+     产出同一张图（长标签截断用字符推进宽度估算而非 measureText：后者随字体
+     是否就绪而变，是"同数据不同图"的源头）。
+     layout algorithm adapted from CodeGraph (MIT, ui/src/lib/map-model.ts)
+     — zero-dependency reimplementation
+     =================================================================== */
+
+  /* 20a. 几何常量（规格 §3.5；同一门课程内不逐图变化，小屏由 CSS 等比缩小） */
+  var CG_LAYER_GAP = 74;    /* 层间垂直间距 */
+  var CG_NODE_H = 40;       /* 节点盒高 */
+  var CG_MIN_COL_W = 96;    /* 横向最小占位 */
+  var CG_MAX_COL_W = 210;   /* 盒宽上限：更长的标签走截断 + title 全名 */
+  var CG_NODE_GAP = 34;     /* 同层相邻节点间距（照 CodeGraph 的 NODE_GAP） */
+  var CG_MIN_SLOT = 230;    /* 每节点在本层的最小横向份额：稀疏层也铺开，不挤成一团 */
+  var CG_PADDING = 32;      /* 画布内边距（规格 §3.5 定为 32，CodeGraph 为 44） */
+  var CG_GLYPH_COL = 30;    /* glyph 槽宽（glyph 居中于 17，标签从 30 起） */
+  var CG_VBW_MIN = 480;     /* 画布下限：小图不至于被拉成巨字 */
+  var CG_DECLARED_COVERAGE = 0.4;   /* declared 覆盖率下限，低于它回落 count（照 CodeGraph） */
+  var CG_KIND_GLYPH = {
+    'entry': '▶', 'function': 'ƒ', 'method': '◇',
+    'class': '◫', 'module': '▦', 'file': '▤'
+  };
+
+  /* 字符推进宽度估算：全角/CJK 12px、半角 6.6px、代理对（emoji 等）14px */
+  function cgCharW(s, i) {
+    var c = s.charCodeAt(i);
+    if (c >= 0xD800 && c <= 0xDBFF) return [14, 2];
+    if ((c >= 0x1100 && c <= 0x115F) || (c >= 0x2E80 && c <= 0xA4CF)
+        || (c >= 0xAC00 && c <= 0xD7A3) || (c >= 0xF900 && c <= 0xFAFF)
+        || (c >= 0xFE30 && c <= 0xFE6F) || (c >= 0xFF00 && c <= 0xFF60)
+        || (c >= 0xFFE0 && c <= 0xFFE6)) return [12, 1];
+    return [6.6, 1];
+  }
+  function cgTextW(s) {
+    var w = 0;
+    for (var i = 0; i < s.length;) {
+      var r = cgCharW(s, i);
+      w += r[0]; i += r[1];
+    }
+    return w;
+  }
+  /* 超过盒宽按估算宽度截断为 …（全名由 title 与事实面板保留，禁止静默丢信息） */
+  function cgElide(label, maxW) {
+    if (cgTextW(label) <= maxW) return { text: label, cut: false };
+    var ellW = cgTextW('…');
+    var out = '', w = 0, i = 0;
+    while (i < label.length) {
+      var r = cgCharW(label, i);
+      if (w + r[0] + ellW > maxW) break;
+      out += label.substr(i, r[1]); w += r[0]; i += r[1];
+    }
+    return { text: out + '…', cut: true };
+  }
+  function cgNum(v) { return Math.round(v * 100) / 100; }
+  /* 线宽：min(6, 1 + log2(count) × 0.7)——承载 700 个调用点的边明显更粗，
+     但不会粗一百倍（规格 §4.2） */
+  function cgStrokeW(count) {
+    var c = (typeof count === 'number' && count >= 1) ? count : 1;
+    return String(cgNum(Math.min(6, 1 + (Math.log(c) / Math.LN2) * 0.7)));
+  }
+
+  /* 20b. 布局（纯函数、零 DOM）
+     对照 CodeGraph `ui/src/lib/map-model.ts` 的 buildMapLayout 逐步重实现：
+     ① 两环互指消解 → ② 最长路径分层（**单位权重**）→ ③ 重心法 3 轮扫 →
+     ④ 落位 → ⑤ 端口散布。注意 declared/count 在参照实现里决定的是"两环互指
+     时谁算回边"（weightOf + 2-cycle break），**不是层跨**——照做，否则一条
+     700 次调用的边会把画布撑成 700 层。
+     所有查表用 Object.create(null)：节点 id 可能是 `constructor` 这类原型键。 */
+  function cgLayout(data) {
+    var cmpStr = function (a, b) { return a < b ? -1 : (a > b ? 1 : 0); };
+    var nodes = Object.create(null), order = [];
+    (data.nodes || []).forEach(function (n) {
+      if (!n || typeof n.id !== 'string' || !n.id) return;
+      if (nodes[n.id]) return;                 /* 重复 id：以首个为准（确定性） */
+      var label = (typeof n.label === 'string' && n.label) ? n.label : n.id;
+      var w = Math.max(CG_MIN_COL_W,
+                       Math.min(CG_MAX_COL_W, cgTextW(label) + CG_GLYPH_COL + 14));
+      var el = cgElide(label, w - CG_GLYPH_COL - 14);
+      nodes[n.id] = {
+        id: n.id, label: label, text: el.text, cut: el.cut,
+        kind: (typeof n.kind === 'string') ? n.kind : '',
+        file: (typeof n.file === 'string') ? n.file : '',
+        line: (typeof n.line === 'number' && n.line >= 1) ? n.line : null,
+        w: cgNum(w), x: 0, y: 0
+      };
+      order.push(n.id);
+    });
+
+    var links = [];
+    (data.links || []).forEach(function (l) {
+      if (!l || typeof l.from !== 'string' || typeof l.to !== 'string') return;
+      if (!nodes[l.from] || !nodes[l.to]) return;   /* 端点不存在：渲染器跳过，校验器报错 */
+      if (l.from === l.to) return;                  /* 自环禁止（规格 §2） */
+      var rec = {
+        i: links.length, from: l.from, to: l.to,
+        count: (typeof l.count === 'number' && l.count >= 1) ? l.count : 1,
+        hasCount: typeof l.count === 'number' && l.count >= 1,
+        declared: (typeof l.declared === 'number' && l.declared >= 1) ? l.declared : null,
+        confidence: (l.confidence === 'inferred') ? 'inferred' : 'verified',
+        file: (typeof l.file === 'string') ? l.file : '',
+        line: (typeof l.line === 'number' && l.line >= 1) ? l.line : null,
+        back: (l.back === true)
+      };
+      links.push(rec);
+    });
+
+    /* ① 分层基准（规格 §3.1）：declared 覆盖率 ≥ 40% 才认它，否则回落 count；
+       两者皆无则按调用结构。降级必须显式声明，见事实面板与 data-cg-layer-mode。 */
+    var declaredLinks = links.filter(function (l) { return l.declared !== null; });
+    var useDeclared = links.length > 0 &&
+      declaredLinks.length >= links.length * CG_DECLARED_COVERAGE;
+    var anyCount = links.some(function (l) { return l.hasCount; });
+    var mode = useDeclared ? 'declared' : (anyCount ? 'count' : 'structure');
+    function weightOf(l) {
+      if (useDeclared) return l.declared;
+      return l.hasCount ? l.count : 1;
+    }
+    var layeringLinks = useDeclared ? declaredLinks : links;
+
+    /* ② 两环互指消解：u→v 与 v→u 同时在场时，权重小的一侧退出分层图——它就是
+       那条回边；权重相同按 id 定序，保证同一份数据两次运行结果一致（照 CodeGraph） */
+    var byPair = Object.create(null);
+    layeringLinks.forEach(function (l) { byPair[l.from + '\u0000' + l.to] = l; });
+    var acyclic = [];
+    layeringLinks.forEach(function (l) {
+      var rev = byPair[l.to + '\u0000' + l.from];
+      if (!rev) { acyclic.push(l); return; }
+      var mine = weightOf(l), theirs = weightOf(rev);
+      if (theirs > mine || (theirs === mine && l.from > l.to)) return;
+      acyclic.push(l);
+    });
+
+    /* ③ 最长路径分层：layer = 1 + max(依赖目标的 layer)，叶子为 0。
+       三环及以上由 visiting 兜底——命中在栈节点按参照实现返回 0、外层仍 +1。 */
+    var out = Object.create(null);
+    order.forEach(function (id) { out[id] = []; });
+    acyclic.forEach(function (l) { out[l.from].push(l.to); });
+    order.forEach(function (id) { out[id].sort(cmpStr); });
+
+    var layer = Object.create(null), visiting = Object.create(null);
+    order.forEach(function (root) {                 /* 起点顺序 = 数据声明顺序 */
+      if (layer[root] !== undefined) return;
+      visiting[root] = true;
+      var stack = [{ id: root, i: 0, best: 0 }];
+      while (stack.length) {
+        var f = stack[stack.length - 1];
+        var outs = out[f.id];
+        if (f.i < outs.length) {
+          var nx = outs[f.i++], got;
+          if (layer[nx] !== undefined) got = layer[nx];
+          else if (visiting[nx]) got = 0;
+          else {
+            visiting[nx] = true;
+            stack.push({ id: nx, i: 0, best: 0 });
+            continue;
+          }
+          f.best = Math.max(f.best, got + 1);
+          continue;
+        }
+        layer[f.id] = f.best;
+        delete visiting[f.id];
+        stack.pop();
+        var up = stack[stack.length - 1];
+        if (up) up.best = Math.max(up.best, f.best + 1);
+      }
+    });
+
+    var maxLayer = 0;
+    order.forEach(function (id) { maxLayer = Math.max(maxLayer, layer[id] || 0); });
+    var layerCount = maxLayer + 1;
+    var rows = [];
+    for (var r = 0; r < layerCount; r++) rows.push([]);
+    order.forEach(function (id) { rows[layer[id] || 0].push(id); });
+    rows.forEach(function (arr) { arr.sort(cmpStr); });   /* 层内起点：稳定字母序 */
+
+    /* ④ 重心法 3 轮：邻居取双向（未给 options.order 时照 CodeGraph 两向都收），
+       排序三级定序（重心 → 原位置 → id），不依赖 sort 稳定性 */
+    var nbr = Object.create(null);
+    order.forEach(function (id) { nbr[id] = []; });
+    acyclic.forEach(function (l) {
+      nbr[l.to].push(l.from);
+      nbr[l.from].push(l.to);
+    });
+    var pos = Object.create(null);
+    rows.forEach(function (arr) { arr.forEach(function (id, i) { pos[id] = i; }); });
+    for (var sw = 0; sw < 3; sw++) {
+      rows.forEach(function (arr) {
+        var bary = Object.create(null);
+        arr.forEach(function (id) {
+          var list = nbr[id];
+          if (!list.length) { bary[id] = Infinity; return; }
+          var sum = 0;
+          list.forEach(function (o) { sum += (pos[o] === undefined ? 0 : pos[o]); });
+          bary[id] = sum / list.length;
+        });
+        arr.sort(function (a, b) {
+          var ba = bary[a], bb = bary[b];
+          if (ba !== bb && isFinite(ba - bb)) return ba - bb;
+          if (ba !== bb) return ba < bb ? -1 : 1;   /* Infinity 相减是 NaN，绕开 */
+          var pa = (pos[a] === undefined ? 0 : pos[a]);
+          var pb = (pos[b] === undefined ? 0 : pos[b]);
+          return (pa - pb) || cmpStr(a, b);
+        });
+        arr.forEach(function (id, i) { pos[id] = i; });
+      });
+    }
+
+    /* ⑤ 落位：层号越大越靠上（源在下边出端口、目标在上边进端口 = 调用自上而下流） */
+    var pitch = CG_NODE_H + CG_LAYER_GAP;
+    var rowSum = [], naturalSpan = [], contentWidth = CG_VBW_MIN - CG_PADDING * 2;
+    rows.forEach(function (arr, i) {
+      var sum = 0;
+      arr.forEach(function (id) { sum += nodes[id].w; });
+      rowSum[i] = sum;
+      naturalSpan[i] = sum + Math.max(0, arr.length - 1) * CG_NODE_GAP;
+      contentWidth = Math.max(contentWidth, naturalSpan[i]);
+    });
+    var rowSpan = rows.map(function (arr, i) {
+      return Math.min(contentWidth, Math.max(naturalSpan[i], arr.length * CG_MIN_SLOT));
+    });
+    rows.forEach(function (arr, i) {
+      var span = rowSpan[i], gap = arr.length > 1 ? (span - rowSum[i]) / (arr.length - 1) : 0;
+      var x = CG_PADDING + (contentWidth - span) / 2 +
+              (arr.length === 1 ? (span - rowSum[i]) / 2 : 0);
+      var y = cgNum(CG_PADDING + (layerCount - 1 - i) * pitch);
+      arr.forEach(function (id) {
+        var n = nodes[id];
+        n.x = cgNum(x); n.y = y;
+        x += n.w + gap;
+      });
+    });
+
+    /* 端口散布：(i+1)/(n+1)——让 8 条依赖成扇面，而不是挤在一个角（规格 §3.5） */
+    var outPool = Object.create(null), inPool = Object.create(null);
+    order.forEach(function (id) { outPool[id] = []; inPool[id] = []; });
+    links.forEach(function (l) { outPool[l.from].push(l); inPool[l.to].push(l); });
+    order.forEach(function (id) {
+      var o = outPool[id], n = inPool[id];
+      o.forEach(function (l, i) { l.sf = (i + 1) / (o.length + 1); });
+      n.forEach(function (l, i) { l.tf = (i + 1) / (n.length + 1); });
+    });
+
+    /* 回边 = 源层号小于目标层号（画面上朝上）——标出来，而不是拉直（规格 §3.4） */
+    links.forEach(function (l) {
+      if (!l.back) l.back = (layer[l.from] || 0) < (layer[l.to] || 0);
+    });
+
+    return {
+      nodes: nodes, order: order, links: links, rows: rows, layer: layer,
+      mode: mode, layerCount: layerCount,
+      declared: declaredLinks.length, total: links.length,
+      vbw: cgNum(contentWidth + CG_PADDING * 2),
+      vbh: cgNum(layerCount * pitch - CG_LAYER_GAP + CG_PADDING * 2)
+    };
+  }
+
+  /* 20c. 渲染与交互（只用 createElementNS；零 innerHTML、无内联 on*、无 fetch）
+     线型 = 置信度：verified 实线 / inferred 虚线 / 回边强调色虚线（base.css §20）；
+     每条边另绘同路径、透明、12px 宽的副本专供 hover（1px 线无法命中）。 */
+  document.querySelectorAll('.callgraph-scene').forEach(function (scene) {
+    var stage = scene.querySelector('.callgraph-stage');
+    if (!stage) return;
+    var facts = scene.querySelector('.callgraph-facts');
+    var data = ctrlParse(scene, 'callgraph-data');
+    if (!data || !data.nodes || !data.nodes.length) {
+      ctrlError(scene, '调用图');
+      return;
+    }
+    var G = cgLayout(data);
+    if (!G.order.length) { ctrlError(scene, '调用图'); return; }
+    scene.setAttribute('data-cg-layer-mode', G.mode);
+
+    var NS = 'http://www.w3.org/2000/svg';
+    function svgEl(tag) { return document.createElementNS(NS, tag); }
+
+    var svg = svgEl('svg');
+    svg.setAttribute('class', 'callgraph-svg');
+    svg.setAttribute('viewBox', '0 0 ' + G.vbw + ' ' + G.vbh);
+    svg.setAttribute('width', '100%');
+    svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+    var gEdges = svgEl('g');
+    gEdges.setAttribute('class', 'cg-edges');
+    var gNodes = svgEl('g');
+    gNodes.setAttribute('class', 'cg-nodes');
+    svg.appendChild(gEdges);
+    svg.appendChild(gNodes);
+
+    /* --- 边：可见路径与命中副本分两轮追加（命中副本在上，重叠边才可点） --- */
+    var edgeRecs = [];
+    G.links.forEach(function (l) {
+      var a = G.nodes[l.from], b = G.nodes[l.to];
+      var sx = cgNum(a.x + a.w * l.sf), tx = cgNum(b.x + b.w * l.tf);
+      var sy, ty;
+      if (l.back) {            /* 回边：从源的上边出去，落回目标的下边 */
+        sy = cgNum(a.y); ty = cgNum(b.y + CG_NODE_H);
+      } else {
+        sy = cgNum(a.y + CG_NODE_H); ty = cgNum(b.y);
+      }
+      var midY = cgNum((sy + ty) / 2);
+      /* 三次贝塞尔：源下端口 → 垂直中点 → 目标上端口（同一捆边同向弯曲） */
+      var d = 'M' + sx + ',' + sy + ' C' + sx + ',' + midY + ' '
+              + tx + ',' + midY + ' ' + tx + ',' + ty;
+
+      var p = svgEl('path');
+      p.setAttribute('class', 'cg-edge is-' + l.confidence + (l.back ? ' is-back' : ''));
+      p.setAttribute('d', d);
+      p.setAttribute('fill', 'none');
+      p.setAttribute('stroke-width', cgStrokeW(l.count));
+      p.setAttribute('pointer-events', 'none');
+      p.setAttribute('data-cg-edge', String(l.i));
+      p.setAttribute('data-cg-from', l.from);
+      p.setAttribute('data-cg-to', l.to);
+      p.setAttribute('data-cg-confidence', l.confidence);
+      p.setAttribute('data-cg-back', l.back ? '1' : '0');
+      gEdges.appendChild(p);
+
+      var hit = svgEl('path');
+      hit.setAttribute('class', 'cg-hit');
+      hit.setAttribute('d', d);
+      hit.setAttribute('fill', 'none');
+      hit.setAttribute('stroke', 'transparent');
+      hit.setAttribute('stroke-width', '12');
+      hit.setAttribute('pointer-events', 'stroke');
+      hit.setAttribute('data-cg-hit', String(l.i));
+      gEdges.appendChild(hit);
+
+      edgeRecs.push({ l: l, el: p, hit: hit });
+    });
+
+    /* --- 节点：圆角矩形 + 类型 glyph + 标签；空心描边，克制风格 --- */
+    var nodeEls = Object.create(null);
+    G.order.forEach(function (id) {
+      var n = G.nodes[id];
+      var g = svgEl('g');
+      g.setAttribute('class', 'cg-node is-kind-' + (n.kind || 'unknown'));
+      g.setAttribute('tabindex', '0');       /* 可 Tab 聚焦，聚焦即等同 hover */
+      g.setAttribute('data-cg-id', id);
+      g.setAttribute('data-cg-full', n.label);
+
+      var ti = svgEl('title');               /* 截断时全名在这里，信息不丢 */
+      ti.textContent = n.label + ' · ' + (n.file || '?')
+                       + (n.line ? ':' + n.line : '');
+      g.appendChild(ti);
+
+      var r = svgEl('rect');
+      r.setAttribute('class', 'cg-box');
+      r.setAttribute('x', String(n.x));
+      r.setAttribute('y', String(n.y));
+      r.setAttribute('width', String(n.w));
+      r.setAttribute('height', String(CG_NODE_H));
+      r.setAttribute('rx', '8');
+      g.appendChild(r);
+
+      var gl = svgEl('text');
+      gl.setAttribute('class', 'cg-glyph');
+      gl.setAttribute('x', String(cgNum(n.x + 17)));
+      gl.setAttribute('y', String(cgNum(n.y + CG_NODE_H / 2)));
+      gl.setAttribute('text-anchor', 'middle');
+      gl.setAttribute('dominant-baseline', 'central');
+      gl.setAttribute('aria-hidden', 'true');
+      gl.textContent = CG_KIND_GLYPH[n.kind] || '•';
+      g.appendChild(gl);
+
+      var lb = svgEl('text');
+      lb.setAttribute('class', 'cg-label');
+      lb.setAttribute('x', String(cgNum(n.x + CG_GLYPH_COL)));
+      lb.setAttribute('y', String(cgNum(n.y + CG_NODE_H / 2)));
+      lb.setAttribute('dominant-baseline', 'central');
+      lb.textContent = n.text;
+      if (n.cut) lb.setAttribute('data-cg-elided', '1');
+      g.appendChild(lb);
+
+      gNodes.appendChild(g);
+      nodeEls[id] = g;
+    });
+
+    /* --- 事实面板：降级必须显式声明，不允许静默 --- */
+    var hint = facts ? facts.textContent.replace(/\s+/g, ' ').trim() : '';
+    var cov = G.declared + '/' + G.total;
+    var modeNote = (G.mode === 'declared')
+      ? '按声明深度（declared）决定分层与回边方向'
+      : (G.mode === 'count'
+         ? '⚠ 无声明深度（declared 覆盖 ' + cov + ' < 40%）：按调用点数决定回边方向'
+         : '⚠ 无声明深度也无调用点数（declared 覆盖 ' + cov + '）：按调用结构分层');
+    function setFacts(t) { if (facts) facts.textContent = t; }
+    function idleFacts() { setFacts((hint ? hint + ' · ' : '') + modeNote); }
+
+    /* --- 高亮/淡化：状态类 .is-cg-hot / .is-cg-dim，与探照灯 .is-spot 严格分离 --- */
+    function paint(sel) {
+      var hotN = null, hotE = null;
+      if (sel && sel.type === 'node') {
+        hotN = Object.create(null); hotN[sel.id] = true;
+        hotE = Object.create(null);
+        edgeRecs.forEach(function (r) {
+          if (r.l.from === sel.id || r.l.to === sel.id) hotE[r.l.i] = true;
+        });
+      } else if (sel && sel.type === 'edge') {
+        hotN = Object.create(null); hotE = Object.create(null);
+        var rec = edgeRecs[sel.i];
+        if (!rec) return;
+        hotE[sel.i] = true;
+        hotN[rec.l.from] = true; hotN[rec.l.to] = true;
+      }
+      G.order.forEach(function (id) {
+        var el = nodeEls[id];
+        if (!hotN) { el.classList.remove('is-cg-hot', 'is-cg-dim'); return; }
+        var on = !!hotN[id];
+        el.classList.toggle('is-cg-hot', on);
+        el.classList.toggle('is-cg-dim', !on);
+      });
+      edgeRecs.forEach(function (r) {
+        if (!hotE) { r.el.classList.remove('is-cg-hot', 'is-cg-dim'); return; }
+        var on = !!hotE[r.l.i];
+        r.el.classList.toggle('is-cg-hot', on);
+        r.el.classList.toggle('is-cg-dim', !on);
+      });
+    }
+    function nodeFacts(id) {
+      var n = G.nodes[id], outs = 0, ins = 0;
+      edgeRecs.forEach(function (r) {
+        if (r.l.from === id) outs++;
+        if (r.l.to === id) ins++;
+      });
+      return n.label + ' · ' + (n.kind || '未知类型') + ' · '
+             + (n.file || '?') + (n.line ? ':' + n.line : '')
+             + ' · 出边 ' + outs + ' / 入边 ' + ins;
+    }
+    function edgeFacts(i) {
+      var l = edgeRecs[i].l;
+      var conf = (l.confidence === 'verified') ? 'verified（实锤）' : 'inferred（推断）';
+      var src = l.file ? (l.file + (l.line ? ':' + l.line : ''))
+                       : (l.line ? '第 ' + l.line + ' 行' : '未给依据行');
+      return G.nodes[l.from].label + ' → ' + G.nodes[l.to].label + ' · '
+             + l.count + ' 个调用点 · ' + conf + ' · ' + src;
+    }
+
+    var cur = null;
+    function enter(key, sel, text) { cur = key; paint(sel); setFacts(text); }
+    function leave(key) {
+      if (cur !== key) return;
+      cur = null; paint(null); idleFacts();
+    }
+    G.order.forEach(function (id) {
+      var g = nodeEls[id];
+      var key = 'n:' + id;
+      g.addEventListener('mouseenter', function () {
+        enter(key, { type: 'node', id: id }, nodeFacts(id));
+      });
+      g.addEventListener('focus', function () {
+        enter(key, { type: 'node', id: id }, nodeFacts(id));
+      });
+      g.addEventListener('mouseleave', function () { leave(key); });
+      g.addEventListener('blur', function () { leave(key); });
+    });
+    edgeRecs.forEach(function (r) {
+      var key = 'e:' + r.l.i;
+      r.hit.addEventListener('mouseenter', function () {
+        enter(key, { type: 'edge', i: r.l.i }, edgeFacts(r.l.i));
+      });
+      r.hit.addEventListener('mouseleave', function () { leave(key); });
+    });
+
+    /* 一次性入场（≤200ms，只走 opacity），尊重 prefers-reduced-motion */
+    if (reduceMotion()) scene.classList.add('is-cg-in');
+    else lazyPlay(scene, function () { scene.classList.add('is-cg-in'); }, null);
+
+    stage.appendChild(svg);
+    idleFacts();
   });
 
 })();

@@ -12,8 +12,8 @@ validate_course.py — code2course 成品课程机械校验（零依赖，Python
   2.  无外部资源引用：src=/href=/url() 不得指向 http(s)://
       （豁免：app.js 内联源码中的 SVG 命名空间字符串不在属性上下文里，
        本脚本只扫属性，天然豁免；xmlns 属性本身也豁免）
-  3.  四类 JSON 数据块（.viz-data/.onion-data/.tower-data/.fork-data）
-      全部可被 JSON.parse 解析，字符串值不含裸 </script，
+  3.  五类 JSON 数据块（.viz-data/.onion-data/.tower-data/.fork-data/
+      .callgraph-data）全部可被 JSON.parse 解析，字符串值不含裸 </script，
       且 note/anchor 等值内无 HTML 实体字面（JSON 是纯文本层）
   4.  每个 .translate-pair 内左右两侧 data-i 集合等长且一致
   5.  每个 .quiz 恰好一个 data-correct="true"；每个 .bet-scene 恰好一个
@@ -37,6 +37,10 @@ validate_course.py — code2course 成品课程机械校验（零依赖，Python
   14. 版本自证：成品应有 <meta name="generator" data-version="…">；
       缺失 WARNING（向后兼容旧产物），与内联外壳 @version 不一致 ERROR
   15. 散点内联 style ≤5 处（超出手写样式集中原则，WARNING）
+  16. 调用图数据块（.callgraph-data，规格 callgraph-block-v1.13.1 §7）：
+      每个 link 有 from/to/confidence 且 confidence ∈ {verified, inferred}、
+      from/to 命中 nodes[].id、无自环；verified link 必须有 file 与 line；
+      每个 node 必须有 file 与 line（调用图不允许无出处的节点）
 
 退出码：发现 ERROR 非零退出（=1），仅 WARNING 时退出 0。
 """
@@ -57,6 +61,7 @@ class CourseChecker(HTMLParser):
         self.json_blocks = []          # (cls, raw_text)
         self._json_cls = None
         self._json_buf = []
+        self._json_where = ''          # 当前 JSON 块的定位串（模块 · 行号）
         self.pairs = []                # 每个 translate-pair 的 data-i 记录
         self._pair_stack = []          # 嵌套 translate-pair 不存在，但保留栈式收尾
         self.quizzes = []              # 每个测验/赌注容器的汇总记录
@@ -127,9 +132,13 @@ class CourseChecker(HTMLParser):
         # JSON 数据块
         if tag == 'script' and a.get('type') == 'application/json':
             jcls = [c for c in classes
-                    if c in ('viz-data', 'onion-data', 'tower-data', 'fork-data')]
+                    if c in ('viz-data', 'onion-data', 'tower-data', 'fork-data',
+                             'callgraph-data')]
             self._json_cls = jcls[0] if jcls else '(json)'
             self._json_buf = []
+            mid = self.module_stack[-1]['id'] if self.module_stack else None
+            self._json_where = '（模块 %s · L%d）' % (mid or '无归属',
+                                                      self.getpos()[0])
             return
 
         # 翻译块（栈式：遇到新的 translate-pair 开新记录）
@@ -247,16 +256,17 @@ class CourseChecker(HTMLParser):
                 break
         if tag == 'script' and self._json_cls is not None:
             raw = ''.join(self._json_buf)
-            self._check_json(self._json_cls, raw)
+            self._check_json(self._json_cls, raw, self._json_where)
             self._json_cls = None
             self._json_buf = []
+            self._json_where = ''
 
     # ---- JSON 检查 ----
-    def _check_json(self, cls, raw):
+    def _check_json(self, cls, raw, where=''):
         try:
-            json.loads(raw)
+            data = json.loads(raw)
         except ValueError as e:
-            self.errors.append('.%s JSON 解析失败：%s' % (cls, e))
+            self.errors.append('.%s JSON 解析失败%s：%s' % (cls, where, e))
             return
         if re.search(r'</script', raw, re.IGNORECASE):
             self.errors.append(
@@ -267,6 +277,8 @@ class CourseChecker(HTMLParser):
             self.warnings.append(
                 '.%s JSON 值含 HTML 实体字面 %s（textContent 原样显示，'
                 '直接写 > < & 字符）' % (cls, m.group(0)))
+        if cls == 'callgraph-data':
+            callgraph_check(data, '.callgraph-data' + where, self.errors)
 
 
 def check_raw_text(raw, errors):
@@ -349,6 +361,92 @@ def trace_id_check(why_texts, known_ids, errors):
             if ref not in known_ids:
                 errors.append('溯源 id 死链：%s（data-why 引用了不存在的组件 id）'
                               % ref)
+
+
+# ---- 16. 调用图数据块契约（规格 callgraph-block-v1.13.1 §7） ----
+CG_CONFIDENCE = ('verified', 'inferred')
+
+
+def _cg_str(v):
+    return isinstance(v, str) and bool(v.strip())
+
+
+def _cg_int(v):
+    """int 且 ≥1；bool 是 int 的子类，必须排除。"""
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 1
+
+
+def callgraph_check(data, where, errors):
+    """调用图数据契约机检（规格 §7 四条）。
+
+    每条独立成错、各自定位到具体节点/连线，便于"注入必红"逐条命中：
+    坏 JSON 在 json.loads 处即返回（不落到这里）；缺 confidence、verified
+    缺 line、node 缺 file 三种注入各只命中一条。
+    """
+    if not isinstance(data, dict):
+        errors.append('%s 顶层必须是对象（含 nodes/links）' % where)
+        return
+    nodes = data.get('nodes')
+    links = data.get('links')
+    if not isinstance(nodes, list) or not nodes:
+        errors.append('%s 缺 nodes[]（或为空）——调用图至少一个节点' % where)
+        return
+    if not isinstance(links, list):
+        errors.append('%s 缺 links[]（引用清单；没有边时写 []）' % where)
+        links = []
+
+    ids = set()
+    for i, n in enumerate(nodes, 1):
+        if not isinstance(n, dict):
+            errors.append('%s nodes[%d] 不是对象' % (where, i))
+            continue
+        nid = n.get('id')
+        if _cg_str(nid):
+            who = nid
+            if nid in ids:
+                errors.append('%s nodes[%d] 的 id「%s」重复（id 必须唯一）'
+                              % (where, i, nid))
+            ids.add(nid)
+        else:
+            who = nid if isinstance(nid, str) else '#%d' % i
+            errors.append('%s nodes[%d] 缺 id' % (where, i))
+        # 4. 每个 node 必须有 file 与 line（调用图不允许无出处的节点）
+        if not _cg_str(n.get('file')):
+            errors.append('%s 调用图节点「%s」缺 file'
+                          '（调用图不允许无出处的节点）' % (where, who))
+        if not _cg_int(n.get('line')):
+            errors.append('%s 调用图节点「%s」缺 line（或不是 ≥1 的整数）'
+                          % (where, who))
+
+    for i, e in enumerate(links, 1):
+        if not isinstance(e, dict):
+            errors.append('%s links[%d] 不是对象' % (where, i))
+            continue
+        # 2. from / to / confidence 三者齐全且合法
+        for k in ('from', 'to', 'confidence'):
+            if not _cg_str(e.get(k)):
+                errors.append('%s 调用图 links[%d] 缺 %s' % (where, i, k))
+        conf = e.get('confidence')
+        if _cg_str(conf) and conf not in CG_CONFIDENCE:
+            errors.append('%s 调用图 links[%d] 的 confidence「%s」不在闭集 '
+                          '{verified, inferred} 内' % (where, i, conf))
+        frm, to = e.get('from'), e.get('to')
+        for k, v in (('from', frm), ('to', to)):
+            if _cg_str(v) and v not in ids:
+                errors.append('%s 调用图 links[%d].%s「%s」在 nodes[].id 中不存在'
+                              % (where, i, k, v))
+        if _cg_str(frm) and frm == to:
+            errors.append('%s 调用图 links[%d] 是自环（from == to，规格禁止）'
+                          % (where, i))
+        # 3. verified link 必须有 file 与 line
+        if conf == 'verified':
+            pair = '%s → %s' % (frm, to)
+            if not _cg_str(e.get('file')):
+                errors.append('%s 调用图 links[%d]（%s）标了 verified 却没有 '
+                              'file——实锤边必须给出发起行' % (where, i, pair))
+            if not _cg_int(e.get('line')):
+                errors.append('%s 调用图 links[%d]（%s）标了 verified 却没有 '
+                              'line——实锤边必须给出发起行' % (where, i, pair))
 
 
 # ---- 10. --source 逐字一致强校验 ----

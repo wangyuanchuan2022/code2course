@@ -3,6 +3,25 @@
 本文件记录 code2course 技能包的版本变更（[Keep-a-Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 格式）。
 版本号唯一事实来源：SKILL.md frontmatter `version`；resources 三件套头部 `@version` 与此同步。
 
+## [1.13.1] — 2026-09-14
+
+本版本给课件补上第三种调用链表达——**确定性调用图**：数据契约与布局算法借鉴 CodeGraph（MIT）的最长路径分层 + 重心法排序（禁力导向/随机布点），渲染沿用 v1.12.0 立下的「线型=置信度」诚实边基准。
+
+### Added
+
+- **声明式模板块 `.callgraph-scene`**（`resources/course-template.html`）：只写 JSON（`nodes` / `links`，逐节点带 `file`+`line`、逐边带 `count` 与 `confidence`），引擎自动布点；不写坐标、不写 SVG
+- **渲染引擎**（`resources/app.js` §20）：纯函数布局（`declared` 优先，无则回落调用点数并在事实面板**显式声明**「按调用链长度分层」）+ 最长路径分层 + 重心法 3 轮排序 + 端口散布 `(i+1)/(n+1)` + 三次贝塞尔连线（源下端口 → 垂直中点 → 目标上端口）+ 线宽 `min(6, 1 + log2(count) × 0.7)` + 实线=verified / 虚线=inferred / 回边强调色虚线 + 12px 透明命中区 + 节点 Tab 聚焦与 hover 同效 + 事实面板显示「文件:行号」；布局算法出处注记见文件内注释
+- **样式**（`resources/base.css` §20）：`.callgraph-*` 组件样式与状态类 `.is-cg-hot` / `.is-cg-dim`（与探照灯 `.is-spot`、赌注 `.is-spot-bet` 严格分离，防历史串扰复发）
+- **机检**（`validate_course.py` 检查 16）：`.callgraph-data` 可解析；node 必须有 `file`+`line`（调用图不允许无出处的节点）；link 必须有 `from`/`to`/`confidence`（闭集 `verified|inferred`）且 id 必须存在于 nodes；禁止自环；标 `verified` 的边必须带发起行 `file`+`line`
+- **文档三处**：`design-system.md` §8 登记组件（配色沿用语义 token，不引入新色）、`interactive-elements.md` §14 用法与数据契约（含与探照灯/栈塔的分工）、`workflow.md` 引用一行
+- **示例课件**：模块 4「单格判定」插入一张真实调用图（数据出自 `analyze_structure.py` 对 minesweeper_help 的分析：7 节点 / 6 边，全部 verified）
+
+### 已知限制
+
+- 布局常量按容器等比缩放，同一课程内不再逐图变化；超宽图走横向滚动而非重排（不做力导向兜底）
+- 该块是「一张图，不是编辑器」：不支持拖拽布点、不做自动截图导出
+- 图与源码冲突时以源码为准；`inferred` 边不得改写为 `verified`（沿用 §3a 诚实性要求）
+
 ## [1.13.0] — 2026-09-14
 
 本版本把"结构事实"从调研落地为随技能分发的工具：新增 `analyze_structure.py`（零依赖单文件：16 门语言结构提取 + 项目地图查询层），并把查询能力作为可选辅助接入 workflow §3。

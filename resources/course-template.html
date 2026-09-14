@@ -16,7 +16,7 @@
   v1.11：.viz-stage/.flow-svg 容器改 role="group"（可交互子元素须留在
   无障碍树内）；赌注揭晓用独立类 is-spot-bet；新增 --on-accent 与
   --code-hot-fg 对比度 token。
-  @version 1.13.0
+  @version 1.13.1
 =================================================================== -->
 <html lang="zh-CN">
 <head>
@@ -234,6 +234,30 @@
           </script>
           <div class="viz-stage" role="group" aria-label="{{图表标题}}"></div>
           <div class="viz-detail t-muted" hidden></div>
+        </div>
+
+        <!-- 调用图（v1.13.1）：把结构事实（analyze_structure.py 的 calls/imports 边）渲染成
+             一张确定性的节点-边图——看"谁调用了谁"的整体形状与疏密，是探照灯（跨文件走读）、
+             栈塔（运行时纵深）之外的第三种调用链表达。数据必须来自真实结构事实，逐边标注
+             confidence：verified（实锤，必带发起行 file:line）/ inferred（推断，命名或导入推测）；
+             禁止把 inferred 改写成 verified。完整契约与自查见 interactive-elements.md §14，
+             不需要的整块删掉。 -->
+        <div class="callgraph-scene scene">
+          <div class="callgraph-title t-h3">🕸️ {{标题，如：一次登录请求的调用图}}</div>
+          <p class="t-body">{{1–2 句引子：这张图回答什么问题、实锤与推断怎么区分}}</p>
+          <script type="application/json" class="callgraph-data">
+          {
+            "nodes": [
+              { "id": "login", "label": "login()", "kind": "function", "file": "src/auth/login.js", "line": 14 },
+              { "id": "verify", "label": "verifyPassword()", "kind": "function", "file": "src/auth/password.js", "line": 8 }
+            ],
+            "links": [
+              { "from": "login", "to": "verify", "count": 1, "confidence": "verified", "file": "src/auth/login.js", "line": 21 }
+            ]
+          }
+          </script>
+          <div class="callgraph-stage" role="group" aria-label="{{标题，如：一次登录请求的调用图}}"></div>
+          <div class="callgraph-facts t-muted" aria-live="polite">{{初始提示，如：悬停节点或连线看事实}}</div>
         </div>
 
         <!-- 应用型测验（模块收尾的总结性检查；与 §6 赌注分工不同，勿互相替代） -->

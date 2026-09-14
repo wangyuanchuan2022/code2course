@@ -21,7 +21,7 @@
    移动端 SVG 文字放大；触摸目标 ≥44px；代码行号 sticky。
    赌注揭晓行改用独立类 .is-spot-bet（与探照灯 .is-spot 分离）。
    ===================================================================
-   @version 1.13.0 */
+   @version 1.13.1 */
 
 /* ---------- 1. 变量 ---------- */
 :root {
@@ -996,3 +996,68 @@ fieldset.fork-param { border: 1px dashed var(--border);
                  border-top: 1px dashed var(--border);
                  color: var(--text-muted); font-size: 0.85rem;
                  display: flex; justify-content: center; text-align: center; }
+
+/* ---------- 20. 调用图（结构事实的节点-边图，v1.13.1） ----------
+   宿主：.callgraph-scene + <script type="application/json" class="callgraph-data">
+   （布局与渲染引擎见 app.js §20；用法见 interactive-elements.md §14）
+   颜色只用既有 token，不引入新色；线型承载诚实性——verified 实线、
+   inferred 虚线、回边强调色虚线。
+   状态类 .is-cg-hot / .is-cg-dim **归调用图引擎所有**，与探照灯 .is-spot、
+   赌注 .is-spot-bet 严格分离（历史串扰 bug 的防线，见 workflow.md §8 契约表）。 */
+.callgraph-title { margin-bottom: var(--space-2); }
+.callgraph-stage {
+  margin-top: var(--space-3);
+  overflow-x: auto;            /* 容器过窄时横向滚动，不把图压到读不出 */
+}
+.callgraph-svg { display: block; width: 100%; height: auto; }
+.callgraph-facts {
+  margin-top: var(--space-2); min-height: 1.6em;
+  font-family: var(--font-mono); font-size: 0.82rem;
+}
+/* 边：默认细墨线；置信度决定线型（inferred 与回边都是虚线） */
+.cg-edge { stroke: var(--text-muted);
+           transition: opacity var(--dur-fast) var(--ease-out),
+                       stroke var(--dur-fast) var(--ease-out); }
+.cg-edge.is-verified { stroke: var(--text); }
+.cg-edge.is-inferred { stroke: var(--text-muted); stroke-dasharray: 7 5; }
+.cg-edge.is-back { stroke: var(--accent-3); stroke-dasharray: 7 5; }
+.cg-hit { cursor: pointer; }
+
+/* 节点：圆角矩形 + 类型 glyph + 标签，空心描边（细墨线，与站点 hero 图同款克制） */
+.cg-node { cursor: pointer; }
+.cg-node .cg-box {
+  fill: var(--bg-card); stroke: var(--border); stroke-width: 1.5;
+  transition: stroke var(--dur-fast) var(--ease-out),
+              fill var(--dur-fast) var(--ease-out);
+}
+.cg-node .cg-label { fill: var(--text); font-family: var(--font-body); font-size: 12px; }
+.cg-node .cg-glyph { fill: var(--text-muted); font-size: 12px; }
+.cg-node.is-kind-entry .cg-glyph { fill: var(--accent-text); }
+.cg-node.is-kind-class .cg-glyph,
+.cg-node.is-kind-module .cg-glyph { fill: var(--accent-2); }
+.cg-node.is-kind-file .cg-glyph { fill: var(--text-muted); }
+
+/* 高亮/淡化：节点与连线的选中、其余退到背景里 */
+.cg-node.is-cg-hot .cg-box { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2.5; }
+.cg-node.is-cg-hot .cg-label { font-weight: 700; }
+.cg-node.is-cg-dim { opacity: 0.3; }
+.cg-edge.is-cg-hot { stroke: var(--accent); stroke-width: 3; }
+.cg-edge.is-cg-dim { opacity: 0.15; }
+.cg-node:focus { outline: none; }
+.cg-node:focus .cg-box { stroke: var(--accent); stroke-width: 2.5; }
+
+/* 一次性入场（≤200ms，只走 opacity）：放在两条分组上，避免与
+   .is-cg-dim 的元素级 opacity 抢优先级 */
+.callgraph-svg .cg-edges,
+.callgraph-svg .cg-nodes { opacity: 0; }
+.callgraph-scene.is-cg-in .callgraph-svg .cg-edges,
+.callgraph-scene.is-cg-in .callgraph-svg .cg-nodes {
+  opacity: 1; transition: opacity 180ms var(--ease-out);
+}
+
+/* 窄容器：几何按 viewBox 等比缩小，低于 719px 时给下限并交给横向滚动（规格 §4.8） */
+@media (max-width: 719px) {
+  .callgraph-svg { min-width: 560px; }
+  .cg-node .cg-label, .cg-node .cg-glyph { font-size: 13px; }
+  .callgraph-facts { font-size: 0.78rem; }
+}

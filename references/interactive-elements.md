@@ -2,7 +2,7 @@
 
 组装课程 HTML 时，直接复制各节的 **HTML 模板**到最终文件，替换 `{{占位符}}` 内容。**类名与结构保持稳定，不得推翻重新发明**。所有模板假定已内联 `resources/base.css` 与 `resources/app.js`。
 
-> ⚠️ §1/§2/§5/§7 各节附带的 CSS/JS 代码块**仅供理解组件原理，禁止粘贴进成品**——它们已内置于 `resources/base.css` 与 `resources/app.js`（含懒播放与防重复初始化）。照抄这里的旧版 JS 会导致双重绑定、动画失去"滚入才播"行为。§3–§6、§10–§12 的控件为**声明式引擎组件**：只写 HTML + JSON 数据，渲染与交互全部由 app.js 自动完成，不写任何 JS。
+> ⚠️ §1/§2/§5/§7 各节附带的 CSS/JS 代码块**仅供理解组件原理，禁止粘贴进成品**——它们已内置于 `resources/base.css` 与 `resources/app.js`（含懒播放与防重复初始化）。照抄这里的旧版 JS 会导致双重绑定、动画失去"滚入才播"行为。§3–§6、§10–§12、§14 的控件为**声明式引擎组件**：只写 HTML + JSON 数据，渲染与交互全部由 app.js 自动完成，不写任何 JS。
 
 零依赖铁律：所有模板只用原生 HTML + CSS + 原生 JS + 内联 SVG，禁止任何外部资源。
 
@@ -354,6 +354,7 @@ document.querySelectorAll('.translate-pair').forEach(pair => {
 | 同一条数据的纵向演化 + 被丢弃字段（数据变形 3b） | §4 | layers 从最终形态排到核；crumbs 只写真被丢的 |
 | 关键转折点先预测再揭晓（错误边界 3c） | §6 | data-bet-* 属性；紧跟要揭晓的翻译块 |
 | 递归 / 回调 / 中间件链的调用与返回 | §12 | script 按 push/pop 预排好；帧字段落到真实函数 |
+| 调用关系的整体形状：谁调谁、谁被最多人调、哪些边只是推断 | §14 | 数据来自结构事实工具，逐边标 confidence；禁止把 inferred 写成 verified |
 | 分支条件：不同输入走不同路（配置扩展面 3d / 设计取舍） | §11 | 只用预标注 when 映射驱动，禁止执行真实代码 |
 | 真实数据对比（文件数/行数/耗时） | §10a / §10b | 每个数字标 anchor 出处，禁止编造 |
 | 状态机 / 算法步骤 / 队列逐帧演化 | §10c | 帧数 3–6，同坐标系逐帧对比 |
@@ -372,6 +373,7 @@ document.querySelectorAll('.translate-pair').forEach(pair => {
 - [ ] 赌注：正确项恰好一个，全部选项 data-bet-why 非空；data-bet-pair 指向的翻译块在附近
 - [ ] 栈塔：script 按 push/pop 如实镜像真实调用结构（同帧内顺序试值可画成"弹出再压入"，但须在旁注说明）
 - [ ] 沙盘：branches 的 when 与真实分支条件一一对应；不出现任何执行真实代码的逻辑（无 eval/Function）
+- [ ] 调用图：nodes/links 全部来自结构事实（`analyze_structure.py`），每个 node 有 `file` 与 `line`，每条 link 有 `confidence`（`verified` 另需 `file` 与 `line`）；**没有把 `inferred` 改写成 `verified`**
 - [ ] 测验正确项恰好一个，所有选项 data-why 非空，且每个考点（含干扰项机制）都能回查到课程内的具体讲解位置
 - [ ] 页面上不存在任何 `http://` / `https://` **资源引用**（src/href/url()；app.js 内联源码里的 SVG 命名空间字符串豁免）
 - [ ] 键盘导航与 IntersectionObserver 只初始化一次
@@ -603,6 +605,95 @@ document.querySelectorAll('.translate-pair').forEach(pair => {
 §1–§7、§10–§12 是保底方案，不是上限。当概念的实际形态连引擎都表达不贴切（如并发竞态、限流排队、自定义布局的中间件漏斗），为概念量身设计新形式——判断标准：**这个形式是不是为这个概念而生**。示例方向与工程约束见 workflow.md §6"不拘泥于既有形式"。
 
 > 先查引擎：概念本质是数据对比/时序/状态步骤时用 §10，是跨文件走读/数据演化/押注/调用栈/分支试验时用 §3/§4/§6/§12/§11，**不要手写**；只有都覆盖不了的全新形态才手写 JS。
+
+---
+
+## 14. 调用图 —— 结构事实的节点-边图（Call Graph）
+
+**部署位置**：要"整体看调用关系"的地方——这个功能的调用链长什么样、哪个函数被最多人调、哪些边其实只是推断。它是**结构事实**的画法，不是手绘示意图：数据只能来自真实仓库。
+
+与 §3/§12 的分工：**探照灯**讲"一次调用跨了哪些文件、逐行走读"（路径），**栈塔**讲"运行时栈怎么涨落"（纵深），调用图讲**形状**——谁调谁、疏密、回路。三者都在讲调用链，但一个看路径、一个看纵深、一个看全局；模块里同时用两个时，用一句话点明分工，别让学习者以为是同一件事的两种画法。
+
+声明式组件：只写 HTML + JSON，分层、布线、命中区、键盘交互全部由引擎完成。
+
+```html
+<div class="callgraph-scene scene">
+  <div class="callgraph-title t-h3">🕸️ {{标题，如：一次登录请求的调用图}}</div>
+  <p class="t-body">{{1–2 句引子：这张图回答什么问题、实锤与推断怎么区分}}</p>
+  <script type="application/json" class="callgraph-data">
+  {
+    "nodes": [
+      { "id": "login", "label": "login()", "kind": "function", "file": "src/auth/login.js", "line": 14 },
+      { "id": "verify", "label": "verifyPassword()", "kind": "function", "file": "src/auth/password.js", "line": 8 }
+    ],
+    "links": [
+      { "from": "login", "to": "verify", "count": 1, "confidence": "verified", "file": "src/auth/login.js", "line": 21 }
+    ]
+  }
+  </script>
+  <div class="callgraph-stage" role="group" aria-label="{{标题，如：一次登录请求的调用图}}"></div>
+  <div class="callgraph-facts t-muted" aria-live="polite">{{初始提示，如：悬停节点或连线看事实}}</div>
+</div>
+```
+
+### 14a. 数据契约（闭集：nodes 与 links 之外不引入新键）
+
+`nodes[]`（必填）：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | string | 唯一标识（推荐 `文件:符号` 或短名），links 靠它连线 |
+| `label` | string | 图上显示的名字（可带 `()`） |
+| `kind` | enum | `function` / `method` / `class` / `module` / `file` / `entry`（决定 glyph 与分组色） |
+| `file` | string | POSIX 相对路径（**必填**，指向真实仓库文件） |
+| `line` | int ≥1 | 声明行（**必填**）——调用图不允许无出处的节点 |
+
+`links[]`（必填）：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `from` / `to` | string | 必须命中 `nodes[].id`；自环（from==to）**禁止** |
+| `count` | int ≥1 | 该边承载的调用点数（缺省 1），决定线宽 |
+| `confidence` | enum | **闭集** `verified`（实锤，带 file:line 的确定调用）/ `inferred`（推断）；**缺省即为非法**——诚实边不允许含糊 |
+| `file` / `line` | string / int | 发起调用的那一行（`verified` **必须给**；`inferred` 给最可能的依据行或省略 `line`） |
+
+布局相关（可选，缺省由算法算）：`declared`（int，链接的"声明深度"权重，来自结构事实的 import/调用层数，覆盖率 ≥40% 才作为分层基准，否则回落 `count` 并在事实面板显式声明降级）、`back`（bool，显式声明为回边，一般由算法自动判定，无需手写）。
+
+### 14b. 布局与渲染（引擎内建，确定性）
+
+- **分层**：最长路径分层——`layer = 1 + max(依赖目标的 layer)`，叶子为 0，画面上层号越大越靠上；两环互指（u→v 与 v→u 同时在场）时权重小的一侧退出分层图，它就是那条回边
+- **层内排序**：重心法 3 轮扫描，起点为稳定字母序；**回边**（指向画面上方的环边）用强调色虚线画出来，而不是拉直
+- **几何**：`LAYER_GAP=74`、节点盒高 `40`、横向最小占位 `96`、画布内边距 `32`；一条边的两端在源节点、目标节点各占一个端口，位置 `(i+1)/(n+1)`——让 8 条依赖成扇面，而不是挤在一个角
+- **线宽**：`min(6, 1 + log2(count) × 0.7)`——承载 700 个调用点的边明显更粗，但不会粗一百倍
+- **线型 = 置信度**：`verified` 实线、`inferred` 虚线、回边强调色虚线
+- **确定性**：同一份 JSON 必然产出同一张图（不依赖时间、随机数、DOM 测量顺序）
+- **交互**：悬停/聚焦节点 → 高亮它的所有边、淡化其余；悬停连线 → 事实面板显示 `from → to`、调用点数、置信度、`file:line`（**边从调用行长出来**）；节点可 Tab 聚焦，聚焦等同悬停；长标签截断为 `…`，全名保留在 `title` 与事实面板里，不丢信息
+
+### 14c. 状态类与分工
+
+状态类 `.is-cg-hot`（高亮）/ `.is-cg-dim`（淡化）**归调用图引擎所有**，与探照灯的 `.is-spot`、赌注的 `.is-spot-bet` 严格分离——各引擎只清扫自己的类，避免历史串扰 bug 复发（契约表见 workflow.md §8）。
+
+配色约定见 design-system.md §8a：**线型承载诚实性**，颜色不承载。
+
+### 14d. 数据从哪来
+
+结构事实工具 `analyze_structure.py`（可选辅助，零依赖单文件）：
+
+```bash
+python analyze_structure.py <仓库> --outdir work/structure-facts
+python analyze_structure.py <仓库> query callees <符号> --facts work/structure-facts/structure-facts.json
+```
+
+`calls[]` 边 → `links[]`（`confidence` 直取、`file`/`line` 直取发起行、`count` 取聚合数），`symbols[]` → `nodes[]`（`kind` 映射到上表枚举）。
+
+> 🔒 **诚实性红线**：**禁止**把 `inferred` 边改写成 `verified`；图与源码冲突时以源码为准。宁可图上少一条实线、多一条虚线，也不要让学习者以为那是一次确定发生的调用。
+
+### 14e. 自查
+
+- [ ] 每个 node 的 `file`/`line` 指向真实仓库文件与真实行，且逐字核对过
+- [ ] 每条 link 的 `confidence` 有据可依：写 `verified` 就必须给得出那次调用的 `file:line`
+- [ ] 节点 4–20 个；超过就拆图，或改用探照灯分段走读
+- [ ] `{{占位符}}` 全部替换；JSON 字符串内不出现裸 `</script`（需要时写 `<\/script`）
 
 手写 JS 的运行时纪律（v1.11 起为验收项）：
 
