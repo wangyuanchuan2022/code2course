@@ -28,20 +28,34 @@ analyze_structure.py — code2course 结构事实底稿生成器（零依赖，P
 不匹配（响亮失败）/ 2 用法错误（缺 <symbol>、--depth 非整数、--in 值非法等）。
 
 产物（写入 <outdir>，缺省 <cwd>/structure-facts）：
-    structure-facts.json — 机器可读五件套（schema_version=2，顶层键恰好 11 个）
+    structure-facts.json — 机器可读五件套（schema_version=3，顶层键恰好 12 个）
     structure-facts.md   — 人读底稿（固定小节：文件清单 / 符号表 / 依赖边（import）/
                            调用边 / 断点清单（Where the graph stops）/ 入口点 /
                            解析失败与警告 / 诚实性声明）
 
 说明：
-  * 五件套 = 文件清单 / 符号表 / import 边 / 调用边 / 入口点。
+  * 五件套 = 文件清单 / 符号表 / import 边 / 调用边 / 入口点。facts 顶层另有
+    engine_version（整数，提取引擎内容版本，与 schema_version 的形状契约相互独立；
+    bump 规则见常量定义处注释）。
   * 语言面：16 门 Tier-1 全部接入（F5）。python 走 ast 模块确定性提取（extractor: ast）；
     其余 15 门走表驱动启发式引擎（brace = 大括号系 / end = end 块系，extractor 如实标注），
     每门语言一张模式表（LANG_TABLES），token 正则借鉴 Pygments 2.21.0 lexer（见文末出处注记）。
     已知盲区见产物 MD 末尾的诚实性声明与 F5 各语言盲区列。
-  * 边诚实性：调用边的 callee 末段名命中符号表 → verified（实锤，带调用处行号）；
-    否则 inferred（推断）；同名多候选 → verified + ambiguous: true（不静默当唯一实锤）；
-    内建/全局名只计入 filtered_calls，不逐条列出；(file, line, callee) 去重。
+  * 边诚实性（v3 消解口径）：verified（实锤）只发给「目标可唯一指认」的调用边，且必带
+    resolved_by 证据来源——实锤(名)=末段名唯一命中（或多候选经同文件唯一收窄）；
+    实锤(绑定)=经 import 绑定收窄，或含点属性链的链根在本文件有绑定且末段名唯一命中；
+    实锤(限定)=receiver+callee 限定名精确命中。以下一律 inferred（推断）：末段名多候选
+    且收不窄（拒绝即未解析；边带 to_candidates 候选列表 ≤5 + candidates_total）；
+    符号表未命中（边带 unresolved_reason：external / not_extracted_here /
+    builtin_filtered）；自引用形态（caller 末段名 == callee——无条件降级并标 self_ref，
+    真递归、super 基类调用与跨 FFI 同名自环静态不可分）；receiver 为含点属性链的边
+    一律不凭名字判 verified。resolution 字段为四值闭集
+    unique / ambiguous / unresolved / self_ref。内建/全局名只计入 filtered_calls，
+    不逐条列出；(file, line, callee) 去重。
+  * 同名候选上限 500（CANDIDATE_CAP）：尾名同名符号超过上限的调用边整条放弃
+    （计 filtered_calls 并告警 name-cap-exceeded），防同名集合二次方扫描回潮。
+  * 生成文件标注：files[].generated 按路径约定 + 文件头 banner 双信号标注
+    （只标注不排除——解释噪声来源，不删数据；banner 只认注释行，窗口 60 行 / 8192 字符）。
   * 默认排除清单按目录 basename 匹配（任意层级、大小写不敏感）；--exclude 为追加而非
     替换；排除在目录遍历阶段生效（被排除目录的探针在 files/symbols/imports/calls
     四处零出现）。
@@ -70,8 +84,15 @@ import re
 import sys
 import tempfile
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 TOOL_NAME = 'analyze_structure.py'
+# A-P1-6（J3 裁决）：引擎内容版本，对齐 CodeGraph EXTRACTION_VERSION 的纪律——
+# 与 SCHEMA_VERSION（facts 形状契约，迁移可补）相互独立：本值跟踪「提取产出的内容」，
+# 只能重建底稿才能对齐的变化 bump。bump 规则：新增事实字段 / 新增语言或引擎分支 /
+# 改变既有字段的语义或取值分布 → +1；纯 bugfix、CLI/UX 改动、仅形状的 schema 迁移
+# → 不 bump（over-bumping 会让「建议重跑」提示变成噪声）。查询层不因本值不等而失败
+# （向后兼容：旧 facts 缺该字段视为未知），只在 MD 头输出供人/下游判断底稿新鲜度。
+ENGINE_VERSION = 1
 SIGNATURE_MAX = 200
 PARSE_MAX_BYTES = 5 * 1024 * 1024        # 超过则不解析（记 too-large 告警）
 READ_MAX_BYTES = 64 * 1024 * 1024        # 超过则不读入
@@ -90,7 +111,11 @@ CLOSED_SETS = {
     'warnings.kind': (
         'parse-error', 'decode-error', 'too-large', 'read-error',
         'unbalanced-block', 'manifest-error', 'unsupported-language',
-        'symlink-skipped'),
+        'symlink-skipped', 'name-cap-exceeded'),
+    'calls.resolution': ('unique', 'ambiguous', 'unresolved', 'self_ref'),
+    'calls.unresolved_reason': ('external', 'not_extracted_here',
+                                'builtin_filtered'),
+    'calls.resolved_by': ('name', 'binding', 'qualified'),
     'language': (
         'python', 'javascript', 'typescript', 'java', 'c', 'cpp', 'csharp',
         'go', 'rust', 'php', 'ruby', 'kotlin', 'swift', 'scala', 'dart', 'lua'),
@@ -103,8 +128,9 @@ CLOSED_SETS = {
 # 闭集尺寸（表完备性自检用；改动闭集必须同步此表与 schema_version）
 CLOSED_SIZES = {
     'symbols.kind': 11, 'extractor': 3, 'imports.kind': 5,
-    'entry_points.kind': 8, 'warnings.kind': 8, 'language': 16,
-    'counts.keys': 11,
+    'entry_points.kind': 8, 'warnings.kind': 9, 'language': 16,
+    'counts.keys': 11, 'calls.resolution': 4,
+    'calls.unresolved_reason': 3, 'calls.resolved_by': 3,
 }
 
 SYM_KINDS = CLOSED_SETS['symbols.kind']
@@ -123,7 +149,7 @@ EP_MAIN_GUARD, EP_MAIN_FUNCTION, EP_CONSOLE_SCRIPT, EP_MANIFEST_MAIN, \
 
 WARNING_KINDS = CLOSED_SETS['warnings.kind']
 W_PARSE, W_DECODE, W_TOO_LARGE, W_READ, W_UNBALANCED, W_MANIFEST, \
-    W_UNSUPPORTED, W_SYMLINK = WARNING_KINDS
+    W_UNSUPPORTED, W_SYMLINK, W_NAME_CAP = WARNING_KINDS
 
 LANG_IDS = CLOSED_SETS['language']
 COUNT_KEYS = CLOSED_SETS['counts.keys']
@@ -131,6 +157,25 @@ COUNT_KEYS = CLOSED_SETS['counts.keys']
 CONF_VERIFIED = 'verified'
 CONF_INFERRED = 'inferred'
 CONFIDENCES = (CONF_VERIFIED, CONF_INFERRED)      # J3：二值枚举
+
+# A-P0-2：调用边消解状态四值闭集（resolution 字段）
+RESOLUTIONS = CLOSED_SETS['calls.resolution']
+R_UNIQUE, R_AMBIGUOUS, R_UNRESOLVED, R_SELF_REF = RESOLUTIONS
+# to=null 时的未解析理由闭集（unresolved_reason 字段；builtin_filtered 当前引擎
+# 不会落到边上——内建名在建边前已按 filtered_calls 计数，取值保留给 hand-built
+# facts 与后续批次收口用）
+UNRESOLVED_REASONS = CLOSED_SETS['calls.unresolved_reason']
+U_EXTERNAL, U_NOT_EXTRACTED, U_BUILTIN = UNRESOLVED_REASONS
+# B-P0-2：verified 边的证据来源正交标签（resolved_by 字段；闭集不扩，J5）
+RESOLVED_BY = CLOSED_SETS['calls.resolved_by']
+RB_NAME, RB_BINDING, RB_QUALIFIED = RESOLVED_BY
+
+# B-P2-3：同名候选上限（CodeGraph CODEGRAPH_AMBIGUOUS_NAME_CEILING 同源纪律：
+# 宁可放弃该边也不做 ref×cand 两两打分）。超过上限的尾名，其调用边整条放弃
+# （计 filtered_calls 并按名告警一次 name-cap-exceeded）。
+CANDIDATE_CAP = 500
+# A-P0-2：多候选时边内保留的候选列表长度上限（全量以 candidates_total 表达）。
+TO_CANDIDATE_LIMIT = 5
 
 # ---------------------------------------------------------------- 语言矩阵（F5）
 LANG_EXTS = {
@@ -755,6 +800,95 @@ PROBE_DIR_NAMES = (
     'node_modules', 'dist', 'build', '__pycache__', '.venv', 'vendor', 'target',
 )
 
+# ---------------------------------------------------------------- 生成文件检测（A-P0-1）
+# 双信号（路径约定 + 文件头 banner），信号只做**标注**（files[].generated），
+# 绝不自动排除（J4 裁决：收益是解释噪声来源，不是删数据）。
+# 机制与纪律借鉴 CodeGraph src/extraction/generated-detection.ts（MIT）：
+# 排序提示非硬过滤、precision-first（假阳会静默把手写源码打上「疑生成」）、
+# banner 必须落注释行（排除字符串字面量与标识符撞词）。
+# 路径约定表：(basename 小写正则, 出处注记)。
+GENERATED_PATH_PATTERNS = (
+    (re.compile(r'\.pb\.go$'), 'protobuf Go'),
+    (re.compile(r'_grpc\.pb\.go$'), 'gRPC Go'),
+    (re.compile(r'\.pb\.(cc|hh?|hpp)$'), 'protobuf C++'),
+    (re.compile(r'_pb2\.py$'), 'protobuf Python'),
+    (re.compile(r'\.pb\.dart$'), 'protobuf Dart'),
+    (re.compile(r'\.g\.dart$'), 'build_runner Dart'),
+    (re.compile(r'\.freezed\.dart$'), 'freezed Dart'),
+    (re.compile(r'\.generated\.(ts|js|rs)$'), '通用 .generated 后缀'),
+    (re.compile(r'\.min\.m?js$'), '压缩产物 JS'),
+    (re.compile(r'^mock_[\w.]+\.go$'), 'gomock mock_<src>.go 命名'),
+    (re.compile(r'[\w.]+_mock\.go$'), 'gomock <src>_mock.go 命名'),
+    (re.compile(r'\.g\.cs$'), 'C# 生成源'),
+    (re.compile(r'^outerclass\.java$'), 'protoc java 内嵌类文件'),
+)
+# banner 形状表（precision-first：每条都要求「手写文本罕见」的组合）
+GENERATED_BANNER_PATTERNS = (
+    # @generated 需词边界守卫：foo@generated 这类标识符文本不算
+    re.compile(r'(?:^|[^\w@])@generated\b', re.IGNORECASE),
+    # 裸「自动生成」散文太常见，要求 by 指名生成者
+    re.compile(r'\bgenerated\s+by\s+\S', re.IGNORECASE),
+    re.compile(r'\bdo\s+not\s+edit\b', re.IGNORECASE),
+    re.compile(r'\bdo\s+not\s+modify\b', re.IGNORECASE),
+)
+GENERATED_STEM = re.compile(r'generat', re.IGNORECASE)   # 一次不锚定扫描快速拒绝
+GENERATED_HEADER_CHARS = 8192   # 头部窗口：够放 license 前言 + build tag，
+GENERATED_HEADER_LINES = 60     # 又紧到「生成器自己的源码里的字符串」冒充不了 banner
+_GENERATED_COMMENT_LEADERS = (
+    '//', '/*', '*', '#', '--', '%', ';', "'", '!', '(*', '{-', '<#',
+    '=begin', '@rem', 'rem',
+)
+_GENERATED_BLOCK_PAIRS = (
+    ('/*', '*/'), ('(*', '*)'), ('{-', '-}'), ('"""', '"""'),
+    ("'''", "'''"), ('=begin', '=end'), ('<#', '#>'),
+)
+
+
+def has_generated_header(text):
+    """文件头 banner 检测（A-P0-1）：先快速拒绝，再逐行只测注释行/块内行。
+
+    块注释状态推进刻意朴素（naive，同行闭合即出块）；代价上限只是「疑生成」
+    标注（非硬过滤），不产生错误答案。
+    """
+    if not text:
+        return False
+    head = text[:GENERATED_HEADER_CHARS]
+    if not GENERATED_STEM.search(head):
+        # 快速拒绝：绝大多数手写源码在此即返回（不切行、零逐行开销）
+        return False
+    in_block = None
+    for line in head.splitlines()[:GENERATED_HEADER_LINES]:
+        stripped = line.strip()
+        if in_block is not None:
+            if in_block in stripped:
+                in_block = None          # 同行闭合（含 =end 一类闭合标记）
+            continue                     # 块内行按注释行对待
+        if not any(stripped.startswith(ld) for ld in _GENERATED_COMMENT_LEADERS):
+            matched_block = False
+            for opener, closer in _GENERATED_BLOCK_PAIRS:
+                if stripped.startswith(opener):
+                    if closer not in stripped[len(opener):]:
+                        in_block = closer
+                    matched_block = True
+                    break
+            if not matched_block:
+                continue                 # 代码行：banner 不在代码行上找
+        if any(rx.search(stripped) for rx in GENERATED_BANNER_PATTERNS):
+            return True
+    return False
+
+
+def detect_generated(path, text=None):
+    """双信号并集入口（A-P0-1）：路径约定命中或头部 banner 命中 → True。
+
+    text=None（未读入/超限/解码失败）时退化为仅路径信号（如实降级，不猜内容）。
+    """
+    base = path.rsplit('/', 1)[-1].lower()
+    for rx, _src in GENERATED_PATH_PATTERNS:
+        if rx.search(base):
+            return True
+    return has_generated_header(text) if text is not None else False
+
 HONESTY_BLOCK = '''> 本底稿由 analyze_structure.py 自动生成。Python 部分来自 ast 模块的确定性提取（extractor: ast）；
 > 其余语言来自表驱动启发式引擎（extractor: brace = 大括号系 / end = end 块系），均为启发式而非事实。
 > 已知盲区举例：C/C++ 宏定义函数与函数指针调用、Java/C# 注解处理器与 Lambda 体、Go 接口隐式实现、
@@ -763,11 +897,20 @@ HONESTY_BLOCK = '''> 本底稿由 analyze_structure.py 自动生成。Python 部
 > `arr[0].push(v)` 形态）。以上均不保证被识别。
 > `.h` 一律按 C 的模式表处理（`.hpp` / `.hh` / `.hxx` 才是 C++）：header-only 或大量用 `.h`
 > 写 C++ 的工程，模板/命名空间/类语义会走 C 的口径，语言统计也随之为 c——需人工复核。
-> 每条 import 边与调用边都标注了「实锤·名」或「推断」：「实锤·名」= callee 的**末段名**在本仓库
-> 符号表命中（是名字对上，不是解析确认）。跨 FFI 边界（pybind11 / ctypes / Cython / JNI）的调用
-> 静态不可见：同名命中可能指向同语言同名符号自身，此类边（receiver 为含点属性链的自名调用）已
-> 降级为「推断」并标 `self_ref`，下游调用图不得画自环。
-> 断点清单的「符号表未命中」既可能是真外部调用，也可能是本文件内的抽漏（启发式引擎不保证抽全）。
+> 每条调用边标注「实锤(名)/实锤(绑定)/实锤(限定)」或「推断」：verified 必须目标可唯一指认
+> （边带 to 身份三元组与 resolved_by 证据来源），末段名多候选收不窄时一律推断（拒绝即未解析；
+> 边带 to_candidates 候选列表 ≤5 + candidates_total，绝不「先实锤再让下游剔」）。
+> 自引用形态（caller 末段名 == callee）无条件降级为「推断」并标 `self_ref`：真递归、
+> super 基类调用与跨 FFI 边界（pybind11 / ctypes / Cython / JNI）的同名自环在静态上不可分，
+> 下游调用图不得把 self_ref 边当实锤边画。receiver 为含点属性链的边一律不凭名字判 verified
+> （链根在本文件有绑定且末段名唯一命中才可判实锤(绑定)）。
+> files[].generated 按路径约定 + 文件头 banner 双信号标注疑似生成文件（只标注不排除；
+> banner 只认注释行，扫描窗口 60 行 / 8192 字符，未读入的文件仅按路径信号判定）。
+> 同名候选超过上限（500）的尾名，其调用边整条放弃：按 filtered_calls 计数并告警
+> name-cap-exceeded（每名一次），不逐条列出。
+> 断点清单的「符号表未命中」既可能是真外部调用，也可能是本文件内的抽漏（启发式引擎不保证抽全；
+> 边上的 unresolved_reason=not_extracted_here 表示「声明形位置出现过该名字但符号表没有」——
+> 抽漏的机检信号）。
 > 入口点中的命名启发式、manifest 声明与 listen( 调用均属启发式而非事实。
 > 底稿与源码冲突时，以源码为准。'''
 
@@ -1140,13 +1283,36 @@ def walk_class(cls, prefix, symbols, calls_raw, rel, src_lines):
             collect_calls(sub, qname, calls_raw)
 
 
-def analyze_python(root, rel, data, text, symbols, imports, entry_points, warnings):
-    """Python 文件 → (调用点原始表, 解析错误消息|None)。"""
+def python_import_locals(node):
+    """import 语句的本地名绑定（B-P0-3 含点链根判定用）。
+
+    `import a.b` 绑定的是 'a'（不是 'a.b'）；`import a.b as c` 绑定 'c'；
+    `from m import x as y` 绑定 'y'；star-import 不产生可判定的本地名（不收）。
+    """
+    out = set()
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            out.add(alias.asname or alias.name.split('.')[0])
+    elif isinstance(node, ast.ImportFrom):
+        for alias in node.names:
+            if alias.name != '*':
+                out.add(alias.asname or alias.name)
+    return out
+
+
+def analyze_python(root, rel, data, text, symbols, imports, entry_points,
+                   warnings, bindings=None):
+    """Python 文件 → (调用点原始表, 解析错误消息|None, 声明形名字集)。
+
+    bindings：{file: set(本地名)}（v3 新增，B-P0-3 链根绑定判定用；None 时不收）。
+    声明形名字集：本文件声明位置出现过的名字（含被跳过的嵌套函数）——unresolved
+    边的 not_extracted_here 机检信号（A-P0-2）。
+    """
     src_lines = text.splitlines()
     try:
         tree = ast.parse(data, filename=rel)
     except (SyntaxError, ValueError, RecursionError) as exc:
-        return [], '%s: %s' % (type(exc).__name__, exc)
+        return [], '%s: %s' % (type(exc).__name__, exc), set()
     calls_raw = []
     try:
         for stmt in tree.body:
@@ -1183,14 +1349,22 @@ def analyze_python(root, rel, data, text, symbols, imports, entry_points, warnin
         for node in ast.walk(tree):
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 imports.extend(python_import_edges(root, rel, node, src_lines))
+                if bindings is not None:
+                    locals_ = python_import_locals(node)
+                    if locals_:
+                        bindings.setdefault(rel, set()).update(locals_)
+        decl_names = set(node.name for node in ast.walk(tree)
+                         if isinstance(node, (ast.FunctionDef,
+                                              ast.AsyncFunctionDef,
+                                              ast.ClassDef)))
     except RecursionError:
         # P1-3：深嵌套合法文件（超长属性链/加法链）ast.parse 能过、遍历递归爆栈
         # ——单文件隔离（F1）：按 parse-error 优雅降级，不牵连整仓。截断前已
         # 提取的符号/入口如实保留，该文件调用/import 边跳过。
         return [], ('RecursionError: AST traversal exceeded the recursion '
                     'limit; per-file isolation (calls/imports of this file '
-                    'skipped)')
-    return calls_raw, None
+                    'skipped)'), set()
+    return calls_raw, None, decl_names
 
 
 def import_bases(dir_parts, level):
@@ -1765,7 +1939,11 @@ def _scan_go_block(root, rel, comments_only, start, imports, extractor, line_of)
 
 def analyze_generic(root, rel, lang, data, text, symbols, imports,
                     entry_points, warnings):
-    """brace/end 双引擎（表驱动）：返回 (调用点原始表, 停用表滤掉的调用数)。"""
+    """brace/end 双引擎（表驱动）：返回 (调用点原始表, 停用表滤掉的调用数, 声明形名字集)。
+
+    声明形名字集（v3 新增）：decl 正则命中且非停用词的名字——含后续因嵌套等原因
+    未进符号表的名字，是 unresolved 边 not_extracted_here 机检信号的依据（A-P0-2）。
+    """
     table = compile_table(lang)
     extractor = lang_extractor(lang)
     stripped = strip_source(text, table, 'all')
@@ -1783,6 +1961,7 @@ def analyze_generic(root, rel, lang, data, text, symbols, imports,
     # ---- 1) 声明扫描（默认在完全剥离文本上；decl_on_comments 语言用仅剥注释文本）----
     found = []
     decl_spans = []
+    decl_names = set()
     decls_compiled, imports_compiled = table['_compiled']
     decl_text = comments_only if table.get('decl_on_comments') else stripped
     for rx, kind, role in decls_compiled:
@@ -1803,6 +1982,7 @@ def analyze_generic(root, rel, lang, data, text, symbols, imports,
                 continue
             if name.startswith('~') or name.startswith('operator'):
                 continue                       # 析构/运算符重载：盲区不猜
+            decl_names.add(name)
             found.append((m.start(), m.end(), name,
                           m.groupdict().get('recv'), kind, role))
     found.sort(key=lambda item: (item[0], -item[1]))
@@ -2023,12 +2203,12 @@ def analyze_generic(root, rel, lang, data, text, symbols, imports,
                 best_start = s_start
                 caller = s_name
         ordered_calls.append((line_no, caller, callee, receiver))
-    return ordered_calls, filtered
+    return ordered_calls, filtered, decl_names
 
 
 # ---------------------------------------------------------------- 五件套组装
 def build_facts(repo, selected_langs=None, extra_excludes=None):
-    """扫描仓库 → facts 字典（J1/J2/J7：顶层 11 键、POSIX 相对路径、稳定排序）。"""
+    """扫描仓库 → facts 字典（J1/J2/J7：顶层 12 键、POSIX 相对路径、稳定排序）。"""
     root = os.path.abspath(repo)
     excludes = set(DEFAULT_EXCLUDES)
     for name in (extra_excludes or ()):
@@ -2044,6 +2224,8 @@ def build_facts(repo, selected_langs=None, extra_excludes=None):
     entry_points = []
     call_units = []                      # (rel, lang, [(line, caller, callee, receiver)])
     filtered_calls = 0
+    py_bindings = {}                     # A-P0-2/B-P0-3：file → set(import 本地名)
+    decl_names_by_file = {}              # A-P0-2：file → set(声明形名字，抽漏机检信号)
 
     for rel in scan_tree(root, excludes, warnings):
         base = os.path.basename(rel)
@@ -2056,10 +2238,15 @@ def build_facts(repo, selected_langs=None, extra_excludes=None):
         lang = EXT_TO_LANG.get(ext)
         if lang is None:
             rec, _data, _text = read_source(root, rel, None, files, warnings)
+            # A-P0-1：未支持扩展名只做路径信号判定（无内容可扫，如实降级）
+            rec['generated'] = detect_generated(rel)
             warnings.append(_warn(rel, W_UNSUPPORTED,
                                   'unsupported file extension: %s' % (ext or '(none)')))
             continue
         rec, data, text = read_source(root, rel, lang, files, warnings)
+        # A-P0-1：生成文件双信号标注（只标注不排除，J4）；读取失败时 text=None，
+        # detect_generated 如实退化为仅路径信号
+        rec['generated'] = detect_generated(rel, text)
         if data is None:
             continue
         if len(data) > PARSE_MAX_BYTES:
@@ -2070,20 +2257,23 @@ def build_facts(repo, selected_langs=None, extra_excludes=None):
         if selected_langs is not None and lang not in selected_langs:
             continue
         if lang == 'python':
-            unit, parse_error = analyze_python(root, rel, data, text, symbols,
-                                               imports, entry_points, warnings)
+            unit, parse_error, decl_names = analyze_python(
+                root, rel, data, text, symbols, imports, entry_points,
+                warnings, py_bindings)
             if parse_error is not None:
                 rec['parse_error'] = parse_error
                 warnings.append(_warn(rel, W_PARSE, parse_error))
             else:
                 call_units.append((rel, lang, unit))
+                decl_names_by_file[rel] = decl_names
         else:                          # brace / end 双引擎（表驱动，1b）
-            unit, extra_filtered = analyze_generic(
+            unit, extra_filtered, decl_names = analyze_generic(
                 root, rel, lang, data, text, symbols, imports,
                 entry_points, warnings)
             filtered_calls += extra_filtered
             if unit:
                 call_units.append((rel, lang, unit))
+                decl_names_by_file[rel] = decl_names
 
     for rec in files:                    # 命名启发式入口点（清单口径，与引擎无关）
         parts = rec['path'].split('/')
@@ -2099,11 +2289,28 @@ def build_facts(repo, selected_langs=None, extra_excludes=None):
                 })
                 break
 
-    last_segment = {}
-    for sym in symbols:                  # 命中判定：callee 与符号末段名相等（全库口径）
-        key = sym['qualname'].split('.')[-1]
-        last_segment[key] = last_segment.get(key, 0) + 1
+    # A-P0-2：惰性配对表（末段名/限定名 → [符号引用]）替代 v2 的末段名计数表——
+    # 一次构建、查询 O(1)；多候选时给出候选列表而非只给计数。防 O(K²)（B-P2-3）：
+    # 任何消解策略都只对「该名字的候选数组」做线性扫描，绝不做 ref×cand 两两打分。
+    by_tail = {}
+    by_qual = {}
+    for sym in symbols:
+        by_tail.setdefault(sym['qualname'].split('.')[-1], []).append(sym)
+        by_qual.setdefault(sym['qualname'], []).append(sym)
 
+    # import 收窄的文件级依据：本文件 verified 且非外部的 import 目标文件集合
+    file_set = set(rec['path'] for rec in files)
+    import_targets = {}
+    for imp in imports:
+        if imp['confidence'] == CONF_VERIFIED and not imp.get('external') \
+                and imp.get('target') in file_set:
+            import_targets.setdefault(imp['file'], set()).add(imp['target'])
+
+    def _ident(sym):
+        return {'file': sym['file'], 'qualname': sym['qualname'],
+                'start_line': sym['start_line']}
+
+    capped = {}                          # 尾名 → 首个触发上限的文件（每名只告警一次）
     for rel, lang, raw_calls in call_units:
         seen = set()
         # A3-3：调用边的 extractor 与语言一致（原先硬编码 'ast'，brace/end 语言
@@ -2120,23 +2327,123 @@ def build_facts(repo, selected_langs=None, extra_excludes=None):
             if key in seen:              # (file, line, callee) 去重
                 continue
             seen.add(key)
-            candidates = last_segment.get(callee, 0)
-            # P0-1：callee 消解纳入 receiver。「同名唯一候选 = 调用者自己」且
-            # receiver 是含点属性链（`native.mscore.win_rate(...)`）时，这多半是
-            # 跨 FFI 边界的外部调用，不是自调——降级 inferred（receiver 证据保留），
-            # 不再产「实锤自环」；同符号边另给显式标记供下游剔除。
-            self_ref = bool(caller) and _lastseg(caller) == callee \
-                and candidates <= 1
-            boundary = self_ref and bool(receiver) and '.' in receiver
+
+            cands = by_tail.get(callee) or ()
+            n_cand = len(cands)
+            if n_cand > CANDIDATE_CAP:
+                # B-P2-3：同名候选超上限——放弃该边（宁可少、不错），计 filtered
+                # 并对该名告警一次（message 里点名尾名与候选数）
+                filtered_calls += 1
+                if callee not in capped:
+                    capped[callee] = rel
+                    warnings.append(_warn(
+                        rel, W_NAME_CAP,
+                        'tail name %r has %d same-name symbols (cap %d); its '
+                        'call edges are dropped (counted in filtered_calls)'
+                        % (callee, n_cand, CANDIDATE_CAP)))
+                continue
+
+            cand_sorted = sorted(cands, key=lambda s: (s['file'], s['start_line'],
+                                                       s['qualname'])) \
+                if n_cand else []
+            to = None
+            to_candidates = None
+            candidates_total = None
+            if n_cand >= 2:
+                to_candidates = [_ident(s) for s in cand_sorted[:TO_CANDIDATE_LIMIT]]
+                candidates_total = n_cand
+
+            self_shape = bool(caller) and _lastseg(caller) == callee
+            dotted = bool(receiver) and '.' in receiver
+            unresolved_reason = None
+            resolved_by = None
+            self_ref = False
+
+            if n_cand == 0:
+                # 未命中：推断 + 机检理由（not_extracted_here = 本文件声明形位置
+                # 出现过该名字但符号表没有——「抽漏」信号，A-P0-2）
+                conf = CONF_INFERRED
+                resolution = R_UNRESOLVED
+                unresolved_reason = U_NOT_EXTRACTED \
+                    if callee in decl_names_by_file.get(rel, ()) else U_EXTERNAL
+            elif self_shape:
+                # B0 修订 A（无条件降级）：caller 末段名 == callee 一律推断并标
+                # self_ref——真递归、`super().__init__()`（receiver=null）与跨 FFI
+                # 同名自环静态不可分，不再依赖 receiver 形态或候选数
+                conf = CONF_INFERRED
+                resolution = R_SELF_REF
+                self_ref = True
+                if n_cand == 1:
+                    to = _ident(cand_sorted[0])
+            elif dotted:
+                # B-P0-3 形态级排他：含点属性链一律不凭名字判 verified（无论候选
+                # 数——D5-P0-1 的教训：同名命中可能就是调用者自己）。链根在本文件
+                # 有绑定（import 本地名 / 同名顶层符号）且末段名唯一命中才判
+                # 实锤(绑定)；多候选收不窄 → 拒绝即未解析（B-P0-4）
+                root_seg = receiver.split('.', 1)[0]
+                if n_cand == 1:
+                    to = _ident(cand_sorted[0])
+                    if root_seg in py_bindings.get(rel, ()) or any(
+                            s['file'] == rel for s in by_qual.get(root_seg, ())):
+                        conf = CONF_VERIFIED
+                        resolution = R_UNIQUE
+                        resolved_by = RB_BINDING
+                    else:
+                        conf = CONF_INFERRED
+                        resolution = R_UNIQUE
+                else:
+                    conf = CONF_INFERRED
+                    resolution = R_AMBIGUOUS
+            else:
+                if n_cand == 1:
+                    # 策略 D：末段名唯一命中（v2 语义保留），限定名形态升级标签
+                    conf = CONF_VERIFIED
+                    resolution = R_UNIQUE
+                    to = _ident(cand_sorted[0])
+                    resolved_by = RB_QUALIFIED if (
+                        receiver and '.' not in receiver
+                        and cand_sorted[0]['qualname'] == receiver + '.' + callee
+                    ) else RB_NAME
+                else:
+                    # 策略 E（B-P0-4）：多候选先收窄——同文件唯一 → import 目标
+                    # 唯一 → 限定名唯一；收不窄一律推断（拒绝即未解析），绝不
+                    # 「先 verified 再让下游剔」
+                    narrowed = None
+                    same = [s for s in cand_sorted if s['file'] == rel]
+                    if len(same) == 1:
+                        narrowed, resolved_by = same[0], RB_NAME
+                    else:
+                        imported = [s for s in cand_sorted
+                                    if s['file'] in import_targets.get(rel, ())]
+                        if len(imported) == 1:
+                            narrowed, resolved_by = imported[0], RB_BINDING
+                        elif receiver and '.' not in receiver:
+                            qhits = by_qual.get(receiver + '.' + callee, ())
+                            if len(qhits) == 1:
+                                narrowed, resolved_by = qhits[0], RB_QUALIFIED
+                    if narrowed is not None:
+                        conf = CONF_VERIFIED
+                        resolution = R_UNIQUE
+                        to = _ident(narrowed)
+                    else:
+                        conf = CONF_INFERRED
+                        resolution = R_AMBIGUOUS
+
             edge = {
                 'file': rel, 'line': line, 'caller': caller, 'callee': callee,
                 'receiver': receiver,
-                'confidence': CONF_INFERRED if boundary or not candidates
-                else CONF_VERIFIED,
-                'candidates': candidates,
-                'ambiguous': candidates > 1,
+                'confidence': conf,
+                'candidates': n_cand,
+                'ambiguous': n_cand > 1,
                 'extractor': extractor,
+                'to': to,                    # A-P0-2：唯一指认的目标身份（否则 null）
+                'to_candidates': to_candidates,   # 多候选候选列表（≤5）
+                'candidates_total': candidates_total,
+                'resolution': resolution,    # unique|ambiguous|unresolved|self_ref
+                'resolved_by': resolved_by,  # verified 证据来源（name|binding|qualified）
             }
+            if unresolved_reason is not None:
+                edge['unresolved_reason'] = unresolved_reason
             if self_ref:
                 edge['self_ref'] = True
             calls.append(edge)
@@ -2144,7 +2451,9 @@ def build_facts(repo, selected_langs=None, extra_excludes=None):
     files.sort(key=lambda r: r['path'])
     symbols.sort(key=lambda s: (s['file'], s['start_line'], s['qualname']))
     imports.sort(key=lambda i: (i['file'], i['line'], i['target']))
-    calls.sort(key=lambda c: (c['file'], c['line'], c['callee']))
+    # A-P0-2：to 作稳定次级键（(file, line, callee) 去重后不新增分桶，仅锁序）
+    calls.sort(key=lambda c: (c['file'], c['line'], c['callee'],
+                              (c['to'] or {}).get('qualname', '')))
     entry_points.sort(key=lambda e: (e['kind'], e['file'], e['line']))
     warnings.sort(key=lambda w: (w['file'], w['kind'], w['message']))
 
@@ -2168,6 +2477,7 @@ def build_facts(repo, selected_langs=None, extra_excludes=None):
     return {
         'schema_version': SCHEMA_VERSION,
         'tool': TOOL_NAME,
+        'engine_version': ENGINE_VERSION,
         'root_name': os.path.basename(root) or root,
         'languages': languages,
         'counts': counts,
@@ -2186,9 +2496,21 @@ def dumps_facts(facts):
 
 
 # ---------------------------------------------------------------- 人读底稿（F3）
-def _conf_label(confidence):
-    """P1-d：标签暴露口径——「实锤·名」= callee 末段名在符号表命中，非解析确认。"""
-    return '实锤·名' if confidence == CONF_VERIFIED else '推断'
+def _conf_label(confidence, resolved_by=None):
+    """B-P0-2：标签与置信来源绑定——实锤必须带括号说明凭什么。
+
+    verified + resolved_by：实锤(名) / 实锤(绑定) / 实锤(限定)；verified 无
+    resolved_by（import / 入口点等非调用边场景）→ 实锤；inferred → 推断。
+    """
+    if confidence != CONF_VERIFIED:
+        return '推断'
+    if resolved_by == RB_NAME:
+        return '实锤(名)'
+    if resolved_by == RB_BINDING:
+        return '实锤(绑定)'
+    if resolved_by == RB_QUALIFIED:
+        return '实锤(限定)'
+    return '实锤'
 
 
 def render_md(facts):
@@ -2198,7 +2520,9 @@ def render_md(facts):
     add = out.append
     add('# 结构事实底稿 · %s' % _md_cell(facts['root_name']))
     add('')
-    add('- 工具：%s（schema_version %d）' % (facts['tool'], facts['schema_version']))
+    add('- 工具：%s（schema_version %d，engine_version %d）'
+        % (facts['tool'], facts['schema_version'],
+           facts.get('engine_version') or 0))
     add('- 语言：%s' % _md_cell(', '.join(facts['languages'])
                                if facts['languages'] else '（无）'))
     add('- 计数摘要：files=%d symbols=%d imports=%d calls=%d（实锤 %d / 推断 %d）'
@@ -2210,13 +2534,15 @@ def render_md(facts):
 
     add('## 文件清单')
     add('')
-    add('| 路径 | 行数 | 语言 |')
-    add('|---|---|---|')
+    add('| 路径 | 行数 | 语言 | 生成 |')
+    add('|---|---|---|---|')
     for rec in facts['files']:
-        add('| %s | %d | %s |' % (_md_cell(rec['path']), rec['lines'],
-                                  _md_cell(rec['language'] or '-')))
+        add('| %s | %d | %s | %s |'
+            % (_md_cell(rec['path']), rec['lines'],
+               _md_cell(rec['language'] or '-'),
+               '是' if rec.get('generated') else '-'))
     if not facts['files']:
-        add('| （无） | 0 | - |')
+        add('| （无） | 0 | - | - |')
     add('')
 
     add('## 符号表')
@@ -2242,7 +2568,10 @@ def render_md(facts):
     for imp in facts['imports']:
         add('| %s:%d | %s | %s | %s | %s |'
             % (_md_cell(imp['file']), imp['line'], _md_cell(imp['target']),
-               _conf_label(imp['confidence']), _md_cell(imp['kind']),
+               _conf_label(imp['confidence'],
+                           RB_BINDING if imp['confidence'] == CONF_VERIFIED
+                           else None),
+               _md_cell(imp['kind']),
                'yes' if imp['external'] else 'no'))
     if not facts['imports']:
         add('| （无） | - | - | - | - |')
@@ -2250,18 +2579,34 @@ def render_md(facts):
 
     add('## 调用边')
     add('')
-    add('「实锤·名」= callee 末段名在本仓库符号表命中（名字对上，非解析确认）；'
-        '「推断」= 未命中。')
+    add('置信列：实锤(名)=末段名唯一命中或多候选经同文件唯一收窄；'
+        '实锤(绑定)=import 绑定收窄，或含点链根在本文件有绑定且末段名唯一命中；'
+        '实锤(限定)=receiver+callee 限定名精确命中。推断=未命中、多候选收不窄、'
+        '自引用形态（无条件降级）或含点链无绑定。verified 边必带 to 目标身份。')
     add('')
-    add('| 位置 | callee | caller | receiver | 置信 | 候选 |')
-    add('|---|---|---|---|---|---|')
+    add('| 位置 | callee | caller | receiver | 置信 | 候选 | 解析 |')
+    add('|---|---|---|---|---|---|---|')
     for call in facts['calls']:
-        add('| %s:%d | %s | %s | %s | %s | %d |'
+        res = call.get('resolution')
+        if res == R_UNIQUE and call.get('to'):
+            res_cell = '%s @%s:%d' % (call['to']['qualname'], call['to']['file'],
+                                      call['to']['start_line'])
+        elif res == R_AMBIGUOUS:
+            res_cell = '%d 个候选' % (call.get('candidates_total')
+                                      or call['candidates'])
+        elif res == R_UNRESOLVED:
+            res_cell = '未命中·%s' % (call.get('unresolved_reason') or 'external')
+        elif res == R_SELF_REF:
+            res_cell = '自引用'
+        else:
+            res_cell = res or '-'
+        add('| %s:%d | %s | %s | %s | %s | %d | %s |'
             % (_md_cell(call['file']), call['line'], _md_cell(call['callee']),
                _md_cell(call['caller'] or '-'), _md_cell(call['receiver'] or '-'),
-               _conf_label(call['confidence']), call['candidates']))
+               _conf_label(call['confidence'], call.get('resolved_by')),
+               call['candidates'], _md_cell(res_cell)))
     if not facts['calls']:
-        add('| （无） | - | - | - | - | 0 |')
+        add('| （无） | - | - | - | - | 0 | - |')
     add('')
 
     add('## 断点清单（Where the graph stops）')
@@ -2660,6 +3005,12 @@ def cmd_map(facts, depth, subdir, file_granular):
         notes.append('%d file(s) without a supported language are excluded from '
                      'line counts (binary/unparsed; their line count is '
                      'byte-derived, not code lines)' % unlang)
+    gen_n = sum(1 for rec in facts['files'] if rec.get('generated'))
+    if gen_n:
+        # A-P0-1：生成文件只标注不排除（J4）——在 notes 里解释噪声来源
+        notes.append('%d file(s) match generated-file signals (path convention '
+                     'or header banner); annotated in files[].generated, '
+                     'never excluded' % gen_n)
     for kind, vdir, vsyms, vshare in vendored_hints(facts)[:3]:
         if kind == 'exclude':
             notes.append('suspected vendored directory %r (%d/%d symbols, %.0f%%); '
@@ -2685,6 +3036,7 @@ def cmd_callers(facts, index, name, exact, limit):
         rows.append({'symbol': call['callee'], 'file': call['file'],
                      'line': call['line'], 'caller': call.get('caller') or '',
                      'confidence': call['confidence'],
+                     'resolved_by': call.get('resolved_by'),
                      'ambiguous': bool(call.get('ambiguous'))})
         if limit and len(rows) >= limit:
             break
@@ -2703,7 +3055,8 @@ def cmd_callees(facts, index, name, exact, limit):
             continue
         rows.append({'symbol': call.get('caller') or '', 'file': call['file'],
                      'line': call['line'], 'callee': call['callee'],
-                     'confidence': call['confidence']})
+                     'confidence': call['confidence'],
+                     'resolved_by': call.get('resolved_by')})
         if limit and len(rows) >= limit:
             break
     return bool(rows), len(hits), name, rows, []
@@ -2881,13 +3234,15 @@ def render_query_md(shell):
         for r in res:
             add('- %s  %s:%d  (%s)  called by %s%s'
                 % (_md_cell(r['symbol']), _md_cell(r['file']), r['line'],
-                   _conf_label(r['confidence']), _md_cell(r['caller'] or '(module)'),
+                   _conf_label(r['confidence'], r.get('resolved_by')),
+                   _md_cell(r['caller'] or '(module)'),
                    '  [ambiguous]' if r['ambiguous'] else ''))
     elif cmd == 'callees':
         for r in res:
             add('- %s  %s:%d  (%s)  calls %s'
                 % (_md_cell(r['symbol']), _md_cell(r['file']), r['line'],
-                   _conf_label(r['confidence']), _md_cell(r['callee'])))
+                   _conf_label(r['confidence'], r.get('resolved_by')),
+                   _md_cell(r['callee'])))
     elif cmd == 'impact':
         for lvl in res['levels']:
             if 'confidences' in lvl:
@@ -2923,7 +3278,7 @@ def render_query_md(shell):
         for c in res['calls']:
             add('- call  %s  %s:%d  (%s)'
                 % (_md_cell(c['callee']), _md_cell(c['file']), c['line'],
-                   _conf_label(c['confidence'])))
+                   _conf_label(c['confidence'], c.get('resolved_by'))))
     for note in shell['notes']:
         add('[NOTE] %s' % note)
     return '\n'.join(out)
@@ -3635,7 +3990,103 @@ class Ffi:
 
     def recurse_like(self, seq):
         return self.recurse_like(seq)
+
+class Base:
+    def __init__(self):
+        pass
+
+class Derived(Base):
+    def __init__(self):
+        super().__init__()
 '''
+
+# B0-A 变异体②：同一尾名在另一文件再定义一次 → win_rate 候选数升为 2
+FIXTURE_FFI2 = '''\
+def win_rate(seq):
+    return seq
+'''
+
+# B-P0-3：含点属性链 + 链根本文件绑定（import 本地名）→ 实锤(绑定)
+FIXTURE_NATIVE = '''\
+def nat_target(x):
+    return x
+'''
+
+FIXTURE_BINDER = '''\
+import native
+
+class B:
+    def go(self, x):
+        return native.bridge.nat_target(x)
+'''
+
+# B-P0-3 负向变异体：链根无任何本文件绑定 → 含点链不判 verified
+FIXTURE_ORPHAN = '''\
+class O:
+    def go2(self, x):
+        return ghost.bridge.nat_target(x)
+'''
+
+# B-P0-4 收窄正例：多候选但同文件唯一 → 保持 verified(名)
+FIXTURE_AMB1 = '''\
+def twin():
+    return 1
+
+def call_local():
+    return twin()
+'''
+
+FIXTURE_AMB2 = '''\
+def twin():
+    return 2
+'''
+
+# B-P0-4 负例：多候选且同文件/import/限定名都收不窄 → inferred + 候选列表
+FIXTURE_AMB_CALL = '''\
+def caller_twin():
+    return twin()
+'''
+
+# B-P0-2 限定名标签：receiver+callee 组成完整限定名精确命中
+FIXTURE_QUALCALL = '''\
+def qualify():
+    return Cart.add(3)
+'''
+
+# A-P0-2 not_extracted_here：嵌套函数是声明形名字但不进符号表（JS 引擎跳过嵌套）
+FIXTURE_JS_NESTED = '''\
+function outerFn() {
+  function innerFn() {
+    return 1;
+  }
+  return innerFn();
+}
+'''
+
+# A-P0-1：路径信号（_pb2.py 命名约定）
+FIXTURE_PB2 = 'X = 1\n'
+
+# A-P0-1：内容信号（banner 落在第 1 行的注释上）
+FIXTURE_GEN_BANNER = '''\
+# Generated by the fixture generator tool.
+# Do not edit.
+
+def real_fn(x):
+    return x
+'''
+
+# A-P0-1 负向变异体：banner 在 60 行窗口之外（按行数计）
+FIXTURE_GEN_LATE = ('# late: banner beyond the 60-line window must not count\n'
+                    'X = 1\n'
+                    + ''.join('# pad line %d\n' % i for i in range(2, 62))
+                    + '# Generated by the late tool. Do not edit.\n')
+
+# A-P0-1 负向变异体：banner 在 8192 字符窗口之外（按字符计，行数不超限）
+FIXTURE_GEN_WIDE = ('# ' + 'x' * 9000 + '\n'
+                    '# Generated by the wide tool. Do not edit.\n')
+
+# A-P0-1 负向变异体：同样的词出现在代码行（字符串字面量）不算 banner
+FIXTURE_GEN_CODELINE = "msg = 'Generated by the build. Do not edit.'\n"
 
 # P1-b：模板/限定返回类型、const / noexcept 限定成员、访问标号、pybind 模块出口
 FIXTURE_CPP_FORMS = '''\
@@ -3743,6 +4194,20 @@ def _materialize_fixture(root):
         'langs/box.hpp': FIXTURE_CPP_CTOR,
         'third_party/lib.py': FIXTURE_THIRD_PARTY,
         'src/ffi.py': FIXTURE_FFI,
+        'src/ffi2.py': FIXTURE_FFI2,
+        'src/native.py': FIXTURE_NATIVE,
+        'src/binder.py': FIXTURE_BINDER,
+        'src/orphan.py': FIXTURE_ORPHAN,
+        'src/amb1.py': FIXTURE_AMB1,
+        'src/amb2.py': FIXTURE_AMB2,
+        'src/amb_call.py': FIXTURE_AMB_CALL,
+        'src/qualcall.py': FIXTURE_QUALCALL,
+        'langs/nested.js': FIXTURE_JS_NESTED,
+        'langs/legacy_pb2.py': FIXTURE_PB2,
+        'src/gen_banner.py': FIXTURE_GEN_BANNER,
+        'src/gen_late.py': FIXTURE_GEN_LATE,
+        'src/gen_wide.py': FIXTURE_GEN_WIDE,
+        'src/gen_codeline.py': FIXTURE_GEN_CODELINE,
         'langs/skip.vue': FIXTURE_VUE,
         'langs/skip.erl': FIXTURE_ERL,
         'apps/pkg/package.json': FIXTURE_PKG_JSON,
@@ -3866,14 +4331,15 @@ def run_selftest():
                       'F5 extension map has no duplicate extension')
 
         # --- F2 / J1 / J3 序列化契约 ---
-        top_keys = ('schema_version', 'tool', 'root_name', 'languages', 'counts',
-                    'files', 'symbols', 'imports', 'calls', 'entry_points', 'warnings')
+        top_keys = ('schema_version', 'tool', 'engine_version', 'root_name',
+                    'languages', 'counts', 'files', 'symbols', 'imports',
+                    'calls', 'entry_points', 'warnings')
         checker.check(set(facts) == set(top_keys),
-                      'J1 top-level keys are exactly the frozen 11')
+                      'J1 top-level keys are exactly the frozen 12')
         checker.check(set(facts['counts']) == set(COUNT_KEYS),
                       'J1 counts keys are exactly the frozen 11')
         checker.check(facts['schema_version'] == SCHEMA_VERSION,
-                      'F2 schema_version == 2')
+                      'F2 schema_version == 3')
         seen_conf = set([x['confidence'] for x in facts['calls']]
                         + [x['confidence'] for x in facts['imports']]
                         + [x['confidence'] for x in facts['entry_points']])
@@ -3972,13 +4438,20 @@ def run_selftest():
                       'AC-23 undefined callee -> inferred (never verified)')
         call = _find_call(facts, core, 20, 'add')
         checker.check(call is not None and call['receiver'] == 'self'
-                      and call['confidence'] == 'verified',
+                      and call['confidence'] == 'verified'
+                      and call['resolved_by'] == RB_NAME,
                       'F6.5 receiver captured for attribute call (self.add)')
         call = _find_call(facts, core, 27, 'run')
-        checker.check(call is not None and call['candidates'] >= 2
+        checker.check(call is not None and call['candidates'] == 3
                       and call['ambiguous'] is True
-                      and call['confidence'] == 'verified',
-                      'F6.5 same tail-name candidates -> ambiguous verified')
+                      and call['confidence'] == 'inferred'
+                      and call['resolution'] == R_AMBIGUOUS
+                      and call['to'] is None
+                      and call['candidates_total'] == 3
+                      and len(call['to_candidates'])
+                      == min(3, TO_CANDIDATE_LIMIT),
+                      'B-P0-4 multi-candidate that cannot narrow -> inferred '
+                      '(rejection is unresolved, never verified-then-filtered)')
         checker.check(all(c['callee'] != 'print' for c in facts['calls'])
                       and facts['counts']['filtered_calls'] >= 3,
                       'F6.5 builtins filtered from calls but counted')
@@ -4493,19 +4966,39 @@ def run_selftest():
         checker.check(ffi_self is not None
                       and ffi_self['confidence'] == CONF_INFERRED
                       and ffi_self.get('self_ref') is True
-                      and ffi_self['receiver'] == 'native.mscore',
-                      'P0-1 dotted-receiver self-name call -> inferred + '
-                      'self_ref (got %r)' % (ffi_self,))
+                      and ffi_self['receiver'] == 'native.mscore'
+                      and ffi_self['resolution'] == R_SELF_REF
+                      and ffi_self['candidates'] == 2
+                      and ffi_self['to'] is None
+                      and len(ffi_self['to_candidates']) == 2,
+                      'P0-1/B0-A mutant: dotted-receiver multi-candidate '
+                      'self-name call -> inferred + self_ref (got %r)'
+                      % (ffi_self,))
         ffi_other = _find_call(facts, 'src/ffi.py', 6, 'other')
         checker.check(ffi_other is not None and not ffi_other.get('self_ref')
-                      and ffi_other['confidence'] == CONF_INFERRED,
+                      and ffi_other['confidence'] == CONF_INFERRED
+                      and ffi_other['resolution'] == R_UNRESOLVED
+                      and ffi_other['unresolved_reason'] == U_EXTERNAL,
                       'P0-1 control: a non-self FFI call carries no self_ref')
         ffi_selfcall = _find_call(facts, 'src/ffi.py', 9, 'recurse_like')
         checker.check(ffi_selfcall is not None
                       and ffi_selfcall.get('self_ref') is True
-                      and ffi_selfcall['confidence'] == CONF_VERIFIED,
-                      'P0-1 control: same-name call with a non-dotted receiver '
-                      'stays verified')
+                      and ffi_selfcall['confidence'] == CONF_INFERRED
+                      and ffi_selfcall['resolution'] == R_SELF_REF
+                      and ffi_selfcall['to'] is not None
+                      and ffi_selfcall['to']['qualname'] == 'Ffi.recurse_like',
+                      'B0-A: same-name call (non-dotted receiver) downgraded '
+                      'unconditionally; to keeps the unique same-name symbol')
+        ffi_super = _find_call(facts, 'src/ffi.py', 17, '__init__')
+        checker.check(ffi_super is not None
+                      and ffi_super.get('self_ref') is True
+                      and ffi_super['confidence'] == CONF_INFERRED
+                      and ffi_super['receiver'] is None
+                      and ffi_super['candidates'] == 2
+                      and ffi_super['resolution'] == R_SELF_REF
+                      and len(ffi_super['to_candidates']) == 2,
+                      'B0-A mutant (G3 form): super().__init__ receiver=null '
+                      'self-loop with candidates>=2 downgraded')
         checker.check('self_ref' in HONESTY_BLOCK and 'FFI' in HONESTY_BLOCK,
                       'P0-1 honesty block documents the FFI boundary / self_ref')
         # P1-b：模板/限定返回类型、const / noexcept 成员、pybind 模块出口；
@@ -4534,9 +5027,13 @@ def run_selftest():
                                      'end') is not None,
                       'P1-c control: calls inside the previously swallowed '
                       'multi-line call stay listed')
-        # P1-d / A3-3：标签暴露口径 + 调用边 extractor 归属
-        checker.check(_conf_label(CONF_VERIFIED) == '实锤·名',
-                      'P1-d verified label exposes the tail-name criterion')
+        # P1-d(B-P0-2) / A3-3：标签与证据来源绑定 + 调用边 extractor 归属
+        checker.check(_conf_label(CONF_VERIFIED, RB_NAME) == '实锤(名)'
+                      and _conf_label(CONF_VERIFIED, RB_BINDING) == '实锤(绑定)'
+                      and _conf_label(CONF_VERIFIED, RB_QUALIFIED) == '实锤(限定)'
+                      and _conf_label(CONF_VERIFIED) == '实锤'
+                      and _conf_label(CONF_INFERRED) == '推断',
+                      'B-P0-2 labels bind confidence to resolved_by evidence')
         hpp_calls = [c for c in facts['calls'] if c['file'].endswith('.hpp')]
         checker.check(bool(hpp_calls)
                       and all(c['extractor'] == 'brace' for c in hpp_calls)
@@ -4549,6 +5046,192 @@ def run_selftest():
                       'P1-a/P2-c vendored hint detects a third-party-named dir')
         checker.check(vendored_hints({'symbols': []}) == [],
                       'P1-a/P2-c vendored hint is empty when there are no symbols')
+
+        # ---- v3 批次探针（facts schema v3 + 消解诚实性）----
+        # ① A-P0-1 生成文件双信号：路径 / banner / 三条负向变异体
+        gen_path = [r for r in facts['files']
+                    if r['path'] == 'langs/legacy_pb2.py']
+        checker.check(len(gen_path) == 1 and gen_path[0]['generated'] is True,
+                      'A-P0-1 path signal: *_pb2.py convention flagged generated')
+        gen_banner = [r for r in facts['files']
+                      if r['path'] == 'src/gen_banner.py']
+        checker.check(len(gen_banner) == 1 and gen_banner[0]['generated'] is True,
+                      'A-P0-1 banner signal: comment-line banner flagged generated')
+        for neg_path in ('src/gen_late.py', 'src/gen_wide.py',
+                         'src/gen_codeline.py', 'src/core.py'):
+            neg_rec = [r for r in facts['files'] if r['path'] == neg_path]
+            checker.check(len(neg_rec) == 1
+                          and neg_rec[0]['generated'] is False,
+                          'A-P0-1 negative: %s stays not-generated' % neg_path)
+        with open(os.path.abspath(__file__), 'r', encoding='utf-8') as _sf:
+            self_src = _sf.read()
+        checker.check(has_generated_header(self_src) is False
+                      and detect_generated('analyze_structure.py',
+                                           self_src) is False,
+                      'A-P0-1 self-classification guard: the tool never flags '
+                      'its own source as generated')
+        checker.check(has_generated_header('') is False
+                      and detect_generated('x.py', None) is False,
+                      'A-P0-1 empty/unread input degrades to not-generated')
+        checker.check(detect_generated('pkg/model_pb2.py') is True
+                      and detect_generated('pkg/model.py') is False,
+                      'A-P0-1 path-only signal works without content')
+
+        # ② A-P0-2 边身份：to 三元组 / unresolved_reason
+        call = _find_call(facts, core, 17, 'util_fn')
+        checker.check(call is not None and call['to'] ==
+                      {'file': 'src/helper.py', 'qualname': 'util_fn',
+                       'start_line': 1}
+                      and call['resolution'] == R_UNIQUE
+                      and call['resolved_by'] == RB_NAME
+                      and call['to_candidates'] is None
+                      and call['candidates_total'] is None,
+                      'A-P0-2 unique tail-name edge carries the to identity')
+        call = _find_call(facts, core, 24, 'undefined_helper')
+        checker.check(call is not None and call['to'] is None
+                      and call['resolution'] == R_UNRESOLVED
+                      and call['unresolved_reason'] == U_EXTERNAL,
+                      'A-P0-2 unresolved edge carries reason=external (ast '
+                      'extraction never misses declarations)')
+        call = _find_call(facts, 'langs/nested.js', 5, 'innerFn')
+        checker.check(call is not None and call['resolution'] == R_UNRESOLVED
+                      and call['unresolved_reason'] == U_NOT_EXTRACTED,
+                      'A-P0-2 not_extracted_here: decl-shaped name missing '
+                      'from the symbol table (nested JS function)')
+        checker.check(U_BUILTIN in UNRESOLVED_REASONS
+                      and all(c.get('unresolved_reason') != U_BUILTIN
+                              for c in facts['calls']),
+                      'A-P0-2 builtin_filtered stays a reserved reason (edges '
+                      'are pre-filtered before entering calls)')
+
+        # ③ B-P0-4 拒绝即未解析：收窄成功 vs 收不窄（正例+负例成对）
+        call = _find_call(facts, 'src/amb_call.py', 2, 'twin')
+        checker.check(call is not None and call['confidence'] == CONF_INFERRED
+                      and call['resolution'] == R_AMBIGUOUS
+                      and call['to'] is None
+                      and call['to_candidates'] is not None
+                      and len(call['to_candidates']) == 2
+                      and call['candidates_total'] == 2,
+                      'B-P0-4 un-narrowable multi-candidate -> inferred + '
+                      'candidate list (never verified-then-filtered)')
+        checker.check(all(set(c) == {'file', 'qualname', 'start_line'}
+                          for c in call['to_candidates']),
+                      'A-P0-2 candidate entries are identity triples')
+        call = _find_call(facts, 'src/amb1.py', 5, 'twin')
+        checker.check(call is not None and call['confidence'] == CONF_VERIFIED
+                      and call['resolved_by'] == RB_NAME
+                      and call['to'] == {'file': 'src/amb1.py',
+                                         'qualname': 'twin',
+                                         'start_line': 1},
+                      'B-P0-4 control: same-file narrowing keeps the edge '
+                      'verified(名) with a to identity')
+
+        # ④ B-P0-3 含点链：绑定正例 / 无绑定负例 / 限定名标签
+        call = _find_call(facts, 'src/binder.py', 5, 'nat_target')
+        checker.check(call is not None and call['confidence'] == CONF_VERIFIED
+                      and call['resolved_by'] == RB_BINDING
+                      and call['resolution'] == R_UNIQUE
+                      and call['to'] == {'file': 'src/native.py',
+                                         'qualname': 'nat_target',
+                                         'start_line': 1},
+                      'B-P0-3 dotted chain with bound root -> verified(绑定)')
+        call = _find_call(facts, 'src/orphan.py', 3, 'nat_target')
+        checker.check(call is not None and call['confidence'] == CONF_INFERRED
+                      and call['resolved_by'] is None
+                      and call['to'] is not None
+                      and call['resolution'] == R_UNIQUE,
+                      'B-P0-3 negative: unbound dotted chain is never verified')
+        call = _find_call(facts, 'src/qualcall.py', 2, 'add')
+        checker.check(call is not None and call['confidence'] == CONF_VERIFIED
+                      and call['resolved_by'] == RB_QUALIFIED
+                      and call['to'] is not None
+                      and call['to']['qualname'] == 'Cart.add',
+                      'B-P0-2 qualified label: receiver+callee exact qualname hit')
+
+        # ⑤ v3 不变式 + 注入必红变异体
+        def _v3_ok(edges):
+            return (
+                all(e['confidence'] != CONF_VERIFIED
+                    or (e.get('resolved_by') in RESOLVED_BY
+                        and e['to'] is not None)
+                    for e in edges)
+                and all(e['confidence'] == CONF_INFERRED
+                        for e in edges if e.get('self_ref'))
+                and all(e['confidence'] == CONF_INFERRED and e['to'] is None
+                        for e in edges if e['resolution'] == R_UNRESOLVED)
+                and all(e['confidence'] == CONF_INFERRED and e['to'] is None
+                        and e['to_candidates'] is not None
+                        for e in edges if e['resolution'] == R_AMBIGUOUS)
+                and all(e['to'] is not None
+                        for e in edges if e['resolution'] == R_UNIQUE))
+        checker.check(_v3_ok(facts['calls']),
+                      'v3 invariants: verified <=> resolved_by+to; self_ref / '
+                      'unresolved / ambiguous edges are never verified')
+        m_flip = json.loads(dumps_facts(facts))
+        next(e for e in m_flip['calls'] if e.get('self_ref'))['confidence'] = \
+            CONF_VERIFIED
+        checker.check(not _v3_ok(m_flip['calls']),
+                      'v3 mutant: flipping a self_ref edge to verified turns '
+                      'the invariant red')
+        m_nob = json.loads(dumps_facts(facts))
+        next(e for e in m_nob['calls']
+             if e['confidence'] == CONF_VERIFIED)['resolved_by'] = None
+        checker.check(not _v3_ok(m_nob['calls']),
+                      'v3 mutant: verified edge without resolved_by turns red')
+        m_unres = json.loads(dumps_facts(facts))
+        next(e for e in m_unres['calls']
+             if e['resolution'] == R_UNRESOLVED)['confidence'] = CONF_VERIFIED
+        checker.check(not _v3_ok(m_unres['calls']),
+                      'v3 mutant: verifying an unresolved edge turns red')
+        m_cand = json.loads(dumps_facts(facts))
+        next(e for e in m_cand['calls']
+             if e['resolution'] == R_AMBIGUOUS)['to_candidates'] = None
+        checker.check(not _v3_ok(m_cand['calls']),
+                      'v3 mutant: ambiguous edge without candidates turns red')
+
+        # ⑥ AC-52 v3 扩展：新字段闭集机检（全量产物，多一个取值都算违约）
+        checker.check(
+            all(e.get('resolution') in RESOLUTIONS for e in facts['calls'])
+            and all(e.get('resolved_by') in (None,) + RESOLVED_BY
+                    for e in facts['calls'])
+            and all(e.get('unresolved_reason') in (None,) + UNRESOLVED_REASONS
+                    for e in facts['calls'])
+            and all(r['generated'] in (True, False) for r in facts['files']),
+            'AC-52 v3: resolution/resolved_by/unresolved_reason/generated '
+            'stay inside the frozen sets')
+
+        # ⑦ A-P1-6 engine_version
+        checker.check(isinstance(facts['engine_version'], int)
+                      and facts['engine_version'] == ENGINE_VERSION,
+                      'A-P1-6 engine_version is a top-level integer constant')
+        checker.check('engine_version' in render_md(facts),
+                      'A-P1-6 MD header carries engine_version')
+
+        # ⑧ B-P2-3 同名候选上限：501 同名 → 整条放弃 + filtered 计数 + 按名告警
+        cap_dir = _probe_dir(probe_base, 'namecap-probe', probe_dirs)
+        with open(os.path.join(cap_dir, 'cap.js'), 'w', encoding='utf-8') as ch:
+            for i in range(501):
+                ch.write('function capme() { return %d; }\n' % i)
+            ch.write('const cap_out = capme();\n')
+        cap_cpu0 = os.times()[0] + os.times()[1]
+        cap_facts = build_facts(cap_dir)
+        cap_cpu = (os.times()[0] + os.times()[1]) - cap_cpu0
+        checker.check(all(c['callee'] != 'capme'
+                          for c in cap_facts['calls']),
+                      'B-P2-3 cap: 501 same-name symbols -> the call edge is '
+                      'dropped (never guessed)')
+        checker.check(cap_facts['counts']['filtered_calls'] == 1,
+                      'B-P2-3 cap: the dropped edge is counted in '
+                      'filtered_calls')
+        cap_warns = [w for w in cap_facts['warnings']
+                     if w['kind'] == 'name-cap-exceeded']
+        checker.check(len(cap_warns) == 1
+                      and 'capme' in cap_warns[0]['message'],
+                      'B-P2-3 cap: exactly one name-cap-exceeded warning '
+                      'naming the tail name')
+        checker.check(cap_cpu < 5.0,
+                      'B-P2-3 cap probe stays linear (%.2fs CPU < 5s)'
+                      % cap_cpu)
 
         # AC-25：入口点八类各 ≥1（F-a：多 manifest 各自产条目，evidence 带相对路径）
         entry_kinds = set(e['kind'] for e in facts['entry_points'])

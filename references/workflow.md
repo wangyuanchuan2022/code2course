@@ -121,6 +121,11 @@
 - 沿调用链追到数据落点（数据库 / 文件 / API 响应），记录途经的每个文件与函数
 - **调用边溯源（边诚实性）**：每条跨文件调用边落到「文件 + 行号」出处；凭命名相似/导入关系推测、未在源码里核实调用点的边，一律标注"推断"——后续讲解与可视化里同样区分（实锤边正常陈述，推断边注明"推断"），禁止把推断画成事实
 - **跨 FFI 边界一律按"运行期绑定"处理**：Python↔C++（pybind11）、ctypes、Cython、JNI 等边界的调用**静态不可见**——结构事实里的「实锤」可能只是"和本语言同名符号撞了名"。凡调用点上出现 `模块.子模块.函数(...)` 形态（如 `native.mscore.win_rate(...)`）而调用者与 callee 同名时，一律按推断处理并**回源码人工核对**；把这类边画进调用图会产出契约禁止的自环（工具已用 `self_ref: true` 标出，见 §3 可选辅助与 interactive-elements.md §14d）
+- **边诚实性引用依据（摘录 CodeGraph 源码原文，github.com/colbymchenry/codegraph，MIT License，2026-09 快照；见 `src/resolution/name-matcher.ts` 与 `src/graph/dynamic-boundary-report.ts`）**：
+  1. "No fuzzy fallback, no qualified-name walking — a wrong callback edge is worse than none."（function_ref 消解的唯一或放弃纪律）
+  2. "Reachability may reject a unique guess; it must never manufacture one."（可见性/可达性可以否决唯一候选，但绝不许反向制造一个）
+  3. "silence beats a wrong edge"（完全连通的流程根本不会产出错误边——没有边好过有错边）
+  三句同一条价值观：**宁缺毋错**。落到本技能：调用边收不窄就标"推断"、断点如实讲"断在哪里"，讲解与可视化里禁止为闭环硬造源码里不存在的边；工具侧的 `resolution`/`resolved_by`/`to_candidates`/`self_ref` 字段就是这三句话的机器可读形态。
 - **半流程禁令**：一条流程链开讲就要闭环——从触发讲到数据落点；静态分析追不到的环节（动态分派、回调注册、事件总线）如实讲"断在哪里、为什么断、另一侧可能是什么"，禁止只演前半段让读者脑补，也禁止为闭环硬编源码里不存在的边
 - 识别异步环节：哪里排队、哪里重试、哪里会被丢弃；组件之间谁向谁发了什么消息
 - 若流程由外部事件驱动（Webhook、用户操作、定时器），把触发 → 处理 → 反馈的完整时序列出来 → 这是探照灯（跨文件走读）与栈塔（调用/返回推演）的剧本，也是 §10b timeline 的数据
