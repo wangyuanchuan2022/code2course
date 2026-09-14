@@ -101,6 +101,8 @@
 
 对每个流程，**从第 1 步已验证的入口**开始，按下列子阶段分析。产出不只是"途经哪些文件"，而是能支撑测验与动画的结构化事实。
 
+**可选辅助：结构事实底稿 + 项目地图查询**——本步开工前，可先跑技能根目录的 `analyze_structure.py` 拿一份结构事实底稿（`python analyze_structure.py <目标仓库路径> --outdir <工作目录>/structure-facts`），产出 `structure-facts.json`（机器可读）与人读的 `structure-facts.md`（五件套：文件清单 / 符号表 / import 边 / 调用边 / 入口点 / 断点清单；支持 Python 及 C/C++/Java/C#/Go/Rust/PHP/Ruby/Kotlin/Swift/Scala/Dart/Lua/JS/TS）。拿到底稿后可以直接对它提问，不必手工翻文件：`map`（模块依赖地图）、`callers` / `callees <符号>`（谁调它 / 它调谁）、`impact <符号>`（影响半径）、`path <a> <b>`（调用路径）、`entry`（入口点）、`search <关键词>`。底稿里的边已按本步的边诚实性要求区分「实锤（带文件:行号）」与「推断」；`impact` 与 `path` 缺省只走实锤边。**这是可选的加速器，不是替代品——手工读码仍完全合法**；底稿与源码冲突时以源码为准（Python 走 ast 确定性提取，其余语言为表驱动启发式，已知盲区见底稿末尾的诚实性声明）。
+
 ### 3a. 事件链与时序
 
 - 沿调用链追到数据落点（数据库 / 文件 / API 响应），记录途经的每个文件与函数
