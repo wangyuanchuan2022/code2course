@@ -67,6 +67,15 @@ analyze_structure.py — code2course 结构事实底稿生成器（零依赖，P
     才纳且逐跳 / 逐层标注 confidence；map / callers / callees 属「列出事实」，两类都返回并
     分列计数；无结果 = found:false + exit 0；path 多解按邻居排序键 (file, line, callee)
     字典序取首个（确定性最短路径）。
+  * 查询层输出契约 v2.1（C-P0-2/P1-1/P1-2/P1-6/P1-7，机检门先行批次）：① 表头数字 =
+    最终保留条目数（callers/callees 新增 listed: 表头、impact 新增 radius: 表头）；
+    --limit 截断时在触发列表旁就地写「已截断：显示 X / 共 Y（--limit 可放宽）」，
+    同一条文本进 notes（截断/降级唯一结构化通道，自带下一步动作）；--format json 外壳
+    加 truncated/total/limit 三字段（total=截断前真实总数）。② 「无结果不是错误」
+    收敛在 classify_query_outcome 单点（md/json 两出口共调）。③ 列表全序单点
+    _list_sort_key（语义主键→file→line→符号名字典序）、去重键单点 _call_site_key
+    （tuple，禁字符串拼接键）。④ emit_human/emit_json 双通道：--format json 时
+    stdout 只写一个 JSON 文档（json.loads 全量一次成功），人类文本（含 [FAIL]）走 stderr。
 
 退出码：0 成功产出（可含 warning）/ 1 产出不完整或内部错误 / 2 用法错误或路径不可读。
 
@@ -2937,6 +2946,93 @@ def _resolved_note(index, name, exact):
                first['start_line']))
 
 
+# ------------------------------------------------ B3 查询层输出契约（C-P0-2/P1-1/P1-2/P1-6/P1-7）
+# 门禁先于实现（J7）：本节常量与函数是 spec F8/F9（v2.1 增补）的机器侧形态——
+# 表头计数不变量、列表三级全序、去重键单点、截断就地报告、双通道分流。
+
+# 带 --limit 的列表型子命令（截断探测只发生在它们身上；其余子命令无输出上限）
+LIMIT_CMDS = ('callers', 'callees', 'search')
+# C-P1-6：截断标记固定尾缀 = note 文本自带的「下一步动作」（用什么参数放宽）
+TRUNC_SUFFIX = '（--limit 可放宽）'
+
+
+def _list_sort_key(primary, file_path, line, tail_name):
+    """C-P1-2 列表全序单点：语义主键 → file → line，末级以符号名字典序收底。
+
+    callers 主键 = caller（谁调它）、callees/search-call 主键 = callee；
+    impact 层内条目只有符号名（无 file:line），直接按末级（名字典序）排序。
+    所有列表型输出共用本键，禁止各处自定义偏序。
+    """
+    return (primary, file_path, line, tail_name)
+
+
+def _call_site_key(call):
+    """C-P1-2 去重键单点（与 AC-27 facts 口径一致）：调用点身份 = (file, line, callee)。
+
+    tuple 定义一次、处处引用；禁止 '>' / '|' 之类字符串拼接键
+    （C-P2-5 反例：无定界拼接存在歧义包含，'a.b>c' 与 'a>b.c' 同形）。
+    """
+    return (call['file'], call['line'], call['callee'])
+
+
+def _cap_note(prefix, shown, total):
+    """C-P0-2/C-P1-6：截断标记——就地行与 notes[] 共用这同一条文本。
+
+    notes 数组是截断/降级信息的唯一结构化通道；文本自带下一步动作
+    （TRUNC_SUFFIX 指明用 --limit 放宽），禁止末尾一句通用「输出已截断」。
+    """
+    return '%s已截断：显示 %d / 共 %d%s' % (prefix, shown, total, TRUNC_SUFFIX)
+
+
+def _is_trunc_note(note):
+    """识别截断类 note（md 渲染据它做就地摆放，而不是末尾通用一句）。"""
+    return note.endswith(TRUNC_SUFFIX)
+
+
+Q_SHAPE_RESULT = 'result'
+Q_SHAPE_NO_MATCH = 'no-match'
+
+
+def classify_query_outcome(found):
+    """C-P1-1：查询出口形状单点判定——「无结果不是错误」（F8 语义裁定 2）
+    收敛在这一处；emit_human 与 emit_json 两个出口共调本函数，禁止各自
+    内联 found→(形状, 退出码) 的映射（CodeGraph 两处 catch 各写一遍、
+    worker 路径形状漂移的反面对照）。
+
+      found=True  → ('result', 0)     正文 / JSON 外壳照常输出
+      found=False → ('no-match', 0)   SUCCESS 形状：exit 0 + [OK] no matches（md）
+                                      / found:false 外壳（json）——绝不译成错误
+
+    exit 1/2（facts 读不到 / 用法错误）不经过本函数：它们在 _query_fail
+    单点出口短路；同样禁止「失败→成功形状」的翻译（schema 不匹配必须响亮）。
+    """
+    return (Q_SHAPE_RESULT if found else Q_SHAPE_NO_MATCH), 0
+
+
+def emit_human(lines, fmt):
+    """C-P1-7 人类通道：md 形态走 stdout（既有人类契约不变）；--format json
+    时整体让路到 stderr——json 模式的 stdout 只允许出现 JSON 文档，
+    用结构而不是纪律保证分流（人类文本没有第二条路能漏进 stdout）。"""
+    stream = sys.stderr if fmt == 'json' else sys.stdout
+    for ln in lines:
+        print(ln, file=stream)
+
+
+def _query_fail(message, code, fmt=None):
+    """C-P1-1/C-P1-7：exit 1/2 失败单点出口。人类文本默认 stdout（md 既有
+    契约）；fmt=='json' 时走 stderr（stdout 纯净性）；返回码原样透传。"""
+    emit_human(['[FAIL] %s' % message], fmt)
+    return code
+
+
+def emit_json(shell):
+    """C-P1-7 机器通道：stdout 只写这一个 JSON 文档——json.loads 全量一次
+    成功（机检口径）；notes 等结构化信息都在外壳里，不走人类通道。"""
+    sys.stdout.write(json.dumps(shell, ensure_ascii=False, sort_keys=True,
+                                indent=2))
+    sys.stdout.write('\n')
+
+
 def cmd_map(facts, depth, subdir, file_granular):
     """项目地图（AC-43）：目录/文件级节点 + 跨节点 import 边聚合。
 
@@ -3020,46 +3116,71 @@ def cmd_map(facts, depth, subdir, file_granular):
             notes.append('top-level directory %r holds %d/%d symbols (%.0f%%); '
                          'check whether it is vendored or project code'
                          % (vdir, vsyms, len(facts['symbols']), vshare))
-    return bool(node_list), 0, None, {'nodes': node_list, 'edges': edge_list}, notes
+    return bool(node_list), 0, None, {'nodes': node_list, 'edges': edge_list}, \
+        notes, len(node_list) + len(edge_list)
 
 
 def cmd_callers(facts, index, name, exact, limit):
-    """谁调用它（列出事实，D-41）：verified/inferred 都返回，逐条带 confidence。"""
+    """谁调用它（列出事实，D-41）：verified/inferred 都返回，逐条带 confidence。
+
+    C-P0-2：先取全量再截断——total=截断前真实命中数，kept=最终保留条目
+    （表头数字只许用 kept）；截断时 notes 写「已截断：显示 X / 共 Y」。
+    C-P1-2：行按 _list_sort_key 三级全序；行身份去重键 _call_site_key 单点。
+    """
     hits = resolve_symbols(index, name, exact)
     if not hits:
-        return False, 0, name, [], ['no symbol matches: %s' % name]
+        return False, 0, name, [], ['no symbol matches: %s' % name], 0
     wanted = set(_lastseg(s['qualname']) for s in hits)
     rows = []
+    seen = set()
     for call in facts['calls']:                # 已按 (file, line, callee) 稳定排序
         if call['callee'] not in wanted:
             continue
+        key = _call_site_key(call)
+        if key in seen:                        # 同一调用点只列一行（C-P1-2）
+            continue
+        seen.add(key)
         rows.append({'symbol': call['callee'], 'file': call['file'],
                      'line': call['line'], 'caller': call.get('caller') or '',
                      'confidence': call['confidence'],
                      'resolved_by': call.get('resolved_by'),
                      'ambiguous': bool(call.get('ambiguous'))})
-        if limit and len(rows) >= limit:
-            break
-    return bool(rows), len(hits), name, rows, []
+    rows.sort(key=lambda r: _list_sort_key(r['caller'], r['file'], r['line'],
+                                           r['symbol']))
+    total = len(rows)
+    kept = rows[:limit] if limit else rows
+    notes = [_cap_note('', len(kept), total)] if total > len(kept) else []
+    return bool(kept), len(hits), name, kept, notes, total
 
 
 def cmd_callees(facts, index, name, exact, limit):
-    """它调用谁（列出事实，D-41）：与 callers 互为逆关系（同一事实的两个方向）。"""
+    """它调用谁（列出事实，D-41）：与 callers 互为逆关系（同一事实的两个方向）。
+
+    C-P0-2/C-P1-2 口径与 cmd_callers 相同（全量→截断→三级全序→tuple 去重键）。
+    """
     hits = resolve_symbols(index, name, exact)
     if not hits:
-        return False, 0, name, [], ['no symbol matches: %s' % name]
+        return False, 0, name, [], ['no symbol matches: %s' % name], 0
     wanted = set(s['qualname'] for s in hits)
     rows = []
+    seen = set()
     for call in facts['calls']:
         if call.get('caller') not in wanted:
             continue
+        key = _call_site_key(call)
+        if key in seen:
+            continue
+        seen.add(key)
         rows.append({'symbol': call.get('caller') or '', 'file': call['file'],
                      'line': call['line'], 'callee': call['callee'],
                      'confidence': call['confidence'],
                      'resolved_by': call.get('resolved_by')})
-        if limit and len(rows) >= limit:
-            break
-    return bool(rows), len(hits), name, rows, []
+    rows.sort(key=lambda r: _list_sort_key(r['callee'], r['file'], r['line'],
+                                           r['symbol']))
+    total = len(rows)
+    kept = rows[:limit] if limit else rows
+    notes = [_cap_note('', len(kept), total)] if total > len(kept) else []
+    return bool(kept), len(hits), name, kept, notes, total
 
 
 def cmd_impact(facts, index, name, exact, depth, include_inferred):
@@ -3102,7 +3223,8 @@ def cmd_impact(facts, index, name, exact, depth, include_inferred):
     rnote = _resolved_note(index, name, exact)
     if rnote:
         notes.insert(0, rnote)
-    return bool(levels), matched, name, {'levels': levels}, notes
+    total = sum(len(l['symbols']) for l in levels)
+    return bool(levels), matched, name, {'levels': levels}, notes, total
 
 
 def cmd_path(facts, index, a, b, exact, include_inferred):
@@ -3119,11 +3241,12 @@ def cmd_path(facts, index, a, b, exact, include_inferred):
     empty = {'from': a, 'to': b, 'hops': []}
     if not a_names or not b_names:
         missing = a if not a_names else b
-        return False, matched, a, empty, ['no symbol matches: %s' % missing]
+        return False, matched, a, empty, \
+            ['no symbol matches: %s' % missing], 0
     if a_names & b_names:
         return True, matched, a, empty, \
             ['source and target coincide (%s); zero hops'
-             % ', '.join(sorted(a_names & b_names))]
+             % ', '.join(sorted(a_names & b_names))], 0
     fwd, _rev = _call_graph(facts, include_inferred)
     parent = {}
     queue = []
@@ -3154,7 +3277,7 @@ def cmd_path(facts, index, a, b, exact, include_inferred):
             rn = _resolved_note(index, who, exact)
             if rn:
                 pnotes.append(rn)
-        return False, matched, a, empty, pnotes
+        return False, matched, a, empty, pnotes, 0
     hops = []
     node = end
     while parent[node] is not None:
@@ -3168,7 +3291,8 @@ def cmd_path(facts, index, a, b, exact, include_inferred):
         rn = _resolved_note(index, who, exact)
         if rn:
             pnotes.append(rn)
-    return True, matched, a, {'from': a, 'to': b, 'hops': hops}, pnotes
+    return True, matched, a, {'from': a, 'to': b, 'hops': hops}, pnotes, \
+        len(hops)
 
 
 def cmd_entry(facts, kind):
@@ -3179,31 +3303,45 @@ def cmd_entry(facts, kind):
     if not rows:
         notes.append('no entry points%s'
                      % ('' if kind is None else ' for kind %s' % kind))
-    return bool(rows), 0, None, rows, notes
+    return bool(rows), 0, None, rows, notes, len(rows)
 
 
 def cmd_search(facts, keyword, domain, limit):
-    """关键字检索（AC-45）：大小写不敏感，--in 三域过滤，条目全部来自 facts。"""
+    """关键字检索（AC-45）：大小写不敏感，--in 三域过滤，条目全部来自 facts。
+
+    C-P0-2：各域先取全量再截断——表头（matched 与三域计数）只报保留数，
+    截断域在触发点就地写「<域> 已截断：显示 X / 共 Y（--limit 可放宽）」，
+    同一条文本进 notes（唯一结构化通道）。
+    C-P1-2：files/calls 域按全序键排序（symbols 已按 (file, start_line)）。
+    """
     kw = keyword.lower()
-    results = {'symbols': [], 'files': [], 'calls': []}
+    full = {'symbols': [], 'files': [], 'calls': []}
     if domain in ('symbol', 'all'):
-        results['symbols'] = [dict(s) for s in facts['symbols']
-                              if kw in s['qualname'].lower()]
-        results['symbols'] = sorted(results['symbols'],
-                                    key=lambda s: (s['file'], s['start_line']))
+        full['symbols'] = sorted(
+            (dict(s) for s in facts['symbols'] if kw in s['qualname'].lower()),
+            key=lambda s: (s['file'], s['start_line']))
     if domain in ('file', 'all'):
-        results['files'] = [dict(r) for r in facts['files']
-                            if kw in r['path'].lower()]
+        full['files'] = sorted(
+            (dict(r) for r in facts['files'] if kw in r['path'].lower()),
+            key=lambda r: r['path'])
     if domain in ('call', 'all'):
-        results['calls'] = [dict(c) for c in facts['calls']
-                            if kw in c['callee'].lower()]
-    if limit:
-        for key in results:
-            results[key] = results[key][:limit]
+        full['calls'] = sorted(
+            (dict(c) for c in facts['calls'] if kw in c['callee'].lower()),
+            key=lambda c: _list_sort_key(c['callee'], c['file'], c['line'],
+                                         c['callee']))
+    results = {}
+    notes = []
+    for key in ('symbols', 'files', 'calls'):
+        rows = full[key]
+        results[key] = rows[:limit] if limit else rows
+        if limit and len(rows) > limit:        # C-P1-6：截断在触发点报告
+            notes.append(_cap_note('%s ' % key, limit, len(rows)))
     found = bool(results['symbols'] or results['files'] or results['calls'])
-    notes = [] if found else \
-        ['no matches for %r in domain %s' % (keyword, domain)]
-    return found, len(results['symbols']), keyword, results, notes
+    if not found:
+        notes = ['no matches for %r in domain %s' % (keyword, domain)]
+    total = sum(len(full[k]) for k in full)
+    matched = len(results['symbols'])          # 表头口径：保留数（不变量）
+    return found, matched, keyword, results, notes, total
 
 
 def render_query_md(shell):
@@ -3211,9 +3349,15 @@ def render_query_md(shell):
 
     行排布与 universal-ctags `-x` 交叉引用行同构（符号 + file:line + 标记），
     仅借鉴输出形态，不引任何依赖。
+
+    B3 表头计数不变量（C-P0-2）：表头数字 = 最终保留在输出里的条目数；
+    截断标记（C-P1-6）在触发它的那个列表旁就地渲染（文本取自 notes，
+    不在末尾另写一句通用「已截断」）。
     """
     cmd = shell['query']
     res = shell['results']
+    notes = shell['notes']
+    trunc = [n for n in notes if _is_trunc_note(n)]
     out = []
     add = out.append
     if cmd == 'search':
@@ -3231,19 +3375,29 @@ def render_query_md(shell):
                 % (_md_cell(e['from']), _md_cell(e['to']), e['count'],
                    e['verified'], e['inferred'], e['external']))
     elif cmd == 'callers':
+        add('listed: %d call site(s)' % len(res))
         for r in res:
             add('- %s  %s:%d  (%s)  called by %s%s'
                 % (_md_cell(r['symbol']), _md_cell(r['file']), r['line'],
                    _conf_label(r['confidence'], r.get('resolved_by')),
                    _md_cell(r['caller'] or '(module)'),
                    '  [ambiguous]' if r['ambiguous'] else ''))
+        for n in trunc:                        # C-P1-6：就地，紧跟被截的列表
+            add(n)
     elif cmd == 'callees':
+        add('listed: %d call site(s)' % len(res))
         for r in res:
             add('- %s  %s:%d  (%s)  calls %s'
                 % (_md_cell(r['symbol']), _md_cell(r['file']), r['line'],
                    _conf_label(r['confidence'], r.get('resolved_by')),
                    _md_cell(r['callee'])))
+        for n in trunc:
+            add(n)
     elif cmd == 'impact':
+        # 表头 = 最终保留条目数（本命令无输出上限，total == 保留数）
+        add('radius: %d symbol(s) in %d level(s)'
+            % (sum(len(l['symbols']) for l in res['levels']),
+               len(res['levels'])))
         for lvl in res['levels']:
             if 'confidences' in lvl:
                 names = ', '.join('%s(%s)' % (_md_cell(s),
@@ -3267,25 +3421,36 @@ def render_query_md(shell):
                 % (_md_cell(r['kind']), _md_cell(r['file']), r['line'],
                    _conf_label(r['confidence']), _md_cell(r['evidence'])))
     elif cmd == 'search':
-        for s in res['symbols']:
-            add('- symbol  %s  %s:%d  %s'
-                % (_md_cell(s['qualname']), _md_cell(s['file']),
-                   s['start_line'], _md_cell(s['kind'])))
-        for r in res['files']:
-            add('- file  %s  (%s, %s lines)'
-                % (_md_cell(r['path']), _md_cell(r['language'] or 'unknown'),
-                   r.get('lines')))
-        for c in res['calls']:
-            add('- call  %s  %s:%d  (%s)'
-                % (_md_cell(c['callee']), _md_cell(c['file']), c['line'],
-                   _conf_label(c['confidence'], c.get('resolved_by'))))
-    for note in shell['notes']:
+        for key in ('symbols', 'files', 'calls'):
+            mark = next((n for n in trunc if n.startswith('%s ' % key)), None)
+            if key == 'symbols':
+                for s in res['symbols']:
+                    add('- symbol  %s  %s:%d  %s'
+                        % (_md_cell(s['qualname']), _md_cell(s['file']),
+                           s['start_line'], _md_cell(s['kind'])))
+            elif key == 'files':
+                for r in res['files']:
+                    add('- file  %s  (%s, %s lines)'
+                        % (_md_cell(r['path']), _md_cell(r['language'] or 'unknown'),
+                           r.get('lines')))
+            else:
+                for c in res['calls']:
+                    add('- call  %s  %s:%d  (%s)'
+                        % (_md_cell(c['callee']), _md_cell(c['file']), c['line'],
+                           _conf_label(c['confidence'], c.get('resolved_by'))))
+            if mark:                           # C-P1-6：截哪个域，标在哪个域旁
+                add(mark)
+    for note in notes:
+        if _is_trunc_note(note):
+            continue                           # 已就地渲染，不再末尾重复
         add('[NOTE] %s' % note)
     return '\n'.join(out)
 
 
 def _query_usage_error(message):
-    print('[FAIL] %s' % message)
+    """用法错误（exit 2）。fmt 未解析阶段经此（人类文本走 stdout，行为不变）；
+    fmt 已知后的用法错误直接调 _query_fail(msg, 2, fmt)。"""
+    return _query_fail(message, 2)
 
 
 def run_query(argv):
@@ -3324,6 +3489,7 @@ def run_query(argv):
 
     fmt = val_opts['--format'] or 'md'
     if fmt not in ('md', 'json'):
+        # fmt 本身非法：不能按它分流，人类文本走 stdout（与旧行为一致）
         _query_usage_error('--format must be md or json: %s' % fmt)
         return 2
     depth = None
@@ -3331,47 +3497,38 @@ def run_query(argv):
         try:
             depth = int(val_opts['--depth'])
         except ValueError:
-            _query_usage_error('--depth needs an integer: %s'
-                               % val_opts['--depth'])
-            return 2
+            return _query_fail('--depth needs an integer: %s'
+                               % val_opts['--depth'], 2, fmt)
         if depth < 1:
-            _query_usage_error('--depth must be >= 1')
-            return 2
+            return _query_fail('--depth must be >= 1', 2, fmt)
     limit = 200
     if val_opts['--limit'] is not None:
         try:
             limit = int(val_opts['--limit'])
         except ValueError:
-            _query_usage_error('--limit needs an integer: %s'
-                               % val_opts['--limit'])
-            return 2
+            return _query_fail('--limit needs an integer: %s'
+                               % val_opts['--limit'], 2, fmt)
         if limit < 0:
-            _query_usage_error('--limit must be >= 0')
-            return 2
+            return _query_fail('--limit must be >= 0', 2, fmt)
     domain = val_opts['--in'] or 'all'
     if domain not in SEARCH_DOMAINS:
-        _query_usage_error('--in must be one of %s: %s'
-                           % ('|'.join(SEARCH_DOMAINS), domain))
-        return 2
+        return _query_fail('--in must be one of %s: %s'
+                           % ('|'.join(SEARCH_DOMAINS), domain), 2, fmt)
     kind = val_opts['--kind']
     if kind is not None and kind not in ENTRY_KINDS:
-        _query_usage_error('--kind must be one of the frozen entry kinds: %s'
-                           % kind)
-        return 2
+        return _query_fail('--kind must be one of the frozen entry kinds: %s'
+                           % kind, 2, fmt)
     if depth is not None and cmd not in ('map', 'impact'):
-        _query_usage_error('--depth applies to map/impact only')
-        return 2
+        return _query_fail('--depth applies to map/impact only', 2, fmt)
 
     need = {'map': 0, 'entry': 0, 'search': 1, 'callers': 1, 'callees': 1,
             'impact': 1, 'path': 2}[cmd]
     if len(pos) < need:
-        _query_usage_error('%s expects %d positional argument(s), got %d'
-                           % (cmd, need, len(pos)))
-        return 2
+        return _query_fail('%s expects %d positional argument(s), got %d'
+                           % (cmd, need, len(pos)), 2, fmt)
     if len(pos) > need:
-        _query_usage_error('%s takes at most %d positional argument(s)'
-                           % (cmd, need))
-        return 2
+        return _query_fail('%s takes at most %d positional argument(s)'
+                           % (cmd, need), 2, fmt)
     if cmd == 'map' and depth is None:
         depth = 1
     if cmd == 'impact' and depth is None:
@@ -3385,54 +3542,67 @@ def run_query(argv):
     if facts_path is None:
         facts_path = os.path.join(os.getcwd(), DEFAULT_FACTS_PATH)
         if not os.path.isfile(facts_path):
-            _query_usage_error(
+            return _query_fail(
                 'no facts at default path (run analyze first or pass --facts):'
-                ' %s' % facts_path)
-            return 2
+                ' %s' % facts_path, 2, fmt)
     facts, err = load_facts(facts_path)
     if err is not None:
-        print('[FAIL] %s' % err)
-        return 1
+        return _query_fail(err, 1, fmt)
 
     index = build_query_index(facts)
     exact = '--exact' in flags
     include_inferred = '--include-inferred' in flags
     if cmd == 'map':
-        found, matched, sym_field, results, notes = cmd_map(
+        found, matched, sym_field, results, notes, total = cmd_map(
             facts, depth, subdir, '--files' in flags)
     elif cmd == 'callers':
-        found, matched, sym_field, results, notes = cmd_callers(
+        found, matched, sym_field, results, notes, total = cmd_callers(
             facts, index, pos[0], exact, limit)
     elif cmd == 'callees':
-        found, matched, sym_field, results, notes = cmd_callees(
+        found, matched, sym_field, results, notes, total = cmd_callees(
             facts, index, pos[0], exact, limit)
     elif cmd == 'impact':
-        found, matched, sym_field, results, notes = cmd_impact(
+        found, matched, sym_field, results, notes, total = cmd_impact(
             facts, index, pos[0], exact, depth, include_inferred)
     elif cmd == 'path':
-        found, matched, sym_field, results, notes = cmd_path(
+        found, matched, sym_field, results, notes, total = cmd_path(
             facts, index, pos[0], pos[1], exact, include_inferred)
     elif cmd == 'entry':
-        found, matched, sym_field, results, notes = cmd_entry(facts, kind)
+        found, matched, sym_field, results, notes, total = cmd_entry(facts, kind)
     else:
-        found, matched, sym_field, results, notes = cmd_search(
+        found, matched, sym_field, results, notes, total = cmd_search(
             facts, pos[0], domain, limit)
 
-    shell = {'query': cmd, 'symbol': sym_field, 'matched': matched,
-             'found': found, 'results': results, 'notes': notes}
-    quiet = '--quiet' in flags
-    if fmt == 'json':
-        print(json.dumps(shell, ensure_ascii=False, sort_keys=True, indent=2))
-    elif not found:
-        if not quiet:
-            print('[OK] no matches')
-            for note in notes:
-                print('[NOTE] %s' % note)
+    # C-P0-2：json 外壳加 truncated/total/limit 三字段——total=截断前真实总数
+    # （真数，不受 limit 影响）、limit=生效上限（0=无上限）、truncated=是否截断。
+    if cmd in LIMIT_CMDS:
+        if cmd == 'search':
+            kept_n = sum(len(results[k])
+                         for k in ('symbols', 'files', 'calls'))
+        else:
+            kept_n = len(results)
     else:
-        text = render_query_md(shell)
-        if text:
-            print(text)
-    return 0
+        kept_n = total                         # 无输出上限：保留数 == 总数
+    shell = {'query': cmd, 'symbol': sym_field, 'matched': matched,
+             'found': found, 'results': results, 'notes': notes,
+             'total': total,
+             'limit': limit if cmd in LIMIT_CMDS else 0,
+             'truncated': total > kept_n}
+    # C-P1-1：两个出口共调同一形状判定（无结果不是错误，收敛一处）
+    shape, code = classify_query_outcome(found)
+    if fmt == 'json':
+        emit_json(shell)                       # stdout 只有这一个 JSON 文档
+        return code
+    quiet = '--quiet' in flags
+    if shape == Q_SHAPE_NO_MATCH:
+        if not quiet:
+            emit_human(['[OK] no matches']
+                       + ['[NOTE] %s' % n for n in notes], fmt)
+        return code
+    text = render_query_md(shell)
+    if text:
+        emit_human(text.split('\n'), fmt)
+    return code
 
 
 # ---------------------------------------------------------------- 自测（--selftest）
@@ -5387,7 +5557,8 @@ def run_selftest():
                       'P2-9 the diverging call edge is present (M.driver -> shout)')
 
         # P1-h / P2-b（v1.13.3）：map 行数聚合口径 + 多候选回显
-        _mfh, _xh, _sh, mres_h, mnotes_h = cmd_map(facts, 1, None, False)
+        _mfh, _xh, _sh, mres_h, mnotes_h, _mtot_h = cmd_map(facts, 1, None,
+                                                            False)
         checker.check(
             sum(n['lines'] for n in mres_h['nodes'])
             == sum(r['lines'] for r in facts['files'] if r['language']),
@@ -5426,6 +5597,27 @@ def run_selftest():
                 fh.close()
             with open(cap, 'r', encoding='utf-8') as rh:
                 return code, rh.read()
+
+        def _quiet_main2(args):
+            """C-P1-1/C-P1-7 机检用：stdout+stderr 双捕获（SUCCESS 形状三件套
+            要断「stderr 为空」，stdout 纯度要断 json.loads 全量一次成功）。"""
+            cap_o = os.path.join(outdir_w, 'capture-out.txt')
+            cap_e = os.path.join(outdir_w, 'capture-err.txt')
+            old_o, old_e = sys.stdout, sys.stderr
+            fo = open(cap_o, 'w', encoding='utf-8')
+            fe = open(cap_e, 'w', encoding='utf-8')
+            sys.stdout, sys.stderr = fo, fe
+            try:
+                code = main(list(args))
+            finally:
+                sys.stdout, sys.stderr = old_o, old_e
+                fo.close()
+                fe.close()
+            with open(cap_o, 'r', encoding='utf-8') as ro:
+                out = ro.read()
+            with open(cap_e, 'r', encoding='utf-8') as reh:
+                err = reh.read()
+            return code, out, err
 
         # --- AC-38 子命令分发与向后兼容 ---
         old_cwd = os.getcwd()
@@ -5471,9 +5663,10 @@ def run_selftest():
         checker.check(code == 0,
                       'AC-48 callers CLI exits 0 with facts present')
         shell = json.loads(out)
-        checker.check(sorted(shell) == ['found', 'matched', 'notes', 'query',
-                                        'results', 'symbol'],
-                      'F9 json shell keys are exactly the frozen six')
+        checker.check(sorted(shell) == ['found', 'limit', 'matched', 'notes',
+                                        'query', 'results', 'symbol', 'total',
+                                        'truncated'],
+                      'F9 json shell keys are exactly the frozen nine (B3)')
         checker.check(shell['found'] and len(shell['results']) >= 1,
                       'AC-39 CLI callers returns call sites for known callee')
         bad = [r for r in shell['results']
@@ -5482,7 +5675,8 @@ def run_selftest():
         checker.check(not bad,
                       'AC-39 every verified callers row exists in facts.calls')
         crows = shell['results']
-        cf, em, _s, erows, _n = cmd_callees(facts, index, caller_q, False, 200)
+        cf, em, _s, erows, _n, _ct = cmd_callees(facts, index, caller_q,
+                                                 False, 200)
         checker.check(cf and em >= 1,
                       'F8 matched reports symbol hits (callers/callees)')
         inv = [r for r in erows
@@ -5490,8 +5684,8 @@ def run_selftest():
                in set((x['file'], x['line'], x['symbol']) for x in crows)]
         checker.check(bool(inv) or not crows,
                       'AC-40 callees(caller) mirrors callers(callee) rows')
-        nf, _m, _s, _r, _n = cmd_callers(facts, index, '__no_such__',
-                                         False, 200)
+        nf, _m, _s, _r, _n, _nt = cmd_callers(facts, index, '__no_such__',
+                                              False, 200)
         checker.check(nf is False,
                       'AC-39 callers on unknown symbol -> found:false')
 
@@ -5527,8 +5721,8 @@ def run_selftest():
                       'AC-41 impact on unknown symbol -> found:false')
 
         # --- path（AC-42 / D-41）---
-        pf, _m, _s, pres, _n = cmd_path(facts, index, caller_q, callee_n,
-                                        False, False)
+        pf, _m, _s, pres, _n, _pt = cmd_path(facts, index, caller_q, callee_n,
+                                             False, False)
         checker.check(pf is True and len(pres['hops']) >= 1,
                       'AC-42 path finds a verified route')
         checker.check(all(h['confidence'] == CONF_VERIFIED
@@ -5540,24 +5734,25 @@ def run_selftest():
         chain = [pres['hops'][0]['from']] + [h['to'] for h in pres['hops']]
         checker.check(chain[0] == caller_last and chain[-1] == callee_n,
                       'AC-42 hop chain connects from -> to')
-        _pf2, _m2, _s2, pres2, _n2 = cmd_path(facts, index, caller_q,
-                                              callee_n, False, False)
+        _pf2, _m2, _s2, pres2, _n2, _pt2 = cmd_path(facts, index, caller_q,
+                                                    callee_n, False, False)
         checker.check(json.dumps(pres, sort_keys=True)
                       == json.dumps(pres2, sort_keys=True),
                       'AC-42 two runs identical (deterministic shortest path)')
-        npf, _m, _s, nres, nnotes = cmd_path(facts, index, callee_n,
-                                             '__no_such__', False, False)
+        npf, _m, _s, nres, nnotes, _npt = cmd_path(facts, index, callee_n,
+                                                   '__no_such__', False, False)
         checker.check(npf is False and nres['hops'] == [] and nnotes,
                       'AC-42 unknown target -> found:false + hops:[] + note')
-        lpf, _m, _s, lres, lnotes = cmd_path(facts, index, 'Util',
-                                             'compute_total', False, False)
+        lpf, _m, _s, lres, lnotes, _lpt = cmd_path(facts, index, 'Util',
+                                                   'compute_total', False,
+                                                   False)
         checker.check(lpf is False and lres['hops'] == []
                       and any('实锤' in n for n in lnotes),
                       'AC-42 no route between known endpoints -> found:false '
                       '+ hops:[] + 未找到实锤路径 note')
 
         # --- map（AC-43）---
-        _mf, _x, _s, mres, _n = cmd_map(facts, 1, None, False)
+        _mf, _x, _s, mres, _n, _mt = cmd_map(facts, 1, None, False)
         checker.check(sum(n['files'] for n in mres['nodes'])
                       == facts['counts']['files'],
                       'AC-43 map node files sum == counts.files')
@@ -5571,31 +5766,31 @@ def run_selftest():
                    != _node_id(i['target'], 1, False))
         checker.check(sum(e['count'] for e in mres['edges']) == xdir,
                       'AC-43 edge count sum == cross-directory import edges')
-        _mf2, _x, _s, mres_f, _n = cmd_map(facts, 1, None, True)
+        _mf2, _x, _s, mres_f, _n, _mt2 = cmd_map(facts, 1, None, True)
         checker.check(len(mres_f['nodes']) == facts['counts']['files'],
                       'F8 --files granularity: one node per file')
-        _mf3, _x, _s, mres_d, _n = cmd_map(facts, 1, 'langs', False)
+        _mf3, _x, _s, mres_d, _n, _mt3 = cmd_map(facts, 1, 'langs', False)
         langs_n = sum(1 for r in facts['files']
                       if r['path'].startswith('langs/'))
         checker.check(sum(n['files'] for n in mres_d['nodes']) == langs_n,
                       'AC-43 --dir restricts the file sum to the subtree')
 
         # --- entry（AC-44）---
-        _ef, _x, _s, erows2, _n = cmd_entry(facts, None)
+        _ef, _x, _s, erows2, _n, _et = cmd_entry(facts, None)
         set_a = set((e['kind'], e['file'], e['line'])
                     for e in facts['entry_points'])
         set_b = set((e['kind'], e['file'], e['line']) for e in erows2)
         checker.check(set_a == set_b and bool(set_a),
                       'AC-44 entry set equals facts.entry_points')
         k0 = sorted(set_a)[0][0]
-        _efk, _x, _s, erowsk, _n = cmd_entry(facts, k0)
+        _efk, _x, _s, erowsk, _n, _etk = cmd_entry(facts, k0)
         checker.check(erowsk and all(e['kind'] == k0 for e in erowsk),
                       'AC-44 --kind filters to a subset')
         checker.check(all(set(e) >= set(ENTRY_KEYS) for e in erows2),
                       'F9 entry rows carry the frozen five keys')
 
         # --- search（AC-45）---
-        sf, _m, _s, sres, _n = cmd_search(facts, callee_n, 'all', 200)
+        sf, _m, _s, sres, _n, _st = cmd_search(facts, callee_n, 'all', 200)
         checker.check(sf is True and sorted(sres)
                       == ['calls', 'files', 'symbols'],
                       'F9 search results carry exactly the three domains')
@@ -5606,19 +5801,21 @@ def run_selftest():
                       and all(callee_n in s['qualname'].lower()
                               for s in sres['symbols']),
                       'AC-45 search rows are facts entries (no invented rows)')
-        sf2, _m, _s, sres2, _n = cmd_search(facts, callee_n.upper(), 'symbol',
-                                            200)
+        sf2, _m, _s, sres2, _n, _st2 = cmd_search(facts, callee_n.upper(),
+                                                  'symbol', 200)
         checker.check(sf2 is True and bool(sres2['symbols']),
                       'AC-45 search is case-insensitive')
-        sf3, _m, _s, sres3, _n = cmd_search(facts, callee_n, 'symbol', 200)
+        sf3, _m, _s, sres3, _n, _st3 = cmd_search(facts, callee_n, 'symbol',
+                                                  200)
         checker.check(sres3['calls'] == [] and sres3['files'] == []
                       and bool(sres3['symbols']),
                       'AC-45 --in symbol excludes the other domains')
-        snf, _m, _s, snres, _n = cmd_search(facts, 'zzz_no_hit_zzz', 'all', 200)
+        snf, _m, _s, snres, _n, _snt = cmd_search(facts, 'zzz_no_hit_zzz',
+                                                  'all', 200)
         checker.check(snf is False
                       and not any(snres[k] for k in snres),
                       'AC-45 fake keyword -> found:false, empty domains')
-        _sl, _m, _s, sres_l, _n = cmd_search(facts, 'e', 'symbol', 3)
+        _sl, _m, _s, sres_l, _n, _stl = cmd_search(facts, 'e', 'symbol', 3)
         checker.check(len(sres_l['symbols']) <= 3,
                       'F8 --limit caps result count')
 
@@ -5663,6 +5860,135 @@ def run_selftest():
         checker.check(dumps_facts(facts) == snapshot,
                       'AC-47 query functions never mutate facts (byte-identical)')
 
+        # --- B3 输出契约机检（C-P0-2/P1-1/P1-2/P1-6/P1-7，门禁先行批次）---
+        tc = None
+        n_sites = 0
+        for k in sorted(index['by_callee'],
+                        key=lambda k: (-len(index['by_callee'][k]), k)):
+            if resolve_symbols(index, k, False):
+                tc = k
+                n_sites = len(index['by_callee'][k])
+                break
+        checker.check(tc is not None and n_sites >= 2,
+                      'B3 fixture provides a resolvable multi-site callee')
+        # B3(1) 恰好截断：limit = 全量-1 → 表头数=保留数 + 触发点截断标记
+        cf1, _m1, _s1, kept1, notes1, tot1 = cmd_callers(facts, index, tc,
+                                                         False, n_sites - 1)
+        checker.check(cf1 is True and len(kept1) == n_sites - 1
+                      and tot1 == n_sites
+                      and notes1 == [_cap_note('', n_sites - 1, n_sites)],
+                      'B3(1) callers limit probe reports exact truncation '
+                      'with retained-count header data')
+        # B3(2) 恰好不截断：limit = 全量 → 无截断标记（多取一条探测为空）
+        cf2, _m2, _s2, kept2, notes2, tot2 = cmd_callers(facts, index, tc,
+                                                         False, n_sites)
+        checker.check(len(kept2) == n_sites and tot2 == n_sites
+                      and notes2 == [],
+                      'B3(2) exactly-at-limit fetch is not flagged truncated')
+        # B3(3) md 出口：listed 表头 = 保留数 + 就地截断行（触发点，非末尾通用句）
+        code, out = _quiet_main([prog, 'callers', tc, '--facts', facts_path,
+                                 '--limit', str(n_sites - 1), '--format', 'md'])
+        checker.check(code == 0
+                      and ('listed: %d call site(s)' % (n_sites - 1)) in out
+                      and _cap_note('', n_sites - 1, n_sites) in out,
+                      'B3(3) md lists retained count with in-place truncation '
+                      'marker')
+        # B3(4) json 出口：truncated/total/limit 三字段
+        code, out = _quiet_main([prog, 'callers', tc, '--facts', facts_path,
+                                 '--limit', str(n_sites - 1), '--format',
+                                 'json'])
+        sh3 = json.loads(out)
+        checker.check(code == 0 and sh3['truncated'] is True
+                      and sh3['total'] == n_sites
+                      and sh3['limit'] == n_sites - 1
+                      and len(sh3['results']) == n_sites - 1,
+                      'B3(4) json shell carries truncated/total/limit triple')
+        # B3(5) search 域级截断：标记带域前缀、就地放在该域块旁
+        _sf, _sm, _ss, _srt, snotes_t, _stt = cmd_search(facts, tc, 'all', 1)
+        call_note = next((n for n in snotes_t
+                          if n.startswith('calls ') and _is_trunc_note(n)),
+                         None)
+        checker.check(call_note is not None
+                      and ('显示 1 / 共 ' in call_note),
+                      'B3(5) search truncation note is domain-prefixed')
+        code, out = _quiet_main([prog, 'search', tc, '--facts', facts_path,
+                                 '--limit', '1', '--format', 'md'])
+        hdr = re.search(r'matched: (\d+) symbols, (\d+) calls, (\d+) files',
+                        out)
+        rows_n = (len([l for l in out.splitlines()
+                       if l.startswith('- symbol ')]),
+                  len([l for l in out.splitlines()
+                       if l.startswith('- call ')]),
+                  len([l for l in out.splitlines()
+                       if l.startswith('- file ')]))
+        checker.check(code == 0 and call_note is not None
+                      and call_note in out and hdr is not None
+                      and (int(hdr.group(1)), int(hdr.group(2)),
+                           int(hdr.group(3))) == rows_n,
+                      'B3(6) search header counts equal rendered rows; '
+                      'domain note in place')
+        # B3(7) SUCCESS 形状三件套（C-P1-1）：exit 0 + [OK] no matches + stderr 空
+        code, out, err = _quiet_main2([prog, 'callers', '__no_such_sym__',
+                                       '--facts', facts_path])
+        checker.check(code == 0 and '[OK] no matches' in out and err == '',
+                      'B3(7) no-match SUCCESS shape: exit 0 + [OK] + clean '
+                      'stderr')
+        # B3(8) 两出口形状一致：json 无结果同为 exit 0 + found:false + stderr 空
+        code, out, err = _quiet_main2([prog, 'callers', '__no_such_sym__',
+                                       '--facts', facts_path, '--format',
+                                       'json'])
+        sh8 = json.loads(out)
+        checker.check(code == 0 and sh8['found'] is False and err == '',
+                      'B3(8) json no-match shape matches the md outlet '
+                      '(classify shared)')
+        # B3(9) json 通道纯净（C-P1-7）：全部子命令 stdout 一次 json.loads 成功
+        json_ok = True
+        for sc, sc_args in (('map', []), ('entry', []), ('search', [tc]),
+                            ('callers', [tc]), ('callees', [tc]),
+                            ('impact', [tc]),
+                            ('path', [tc, 'compute_total'])):
+            c2, o2, e2 = _quiet_main2([prog, sc] + sc_args
+                                      + ['--facts', facts_path,
+                                         '--format', 'json'])
+            try:
+                json.loads(o2)
+            except ValueError:
+                json_ok = False
+            json_ok = json_ok and c2 == 0 and e2 == ''
+        checker.check(json_ok,
+                      'B3(9) every subcommand: --format json stdout parses '
+                      'in one json.loads with clean stderr')
+        # B3(10) 全序 + 去重键单点 + 确定性（C-P1-2）
+        ca, _ma, _sa, rows_a, _na, ta = cmd_callers(facts, index, tc, False, 0)
+        cb, _mb, _sb, rows_b, _nb, tb = cmd_callers(facts, index, tc, False, 0)
+        keys_a = [_list_sort_key(r['caller'], r['file'], r['line'], r['symbol'])
+                  for r in rows_a]
+        site_keys = set(_call_site_key({'file': r['file'], 'line': r['line'],
+                                        'callee': r['symbol']})
+                        for r in rows_a)
+        checker.check(ca is True and ta == tb
+                      and json.dumps(rows_a, sort_keys=True)
+                      == json.dumps(rows_b, sort_keys=True)
+                      and keys_a == sorted(keys_a)
+                      and len(site_keys) == len(rows_a),
+                      'B3(10) callers rows deterministic, total-ordered, '
+                      'tuple-key deduped')
+        # B3(11) impact 层内符号序 = 末级（符号名字典序）
+        imp_lv = cmd_impact(facts, index, tc, False, 2, False)[3]['levels']
+        checker.check(all(l['symbols'] == sorted(l['symbols'])
+                          for l in imp_lv),
+                      'B3(11) impact level symbols follow lexicographic order')
+        # B3(12) 无上限子命令外壳：limit=0、truncated=false、total=保留数
+        code, out = _quiet_main([prog, 'impact', tc, '--facts', facts_path,
+                                 '--format', 'json'])
+        sh12 = json.loads(out)
+        imp_total = sum(len(l['symbols']) for l in sh12['results']['levels'])
+        checker.check(code == 0 and sh12['limit'] == 0
+                      and sh12['truncated'] is False
+                      and sh12['total'] == imp_total,
+                      'B3(12) uncapped subcommand shell: limit 0, not '
+                      'truncated, total honest')
+
         # --- AC-56 注入必红：verified 边翻推断 + 删除目标符号 ---
         mutant = json.loads(dumps_facts(facts))
         mcall = None
@@ -5679,36 +6005,38 @@ def run_selftest():
         mutant['symbols'] = [s for s in mutant['symbols']
                              if _lastseg(s['qualname']) != t_name]
         mindex = build_query_index(mutant)
-        m_imp_f, _m, _s, m_imp, _n = cmd_impact(mutant, mindex, t_name,
-                                                False, 2, False)
+        m_imp_f, _m, _s, m_imp, _n, _mt4 = cmd_impact(mutant, mindex, t_name,
+                                                      False, 2, False)
         checker.check(m_imp_f is False and m_imp['levels'] == [],
                       'AC-56(1) default impact does not traverse the flipped '
                       'edge')
-        w_imp_f, _m, _s, w_imp, _n = cmd_impact(mutant, mindex, t_name,
-                                                False, 2, True)
+        w_imp_f, _m, _s, w_imp, _n, _mt5 = cmd_impact(mutant, mindex, t_name,
+                                                      False, 2, True)
         checker.check(w_imp_f is True
                       and u_name in w_imp['levels'][0]['symbols']
                       and w_imp['levels'][0]['confidences'][u_name]
                       == CONF_INFERRED,
                       'AC-56(1b) --include-inferred impact reaches the caller '
                       'with an inferred label')
-        p56f, _m, _s, p56, p56notes = cmd_path(mutant, mindex,
-                                               mcall['caller'], t_name,
-                                               False, False)
+        p56f, _m, _s, p56, p56notes, _pt4 = cmd_path(mutant, mindex,
+                                                     mcall['caller'], t_name,
+                                                     False, False)
         checker.check(p56f is False and p56['hops'] == []
                       and any('实锤' in n for n in p56notes),
                       'AC-56(2) default path reports found:false + hops:[] '
                       '+ note')
-        p56bf, _m, _s, p56b, _n = cmd_path(mutant, mindex, mcall['caller'],
-                                           t_name, False, True)
+        p56bf, _m, _s, p56b, _n, _pt5 = cmd_path(mutant, mindex,
+                                                 mcall['caller'],
+                                                 t_name, False, True)
         checker.check(p56bf is True and p56b['hops']
                       and all('confidence' in h for h in p56b['hops'])
                       and any(h['confidence'] == CONF_INFERRED
                               for h in p56b['hops']),
                       'AC-56(3) --include-inferred path appears with '
                       'confidence labels (inferred hop present)')
-        ctrl_f, _m, _s, _ctrl, _n = cmd_path(facts, index, mcall['caller'],
-                                             t_name, False, False)
+        ctrl_f, _m, _s, _ctrl, _n, _pt6 = cmd_path(facts, index,
+                                                   mcall['caller'],
+                                                   t_name, False, False)
         checker.check(ctrl_f is True,
                       'AC-56 control: the same path exists on unmutated facts')
     finally:

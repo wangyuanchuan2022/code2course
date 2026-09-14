@@ -37,12 +37,17 @@ validate_course.py — code2course 成品课程机械校验（零依赖，Python
   14. 版本自证：成品应有 <meta name="generator" data-version="…">；
       缺失 WARNING（向后兼容旧产物），与内联外壳 @version 不一致 ERROR
   15. 散点内联 style ≤5 处（超出手写样式集中原则，WARNING）
-  16. 调用图数据块（.callgraph-data，规格 callgraph-block-v1.13.1 §7）：
+  16. 调用图数据块（.callgraph-data，规格 callgraph-block-v1.13.1 §7 + B3 契约升级）：
       每个 link 有 from/to/confidence 且 confidence ∈ {verified, inferred}、
       from/to 命中 nodes[].id、无自环；verified link 必须有 file 与 line；
       每个 node 必须有 file 与 line（调用图不允许无出处的节点）；
       节点可选键 about/call：只允许出现在 nodes[]（links[] 出现即错）、
-      出现即必须是非空字符串且限长（about ≤60 字、call ≤80 字）
+      出现即必须是非空字符串且限长（about ≤60 字、call ≤80 字）；
+      全键白名单（§14a 逐字段闭集）：nodes/links 出现契约外未知键即错；
+      facts v3 派生字段（B2 移交②）：resolved_by ∈ {name,binding,qualified}
+      且只属于 verified 边；resolution=self_ref 的边禁入调用图数据；
+      resolution ∈ {unresolved, ambiguous} 恒 inferred，resolution=unique
+      必须 verified 且带合法 resolved_by
 
 退出码：发现 ERROR 非零退出（=1），仅 WARNING 时退出 0。
 """
@@ -371,12 +376,26 @@ def trace_id_check(why_texts, known_ids, errors):
                               % ref)
 
 
-# ---- 16. 调用图数据块契约（规格 callgraph-block-v1.13.1 §7） ----
+# ---- 16. 调用图数据块契约（规格 callgraph-block-v1.13.1 §7 + B3 契约升级） ----
 CG_CONFIDENCE = ('verified', 'inferred')
 # about/call：节点级可选键（v1.13.4 前提，规格 §14a）。只许挂在 nodes[] 上，
 # 出现即必须是有内容的字符串且有长度上限——事实面板一行放不下超长综述。
 CG_ABOUT_MAX = 60   # 字
 CG_CALL_MAX = 80    # 字
+
+# B3 全键白名单（兑现 §14a「逐字段闭集」承诺）：nodes/links 键集以下两表为准，
+# 出现契约外未知键即报错。links 白名单含 facts v3 派生字段（B2 移交②）
+# resolved_by / resolution——它们是 B-P0-2/P0-4 消解诚实性字段的投影。
+CG_NODE_KEYS = frozenset(('id', 'label', 'kind', 'file', 'line',
+                          'about', 'call'))
+CG_LINK_KEYS = frozenset(('from', 'to', 'count', 'confidence', 'file', 'line',
+                          'declared', 'back', 'resolved_by', 'resolution'))
+
+# B3 契约升级（B2 移交②）：facts v3 消解字段在调用图数据里的语义机检。
+# resolution：unique|ambiguous|unresolved|self_ref 四值闭集（facts 侧同源）；
+# resolved_by：name|binding|qualified 三值闭集（实锤名/绑定/限定的证据来源）。
+CG_RESOLUTIONS = ('unique', 'ambiguous', 'unresolved', 'self_ref')
+CG_RESOLVED_BY = ('name', 'binding', 'qualified')
 
 
 def _cg_str(v):
@@ -388,13 +407,62 @@ def _cg_int(v):
     return isinstance(v, int) and not isinstance(v, bool) and v >= 1
 
 
+def _cg_resolution_check(e, i, where, errors):
+    """B3：facts v3 派生边（携带 resolution/resolved_by 字段）的语义机检。
+
+    四条谓词（各配注入必红变异体，见 agent-out/b3_negative_1134.py）：
+      a. resolved_by 出现 → 必须 ∈ {name, binding, qualified}（闭集）；
+      b. resolved_by ⟺ verified（证据来源只属于实锤边）；
+      c. resolution=self_ref 的边禁入调用图数据（自引用形态必须剔除——
+         跨 FFI 同名 / super 调用 / 真递归在这里只能画成契约禁止的自环）；
+      d. resolution ∈ {unresolved, ambiguous} 恒 inferred（拒绝即未解析），
+         标 verified 即错；resolution=unique 必须 verified 且带合法 resolved_by
+         （facts 侧不变式 verified⟺resolved_by+to 的校验器侧接线；
+         link 的 to 不可为空由既有「缺 to / to 不在 nodes」检查兜住）。
+    """
+    rb = e.get('resolved_by')
+    if 'resolved_by' in e:
+        if rb not in CG_RESOLVED_BY:
+            errors.append('%s 调用图 links[%d] 的 resolved_by「%s」不在闭集 '
+                          '{name, binding, qualified} 内'
+                          % (where, i, rb if isinstance(rb, str) else rb))
+        if e.get('confidence') != 'verified':
+            errors.append('%s 调用图 links[%d] 不是 verified 边却带 resolved_by'
+                          '（证据来源只属于实锤边）' % (where, i))
+    if 'resolution' in e:
+        res = e.get('resolution')
+        if res not in CG_RESOLUTIONS:
+            errors.append('%s 调用图 links[%d] 的 resolution「%s」不在闭集 '
+                          '{unique, ambiguous, unresolved, self_ref} 内'
+                          % (where, i, res if isinstance(res, str) else res))
+            return
+        if res == 'self_ref':
+            errors.append('%s 调用图 links[%d] 的 resolution=self_ref——'
+                          '自引用边禁入调用图数据（画出来即契约禁止的自环，'
+                          '必须按 §14d SOP 剔除）' % (where, i))
+        elif res in ('unresolved', 'ambiguous'):
+            if e.get('confidence') != 'inferred':
+                errors.append('%s 调用图 links[%d] 的 resolution=%s 恒 inferred'
+                              '（拒绝即未解析，多候选收不窄不得标 verified）'
+                              % (where, i, res))
+        else:                                  # unique：verified + 证据来源
+            if e.get('confidence') != 'verified' \
+                    or rb not in CG_RESOLVED_BY:
+                errors.append('%s 调用图 links[%d] 的 resolution=unique 必须'
+                              ' verified 且带 resolved_by∈{name, binding, '
+                              'qualified}（实锤边必须说明凭什么实锤）'
+                              % (where, i))
+
+
 def callgraph_check(data, where, errors, warnings=None):
-    """调用图数据契约机检（规格 §7 四条 + v1.13.4 前提的 about/call 三检）。
+    """调用图数据契约机检（规格 §7 四条 + v1.13.4 前提的 about/call 三检
+    + B3 全键白名单与 facts v3 字段语义）。
 
     每条独立成错、各自定位到具体节点/连线，便于"注入必红"逐条命中：
     坏 JSON 在 json.loads 处即返回（不落到这里）；缺 confidence、verified
-    缺 line、node 缺 file、about 空串、about 超长、about 挂到 links 上
-    六种注入各只命中对应那一条。
+    缺 line、node 缺 file、about 空串、about 超长、about 挂到 links 上、
+    未知键、resolved_by 闭集外、self_ref 边、降级边标 verified 等
+    各只命中对应那一条。
     """
     if not isinstance(data, dict):
         errors.append('%s 顶层必须是对象（含 nodes/links）' % where)
@@ -413,6 +481,14 @@ def callgraph_check(data, where, errors, warnings=None):
         if not isinstance(n, dict):
             errors.append('%s nodes[%d] 不是对象' % (where, i))
             continue
+        # B3 全键白名单：逐字段闭集（§14a「键集以下两表为准」的校验器兑现）
+        unknown = sorted(set(n) - CG_NODE_KEYS)
+        if unknown:
+            who0 = n.get('id') if isinstance(n.get('id'), str) else '#%d' % i
+            errors.append('%s 调用图节点「%s」出现契约外键 %s'
+                          '（§14a 逐字段闭集：节点只允许 %s）'
+                          % (where, who0, '/'.join(unknown),
+                             ', '.join(sorted(CG_NODE_KEYS))))
         nid = n.get('id')
         if _cg_str(nid):
             who = nid
@@ -449,6 +525,13 @@ def callgraph_check(data, where, errors, warnings=None):
         if not isinstance(e, dict):
             errors.append('%s links[%d] 不是对象' % (where, i))
             continue
+        # B3 全键白名单：links 键集闭集（含 facts v3 派生字段 resolved_by/resolution）
+        unknown = sorted(set(e) - CG_LINK_KEYS)
+        if unknown:
+            errors.append('%s 调用图 links[%d] 出现契约外键 %s'
+                          '（§14a 逐字段闭集：边只允许 %s）'
+                          % (where, i, '/'.join(unknown),
+                             ', '.join(sorted(CG_LINK_KEYS))))
         # 6. about / call 是节点级字段：不允许挂在 links[] 上（防载荷膨胀——
         #    边可能成倍于节点，且边的「作用」本就是节点 about 的内容）
         for key in ('about', 'call'):
@@ -479,6 +562,8 @@ def callgraph_check(data, where, errors, warnings=None):
             warnings.append('%s 调用图 links[%d]（%s → %s）两端末段名相同，'
                             '很可能是同一符号的自环（analyze 产物里 self_ref: true '
                             '的边必须剔除），请人工核对' % (where, i, frm, to))
+        # B3：facts v3 派生字段的语义机检（B2 移交②）
+        _cg_resolution_check(e, i, where, errors)
         # 3. verified link 必须有 file 与 line
         if conf == 'verified':
             pair = '%s → %s' % (frm, to)

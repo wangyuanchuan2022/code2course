@@ -660,6 +660,8 @@ document.querySelectorAll('.translate-pair').forEach(pair => {
 | `file` / `line` | string / int | 发起调用的那一行（`verified` **必须给**；`inferred` 给最可能的依据行或省略 `line`） |
 | `declared` | int | 可选。这条边的"声明深度"权重，来自结构事实的 import/调用层数；覆盖率 ≥40% 才作为分层基准，否则回落 `count` 并在事实面板显式声明降级 |
 | `back` | bool | 可选。显式声明为回边，一般由算法自动判定，无需手写 |
+| `resolved_by` | enum | 可选（v3 派生字段）。**闭集** `name`（实锤·按末段名唯一命中）/ `binding`（按导入绑定）/ `qualified`（按限定名精确匹配）；仅 `verified` 边可携带，且 verified 边携带时必为三值之一——校验器机检 |
+| `resolution` | enum | 可选（v3 派生字段）。**闭集** `unique` / `ambiguous` / `unresolved` / `self_ref`；调用图数据禁用 `self_ref`，`unresolved`/`ambiguous` 恒为 `inferred`——校验器机检 |
 
 `about` / `call` 只属于**节点**：不允许写在 `links[]` 上——边可能成倍于节点，且"这条边为什么存在"本就该写在节点的 `about` 里；写错位置校验器直接报错。
 
