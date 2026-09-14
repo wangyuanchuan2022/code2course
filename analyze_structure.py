@@ -6,7 +6,26 @@ analyze_structure.py — code2course 结构事实底稿生成器（零依赖，P
 用法：
     python analyze_structure.py <repo> [--lang auto|<id>[,<id>...]]
                                 [--exclude A,B,...] [--outdir DIR] [--quiet]
+    python analyze_structure.py analyze <repo> [同上]        # 显式子命令形式（等价 v1）
     python analyze_structure.py --selftest
+
+查询层（F8/F9，纯只读，不写任何文件；facts 缺省取 <cwd>/structure-facts/structure-facts.json）：
+    python analyze_structure.py map      [--facts F] [--dir P] [--depth N] [--files]
+                                        [--include-inferred] [--format md|json]
+    python analyze_structure.py callers  <symbol> [--facts F] [--exact] [--limit N]
+                                        [--include-inferred] [--format md|json]
+    python analyze_structure.py callees  <symbol> [--facts F] [--exact] [--limit N]
+                                        [--include-inferred] [--format md|json]
+    python analyze_structure.py impact   <symbol> [--facts F] [--depth N] [--exact]
+                                        [--include-inferred] [--format md|json]
+    python analyze_structure.py path     <a> <b> [--facts F] [--exact]
+                                        [--include-inferred] [--format md|json]
+    python analyze_structure.py entry    [--facts F] [--kind K] [--format md|json]
+    python analyze_structure.py search   <keyword> [--facts F] [--in symbol|file|call|all]
+                                        [--limit N] [--format md|json]
+
+查询退出码：0 查询完成（含无结果）/ 1 facts 读不到、JSON 非法或 schema_version
+不匹配（响亮失败）/ 2 用法错误（缺 <symbol>、--depth 非整数、--in 值非法等）。
 
 产物（写入 <outdir>，缺省 <cwd>/structure-facts）：
     structure-facts.json — 机器可读五件套（schema_version=2，顶层键恰好 11 个）
@@ -28,7 +47,12 @@ analyze_structure.py — code2course 结构事实底稿生成器（零依赖，P
     四处零出现）。
   * 被分析仓库零写入；产物确定性：同一仓库同一输入连跑两次字节一致（无时间戳、
     无绝对路径、所有列表按稳定键排序）。
-  * 查询层子命令（map / callers / callees / impact / path / entry / search）由步骤 1c 接入。
+  * 查询层子命令（F8/F9，1c）：map / callers / callees / impact / path / entry / search。
+    进程内加载 facts → dict 索引，纯只读；符号参数先 qualname 精确、再末段名（--exact 只认
+    精确）；impact / path 缺省只走 verified 边（D-41：推断边不进推理链），--include-inferred
+    才纳且逐跳 / 逐层标注 confidence；map / callers / callees 属「列出事实」，两类都返回并
+    分列计数；无结果 = found:false + exit 0；path 多解按邻居排序键 (file, line, callee)
+    字典序取首个（确定性最短路径）。
 
 退出码：0 成功产出（可含 warning）/ 1 产出不完整或内部错误 / 2 用法错误或路径不可读。
 
@@ -2062,6 +2086,15 @@ def main(argv):
         pass
     if '--selftest' in argv[1:]:
         return run_selftest()
+    # 查询层子命令分发（F8/D-39）：已知查询命令短路；`analyze` 剥壳后走 v1 流程；
+    # 其余首参（含 mapx 等伪造名）按仓库路径处理——v1 命令行不破坏（AC-38）。
+    if len(argv) > 1 and argv[1] in QUERY_COMMANDS:
+        return run_query(argv)
+    if len(argv) > 1 and argv[1] == 'analyze':
+        argv = [argv[0]] + argv[2:]
+        if len(argv) == 1:
+            print(__doc__)
+            return 2
 
     opts = {'--lang': None, '--exclude': None, '--outdir': None}
     flags = []
@@ -2136,6 +2169,578 @@ def main(argv):
     if counts['files'] == 0 or counts['files'] == counts['unsupported_files']:
         print('[WARN] zero supported source files (artifacts written anyway)')
         return 1
+    return 0
+
+
+# ---------------------------------------------------------------- 查询层（F8/F9，1c）
+#
+# 索引与性能（F11 / D-42）：进程内 json.load facts → 建 dict 索引（by qualname /
+# by 末段名 / by caller / by callee），再按需做集合运算与 BFS。不引入任何嵌入式
+# SQL 索引引擎（标准库里的也不引）——保住 facts 的文本可 diff / 可审计性与
+# F10 kind 闭集的可审性；典型量级（10^4 符号 / 10^5 边 / 数 MB JSON）内存
+# dict 完全够用；查询层纯只读，嵌入式数据库只会引入锁 / 并发 / 写盘失败等新失败面。
+# 重估触发条件（提前不引入，触发时另开修订）：单次查询冷启动 > 3s（AC-49 软门）、
+# 或 structure-facts.json > 50MB、或跨文件边数 > 10^6——届时再评估嵌入式索引或
+# 侧车索引（spec F11/D-42，届时另开修订）。
+
+QUERY_COMMANDS = ('map', 'callers', 'callees', 'impact', 'path', 'entry', 'search')
+DEFAULT_FACTS_PATH = os.path.join('structure-facts', 'structure-facts.json')
+SEARCH_DOMAINS = ('symbol', 'file', 'call', 'all')
+CONF_RANK = {CONF_VERIFIED: 0, CONF_INFERRED: 1}
+ENTRY_KEYS = ('kind', 'file', 'line', 'evidence', 'confidence')
+
+
+def load_facts(path):
+    """读 facts JSON（F9 只读口径）。返回 (facts|None, 错误消息|None)。
+
+    三类响亮失败（CLI exit 1，不静默降级）：文件不存在 / JSON 非法 /
+    schema_version 与本工具不匹配。查询层绝不写任何文件（AC-47）。
+    """
+    if not os.path.isfile(path):
+        return None, 'facts file not found: %s' % path
+    try:
+        with open(path, 'r', encoding='utf-8') as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as exc:
+        return None, 'cannot read facts (%s): %r' % (path, exc)
+    if not isinstance(data, dict) or data.get('schema_version') != SCHEMA_VERSION:
+        got = data.get('schema_version') if isinstance(data, dict) \
+            else type(data).__name__
+        return None, ('schema_version mismatch: expected %r, got %r'
+                      % (SCHEMA_VERSION, got))
+    return data, None
+
+
+def build_query_index(facts):
+    """F11 内存索引：by qualname / by 末段名（符号），by caller / by callee（调用边）。"""
+    by_qual = {}
+    by_last = {}
+    for sym in facts['symbols']:
+        by_qual.setdefault(sym['qualname'], []).append(sym)
+        by_last.setdefault(sym['name'], []).append(sym)
+    by_caller = {}
+    by_callee = {}
+    for call in facts['calls']:
+        if call.get('caller'):
+            by_caller.setdefault(call['caller'], []).append(call)
+        by_callee.setdefault(call['callee'], []).append(call)
+    return {'by_qual': by_qual, 'by_last': by_last,
+            'by_caller': by_caller, 'by_callee': by_callee}
+
+
+def resolve_symbols(index, name, exact):
+    """符号参数口径（F8）：先 qualname 精确，再末段名；--exact 只接受精确。"""
+    hits = index['by_qual'].get(name, [])
+    if not hits and not exact:
+        hits = index['by_last'].get(name, [])
+    return hits
+
+
+def _lastseg(qualname):
+    return qualname.split('.')[-1] if qualname else ''
+
+
+def _node_id(path, depth, file_granular):
+    """map 节点归组：--files 时为文件本身；否则目录按 depth 层截断，根级文件归 '.'。"""
+    if file_granular:
+        return path
+    parts = path.split('/')[:-1]
+    if not parts:
+        return '.'
+    return '/'.join(parts[:max(1, depth)])
+
+
+def _anchor_names(index, name, exact):
+    """impact / path 的 BFS 节点名集合（末段名空间，与调用边 callee 口径一致）。
+
+    符号命中 → 各命中符号的末段名；符号零命中（如 facts 变体删掉了目标符号，
+    AC-56）而该末段名仍出现在调用边名字空间时，继续作为图节点可用；否则为空。
+    callers / callees / search 不用此回退——它们「列出事实」，符号不存在即
+    found:false（AC-39）。
+    """
+    names = set(_lastseg(s['qualname']) for s in resolve_symbols(index, name, exact))
+    if not names and not exact:
+        seg = _lastseg(name)
+        if seg in index['by_callee'] or any(
+                k == seg or k.endswith('.' + seg) for k in index['by_caller']):
+            names.add(seg)
+    return names
+
+
+def _call_graph(facts, include_inferred):
+    """符号级调用图（末段名节点空间）。
+
+    fwd[u][v] / rev[v][u] = 代表调用点 (file, line, confidence)；同一 (u, v) 的
+    多条记录取 (file, line) 字典序最小者（确定性，F8 裁定 3）。缺省只收 verified
+    边（D-41：推断边不进推理链）；--include-inferred 才纳，逐跳/逐层带 confidence。
+    模块级调用点（caller 为空）不产生符号级边——callers/callees 列事实时仍列出。
+    """
+    fwd = {}
+    rev = {}
+    for call in facts['calls']:
+        if call['confidence'] == CONF_INFERRED and not include_inferred:
+            continue
+        u = _lastseg(call.get('caller'))
+        if not u:
+            continue
+        v = call['callee']
+        rec = (call['file'], call['line'], call['confidence'])
+        best = fwd.setdefault(u, {}).get(v)
+        if best is None or rec[:2] < best[:2]:
+            fwd[u][v] = rec
+        best = rev.setdefault(v, {}).get(u)
+        if best is None or rec[:2] < best[:2]:
+            rev[v][u] = rec
+    return fwd, rev
+
+
+def cmd_map(facts, depth, subdir, file_granular):
+    """项目地图（AC-43）：目录/文件级节点 + 跨节点 import 边聚合。
+
+    节点 files 之和 = facts.counts.files（--dir 时按子树）；边只聚合 target
+    落在仓库内的 import（未解析/外部的 import 无目录端点，不构成跨目录边，
+    数量记入 notes）；同节点内部依赖不计。verified/inferred/external 分列
+    之和恒等于 count（本工具产物中 resolved ⟺ verified，分列是为兼容
+    hand-built/variant facts）。
+    """
+    sym_count = {}
+    for s in facts['symbols']:
+        sym_count[s['file']] = sym_count.get(s['file'], 0) + 1
+
+    def in_scope(path):
+        return subdir is None or path == subdir or path.startswith(subdir + '/')
+
+    nodes = {}
+    for rec in facts['files']:                 # facts 已按 path 稳定排序
+        path = rec['path']
+        if not in_scope(path):
+            continue
+        nid = _node_id(path, depth, file_granular)
+        node = nodes.get(nid)
+        if node is None:
+            node = nodes[nid] = {'id': nid, 'path': nid, 'files': 0,
+                                 'symbols': 0, 'lines': 0}
+        node['files'] += 1
+        node['symbols'] += sym_count.get(path, 0)
+        node['lines'] += rec.get('lines') or 0
+
+    file_set = set(rec['path'] for rec in facts['files'])
+    edges = {}
+    unmapped = 0
+    for imp in facts['imports']:
+        tgt = imp.get('target')
+        if imp.get('external') or tgt not in file_set:
+            unmapped += 1
+            continue
+        if not in_scope(imp['file']):
+            continue
+        u = _node_id(imp['file'], depth, file_granular)
+        v = _node_id(tgt, depth, file_granular)
+        if u == v:
+            continue
+        edge = edges.setdefault((u, v), {'from': u, 'to': v, 'count': 0,
+                                         'verified': 0, 'inferred': 0,
+                                         'external': 0})
+        edge['count'] += 1
+        if imp.get('external'):
+            edge['external'] += 1
+        elif imp.get('confidence') == CONF_VERIFIED:
+            edge['verified'] += 1
+        else:
+            edge['inferred'] += 1
+    node_list = [nodes[k] for k in sorted(nodes)]
+    edge_list = [edges[k] for k in sorted(edges)]
+    notes = []
+    if unmapped:
+        notes.append('%d import(s) without an in-repo target are not mapped'
+                     % unmapped)
+    return bool(node_list), 0, None, {'nodes': node_list, 'edges': edge_list}, notes
+
+
+def cmd_callers(facts, index, name, exact, limit):
+    """谁调用它（列出事实，D-41）：verified/inferred 都返回，逐条带 confidence。"""
+    hits = resolve_symbols(index, name, exact)
+    if not hits:
+        return False, 0, name, [], ['no symbol matches: %s' % name]
+    wanted = set(_lastseg(s['qualname']) for s in hits)
+    rows = []
+    for call in facts['calls']:                # 已按 (file, line, callee) 稳定排序
+        if call['callee'] not in wanted:
+            continue
+        rows.append({'symbol': call['callee'], 'file': call['file'],
+                     'line': call['line'], 'caller': call.get('caller') or '',
+                     'confidence': call['confidence'],
+                     'ambiguous': bool(call.get('ambiguous'))})
+        if limit and len(rows) >= limit:
+            break
+    return bool(rows), len(hits), name, rows, []
+
+
+def cmd_callees(facts, index, name, exact, limit):
+    """它调用谁（列出事实，D-41）：与 callers 互为逆关系（同一事实的两个方向）。"""
+    hits = resolve_symbols(index, name, exact)
+    if not hits:
+        return False, 0, name, [], ['no symbol matches: %s' % name]
+    wanted = set(s['qualname'] for s in hits)
+    rows = []
+    for call in facts['calls']:
+        if call.get('caller') not in wanted:
+            continue
+        rows.append({'symbol': call.get('caller') or '', 'file': call['file'],
+                     'line': call['line'], 'callee': call['callee'],
+                     'confidence': call['confidence']})
+        if limit and len(rows) >= limit:
+            break
+    return bool(rows), len(hits), name, rows, []
+
+
+def cmd_impact(facts, index, name, exact, depth, include_inferred):
+    """影响半径（推理，D-41）：反向 BFS，缺省只走 verified 边，逐层给出符号集。
+
+    --include-inferred 时每层附 confidences 映射（逐符号标注到达边的 confidence，
+    多条边时取最优：verified 优先于 inferred）。levels 为空 → found:false。
+    """
+    matched = len(resolve_symbols(index, name, exact))
+    anchors = _anchor_names(index, name, exact)
+    if not anchors:
+        return False, matched, name, {'levels': []}, \
+            ['no symbol matches: %s' % name]
+    _fwd, rev = _call_graph(facts, include_inferred)
+    levels = []
+    visited = set(anchors)
+    frontier = sorted(visited)
+    for d in range(1, max(1, depth) + 1):
+        nxt = {}
+        for node in frontier:
+            for caller, rec in sorted(rev.get(node, {}).items()):
+                if caller in visited:
+                    continue
+                if caller not in nxt or CONF_RANK[rec[2]] < CONF_RANK[nxt[caller]]:
+                    nxt[caller] = rec[2]
+        if not nxt:
+            break
+        level = {'depth': d, 'symbols': sorted(nxt)}
+        if include_inferred:
+            level['confidences'] = dict((k, nxt[k]) for k in sorted(nxt))
+        levels.append(level)
+        visited.update(nxt)
+        frontier = sorted(nxt)
+    notes = []
+    if not levels:
+        notes.append('no reachable callers')
+    elif not include_inferred:
+        notes.append('default follows verified edges only; '
+                     'retry with --include-inferred to widen')
+    return bool(levels), matched, name, {'levels': levels}, notes
+
+
+def cmd_path(facts, index, a, b, exact, include_inferred):
+    """调用路径（推理，D-41 + F8 裁定 3）：BFS 确定性最短路径。
+
+    邻居扩展按排序键 (file, line, callee) 字典序；缺省只走 verified 边。
+    无路径 → found:false + hops:[] + note 明说「未找到实锤路径」——绝不返回
+    空图冒充结果（AC-42）。
+    """
+    matched = len(resolve_symbols(index, a, exact)) \
+        + len(resolve_symbols(index, b, exact))
+    a_names = _anchor_names(index, a, exact)
+    b_names = _anchor_names(index, b, exact)
+    empty = {'from': a, 'to': b, 'hops': []}
+    if not a_names or not b_names:
+        missing = a if not a_names else b
+        return False, matched, a, empty, ['no symbol matches: %s' % missing]
+    if a_names & b_names:
+        return True, matched, a, empty, \
+            ['source and target coincide (%s); zero hops'
+             % ', '.join(sorted(a_names & b_names))]
+    fwd, _rev = _call_graph(facts, include_inferred)
+    parent = {}
+    queue = []
+    for nm in sorted(a_names):
+        parent[nm] = None
+        queue.append(nm)
+    head = 0
+    end = None
+    while head < len(queue) and end is None:
+        u = queue[head]
+        head += 1
+        edges = sorted(((rec[0], rec[1], v), v, rec)
+                       for v, rec in fwd.get(u, {}).items())
+        for _key, v, rec in edges:             # 排序键 = (file, line, callee)
+            if v in parent:
+                continue
+            parent[v] = (u, rec)
+            if v in b_names:
+                end = v
+                break
+            queue.append(v)
+    if end is None:
+        note = '未找到实锤路径 (no verified call path); try --include-inferred' \
+            if not include_inferred \
+            else 'no call path even with inferred edges included'
+        return False, matched, a, empty, [note]
+    hops = []
+    node = end
+    while parent[node] is not None:
+        u, rec = parent[node]
+        hops.append({'from': u, 'to': node, 'file': rec[0], 'line': rec[1],
+                     'confidence': rec[2]})
+        node = u
+    hops.reverse()
+    return True, matched, a, {'from': a, 'to': b, 'hops': hops}, []
+
+
+def cmd_entry(facts, kind):
+    """入口点列表（AC-44）：与 facts.entry_points 同构，--kind 过滤为子集。"""
+    rows = [dict(e) for e in facts['entry_points']
+            if kind is None or e['kind'] == kind]
+    notes = []
+    if not rows:
+        notes.append('no entry points%s'
+                     % ('' if kind is None else ' for kind %s' % kind))
+    return bool(rows), 0, None, rows, notes
+
+
+def cmd_search(facts, keyword, domain, limit):
+    """关键字检索（AC-45）：大小写不敏感，--in 三域过滤，条目全部来自 facts。"""
+    kw = keyword.lower()
+    results = {'symbols': [], 'files': [], 'calls': []}
+    if domain in ('symbol', 'all'):
+        results['symbols'] = [dict(s) for s in facts['symbols']
+                              if kw in s['qualname'].lower()]
+        results['symbols'] = sorted(results['symbols'],
+                                    key=lambda s: (s['file'], s['start_line']))
+    if domain in ('file', 'all'):
+        results['files'] = [dict(r) for r in facts['files']
+                            if kw in r['path'].lower()]
+    if domain in ('call', 'all'):
+        results['calls'] = [dict(c) for c in facts['calls']
+                            if kw in c['callee'].lower()]
+    if limit:
+        for key in results:
+            results[key] = results[key][:limit]
+    found = bool(results['symbols'] or results['files'] or results['calls'])
+    notes = [] if found else \
+        ['no matches for %r in domain %s' % (keyword, domain)]
+    return found, len(results['symbols']), keyword, results, notes
+
+
+def render_query_md(shell):
+    """--format md（F9）：人读形态，file:line + 实锤/推断标记（口径同 F3）。
+
+    行排布与 universal-ctags `-x` 交叉引用行同构（符号 + file:line + 标记），
+    仅借鉴输出形态，不引任何依赖。
+    """
+    cmd = shell['query']
+    res = shell['results']
+    out = []
+    add = out.append
+    if shell['matched'] > 1:
+        add('matched: %d symbols' % shell['matched'])
+    if cmd == 'map':
+        for n in res['nodes']:
+            add('- %s  files=%d symbols=%d lines=%d'
+                % (n['id'], n['files'], n['symbols'], n['lines']))
+        for e in res['edges']:
+            add('- %s -> %s  count=%d (verified=%d inferred=%d external=%d)'
+                % (e['from'], e['to'], e['count'], e['verified'],
+                   e['inferred'], e['external']))
+    elif cmd == 'callers':
+        for r in res:
+            add('- %s  %s:%d  (%s)  called by %s%s'
+                % (r['symbol'], r['file'], r['line'],
+                   _conf_label(r['confidence']), r['caller'] or '(module)',
+                   '  [ambiguous]' if r['ambiguous'] else ''))
+    elif cmd == 'callees':
+        for r in res:
+            add('- %s  %s:%d  (%s)  calls %s'
+                % (r['symbol'], r['file'], r['line'],
+                   _conf_label(r['confidence']), r['callee']))
+    elif cmd == 'impact':
+        for lvl in res['levels']:
+            if 'confidences' in lvl:
+                names = ', '.join('%s(%s)' % (s, _conf_label(lvl['confidences'][s]))
+                                  for s in lvl['symbols'])
+            else:
+                names = ', '.join(lvl['symbols'])
+            add('- depth %d: %s' % (lvl['depth'], names or '(none)'))
+    elif cmd == 'path':
+        if res['hops']:
+            add('- route: %s' % ' -> '.join(
+                [res['hops'][0]['from']] + [h['to'] for h in res['hops']]))
+        for h in res['hops']:
+            add('  - %s -> %s  %s:%d  (%s)'
+                % (h['from'], h['to'], h['file'], h['line'],
+                   _conf_label(h['confidence'])))
+    elif cmd == 'entry':
+        for r in res:
+            add('- %s  %s:%d  (%s)  evidence: %s'
+                % (r['kind'], r['file'], r['line'],
+                   _conf_label(r['confidence']), r['evidence']))
+    elif cmd == 'search':
+        for s in res['symbols']:
+            add('- symbol  %s  %s:%d  %s'
+                % (s['qualname'], s['file'], s['start_line'], s['kind']))
+        for r in res['files']:
+            add('- file  %s  (%s, %s lines)'
+                % (r['path'], r['language'] or 'unknown', r.get('lines')))
+        for c in res['calls']:
+            add('- call  %s  %s:%d  (%s)'
+                % (c['callee'], c['file'], c['line'],
+                   _conf_label(c['confidence'])))
+    for note in shell['notes']:
+        add('[NOTE] %s' % note)
+    return '\n'.join(out)
+
+
+def _query_usage_error(message):
+    print('[FAIL] %s' % message)
+
+
+def run_query(argv):
+    """查询层入口（F8）：argv = [prog, <cmd>, ...]，返回退出码 0/1/2。
+
+    0 = 查询完成（含无结果，found:false）；1 = facts 读不到 / JSON 非法 /
+    schema_version 不匹配（响亮失败，不静默降级）；2 = 用法错误（缺 <symbol>、
+    --depth 非整数、--in/--kind/--format 值非法、缺省路径无产物且未给 --facts 等）。
+    只读纪律：除 stdout 外不触任何文件（AC-47）。
+    """
+    cmd = argv[1]
+    val_opts = {'--facts': None, '--dir': None, '--depth': None,
+                '--in': None, '--kind': None, '--limit': None,
+                '--format': None}
+    flag_opts = ('--exact', '--files', '--include-inferred', '--quiet')
+    flags = []
+    pos = []
+    i = 2
+    while i < len(argv):
+        a = argv[i]
+        if a in val_opts:
+            if i + 1 >= len(argv):
+                _query_usage_error('option needs a value: %s' % a)
+                return 2
+            val_opts[a] = argv[i + 1]
+            i += 2
+        elif a.startswith('-') and len(a) > 1:
+            if a not in flag_opts:
+                _query_usage_error('unknown option: %s' % a)
+                return 2
+            flags.append(a)
+            i += 1
+        else:
+            pos.append(a)
+            i += 1
+
+    fmt = val_opts['--format'] or 'md'
+    if fmt not in ('md', 'json'):
+        _query_usage_error('--format must be md or json: %s' % fmt)
+        return 2
+    depth = None
+    if val_opts['--depth'] is not None:
+        try:
+            depth = int(val_opts['--depth'])
+        except ValueError:
+            _query_usage_error('--depth needs an integer: %s'
+                               % val_opts['--depth'])
+            return 2
+        if depth < 1:
+            _query_usage_error('--depth must be >= 1')
+            return 2
+    limit = 200
+    if val_opts['--limit'] is not None:
+        try:
+            limit = int(val_opts['--limit'])
+        except ValueError:
+            _query_usage_error('--limit needs an integer: %s'
+                               % val_opts['--limit'])
+            return 2
+        if limit < 0:
+            _query_usage_error('--limit must be >= 0')
+            return 2
+    domain = val_opts['--in'] or 'all'
+    if domain not in SEARCH_DOMAINS:
+        _query_usage_error('--in must be one of %s: %s'
+                           % ('|'.join(SEARCH_DOMAINS), domain))
+        return 2
+    kind = val_opts['--kind']
+    if kind is not None and kind not in ENTRY_KINDS:
+        _query_usage_error('--kind must be one of the frozen entry kinds: %s'
+                           % kind)
+        return 2
+    if depth is not None and cmd not in ('map', 'impact'):
+        _query_usage_error('--depth applies to map/impact only')
+        return 2
+
+    need = {'map': 0, 'entry': 0, 'search': 1, 'callers': 1, 'callees': 1,
+            'impact': 1, 'path': 2}[cmd]
+    if len(pos) < need:
+        _query_usage_error('%s expects %d positional argument(s), got %d'
+                           % (cmd, need, len(pos)))
+        return 2
+    if len(pos) > need:
+        _query_usage_error('%s takes at most %d positional argument(s)'
+                           % (cmd, need))
+        return 2
+    if cmd == 'map' and depth is None:
+        depth = 1
+    if cmd == 'impact' and depth is None:
+        depth = 2
+
+    subdir = None
+    if val_opts['--dir'] is not None:
+        subdir = val_opts['--dir'].strip().replace('\\', '/').strip('/') or None
+
+    facts_path = val_opts['--facts']
+    if facts_path is None:
+        facts_path = os.path.join(os.getcwd(), DEFAULT_FACTS_PATH)
+        if not os.path.isfile(facts_path):
+            _query_usage_error(
+                'no facts at default path (run analyze first or pass --facts):'
+                ' %s' % facts_path)
+            return 2
+    facts, err = load_facts(facts_path)
+    if err is not None:
+        print('[FAIL] %s' % err)
+        return 1
+
+    index = build_query_index(facts)
+    exact = '--exact' in flags
+    include_inferred = '--include-inferred' in flags
+    if cmd == 'map':
+        found, matched, sym_field, results, notes = cmd_map(
+            facts, depth, subdir, '--files' in flags)
+    elif cmd == 'callers':
+        found, matched, sym_field, results, notes = cmd_callers(
+            facts, index, pos[0], exact, limit)
+    elif cmd == 'callees':
+        found, matched, sym_field, results, notes = cmd_callees(
+            facts, index, pos[0], exact, limit)
+    elif cmd == 'impact':
+        found, matched, sym_field, results, notes = cmd_impact(
+            facts, index, pos[0], exact, depth, include_inferred)
+    elif cmd == 'path':
+        found, matched, sym_field, results, notes = cmd_path(
+            facts, index, pos[0], pos[1], exact, include_inferred)
+    elif cmd == 'entry':
+        found, matched, sym_field, results, notes = cmd_entry(facts, kind)
+    else:
+        found, matched, sym_field, results, notes = cmd_search(
+            facts, pos[0], domain, limit)
+
+    shell = {'query': cmd, 'symbol': sym_field, 'matched': matched,
+             'found': found, 'results': results, 'notes': notes}
+    quiet = '--quiet' in flags
+    if fmt == 'json':
+        print(json.dumps(shell, ensure_ascii=False, sort_keys=True, indent=2))
+    elif not found:
+        if not quiet:
+            print('[OK] no matches')
+            for note in notes:
+                print('[NOTE] %s' % note)
+    else:
+        text = render_query_md(shell)
+        if text:
+            print(text)
     return 0
 
 
@@ -2744,6 +3349,18 @@ def _fixture_root():
         return tmp, sibling
 
 
+def _writable_dir(base):
+    """在 base 下建可写子目录；base 不可写（mkdtemp 0700 症候）时退回兄弟目录。"""
+    probe = os.path.join(base, 'w')
+    try:
+        os.makedirs(probe)
+        return probe
+    except OSError:
+        sibling = base + '-w'
+        os.makedirs(sibling)
+        return sibling
+
+
 def run_selftest():
     checker = SelftestChecker()
     tmp, root = _fixture_root()
@@ -3176,6 +3793,306 @@ def run_selftest():
             and _find_call(facts, 'langs/app.ts', 12, 'helper') is not None)
         checker.check(xcheck,
                       'AC-23 multi-language verified call edges at exact call sites')
+
+        # ============ 查询层（F8/F9，1c）============
+        snapshot = dumps_facts(facts)          # AC-47 只读基线（查询前后逐字节比对）
+        index = build_query_index(facts)
+        prog = sys.argv[0] or 'analyze_structure.py'
+        outdir_w = _writable_dir(tmp)
+        facts_path = os.path.join(outdir_w, 'structure-facts.json')
+
+        def _quiet_main(args):
+            """进程内跑一次 CLI，stdout 重定向到临时文件（不污染 selftest 输出）。"""
+            cap = os.path.join(outdir_w, 'capture.txt')
+            old = sys.stdout
+            fh = open(cap, 'w', encoding='utf-8')
+            sys.stdout = fh
+            try:
+                code = main(list(args))
+            finally:
+                sys.stdout = old
+                fh.close()
+            with open(cap, 'r', encoding='utf-8') as rh:
+                return code, rh.read()
+
+        # --- AC-38 子命令分发与向后兼容 ---
+        old_cwd = os.getcwd()
+        os.chdir(outdir_w)                     # 缺省 facts 路径必不存在 → 裸命令=用法错
+        try:
+            for sc in QUERY_COMMANDS:
+                code, _out = _quiet_main([prog, sc])
+                checker.check(code == 2,
+                              'AC-38 bare subcommand %r exits 2 (usage)' % sc)
+            code, _out = _quiet_main([prog, 'mapx', os.path.join(root, 'nope')])
+            checker.check(code == 2,
+                          'AC-38 forged subcommand name falls back to path '
+                          'handling (exit 2, no crash)')
+        finally:
+            os.chdir(old_cwd)
+        code, _out = _quiet_main([prog, 'analyze', root, '--outdir', outdir_w])
+        checker.check(code == 0,
+                      'AC-38 analyze subcommand form runs the v1 flow (exit 0)')
+        cli_facts, err = load_facts(facts_path)
+        checker.check(cli_facts is not None and err is None,
+                      'F9 load_facts validates the analyze product')
+        checker.check(cli_facts is not None
+                      and dumps_facts(cli_facts) == dumps_facts(facts),
+                      'AC-13 CLI-built facts equal the in-memory facts')
+
+        # --- callers / callees（AC-39/40）---
+        call_set = set((c['file'], c['line'], c['callee'])
+                       for c in facts['calls'])
+        vcall = None
+        for c in facts['calls']:
+            if c['confidence'] == CONF_VERIFIED and c.get('caller') \
+                    and c['candidates'] == 1 \
+                    and _find_symbol(facts, c['caller']) is not None:
+                vcall = c
+                break
+        checker.check(vcall is not None,
+                      'query fixture has an unambiguous verified '
+                      'symbol-to-symbol call edge')
+        caller_q = vcall['caller']
+        callee_n = vcall['callee']
+        code, out = _quiet_main([prog, 'callers', callee_n, '--facts',
+                                 facts_path, '--format', 'json'])
+        checker.check(code == 0,
+                      'AC-48 callers CLI exits 0 with facts present')
+        shell = json.loads(out)
+        checker.check(sorted(shell) == ['found', 'matched', 'notes', 'query',
+                                        'results', 'symbol'],
+                      'F9 json shell keys are exactly the frozen six')
+        checker.check(shell['found'] and len(shell['results']) >= 1,
+                      'AC-39 CLI callers returns call sites for known callee')
+        bad = [r for r in shell['results']
+               if r['confidence'] == CONF_VERIFIED
+               and (r['file'], r['line'], r['symbol']) not in call_set]
+        checker.check(not bad,
+                      'AC-39 every verified callers row exists in facts.calls')
+        crows = shell['results']
+        cf, em, _s, erows, _n = cmd_callees(facts, index, caller_q, False, 200)
+        checker.check(cf and em >= 1,
+                      'F8 matched reports symbol hits (callers/callees)')
+        inv = [r for r in erows
+               if (r['file'], r['line'], r['callee'])
+               in set((x['file'], x['line'], x['symbol']) for x in crows)]
+        checker.check(bool(inv) or not crows,
+                      'AC-40 callees(caller) mirrors callers(callee) rows')
+        nf, _m, _s, _r, _n = cmd_callers(facts, index, '__no_such__',
+                                         False, 200)
+        checker.check(nf is False,
+                      'AC-39 callers on unknown symbol -> found:false')
+
+        # --- impact（AC-41 / D-41）---
+        def _verified_callers(node, seen):
+            hit = set()
+            for c in facts['calls']:
+                if c['confidence'] != CONF_VERIFIED or not c.get('caller'):
+                    continue
+                if c['callee'] == node and _lastseg(c['caller']) not in seen:
+                    hit.add(_lastseg(c['caller']))
+            return hit
+
+        caller_last = _lastseg(caller_q)
+        imp_d = cmd_impact(facts, index, caller_q, False, 2, False)[3]['levels']
+        exp1 = _verified_callers(caller_last, {caller_last})
+        exp2 = set()
+        for nm in exp1:
+            exp2 |= _verified_callers(nm, {caller_last} | exp1)
+        got1 = set(imp_d[0]['symbols']) if imp_d else set()
+        got2 = set(imp_d[1]['symbols']) if len(imp_d) > 1 else set()
+        checker.check(got1 == exp1 and got2 == exp2,
+                      'AC-41 default impact levels equal an independent '
+                      'verified-only oracle')
+        imp_w = cmd_impact(facts, index, caller_q, False, 2, True)[3]['levels']
+        checker.check(sum(len(l['symbols']) for l in imp_w)
+                      >= sum(len(l['symbols']) for l in imp_d),
+                      'AC-41 --include-inferred radius >= default radius')
+        imp_1 = cmd_impact(facts, index, caller_q, False, 1, False)[3]['levels']
+        checker.check(len(imp_1) <= 1, 'F8 --depth caps impact levels')
+        imp_x = cmd_impact(facts, index, '__no_such__', False, 2, False)
+        checker.check(imp_x[0] is False and imp_x[3]['levels'] == [],
+                      'AC-41 impact on unknown symbol -> found:false')
+
+        # --- path（AC-42 / D-41）---
+        pf, _m, _s, pres, _n = cmd_path(facts, index, caller_q, callee_n,
+                                        False, False)
+        checker.check(pf is True and len(pres['hops']) >= 1,
+                      'AC-42 path finds a verified route')
+        checker.check(all(h['confidence'] == CONF_VERIFIED
+                          for h in pres['hops']),
+                      'D-41 default path hops are verified-only')
+        checker.check(all((h['file'], h['line'], h['to']) in call_set
+                          for h in pres['hops']),
+                      'AC-42 every hop exists in facts.calls')
+        chain = [pres['hops'][0]['from']] + [h['to'] for h in pres['hops']]
+        checker.check(chain[0] == caller_last and chain[-1] == callee_n,
+                      'AC-42 hop chain connects from -> to')
+        _pf2, _m2, _s2, pres2, _n2 = cmd_path(facts, index, caller_q,
+                                              callee_n, False, False)
+        checker.check(json.dumps(pres, sort_keys=True)
+                      == json.dumps(pres2, sort_keys=True),
+                      'AC-42 two runs identical (deterministic shortest path)')
+        npf, _m, _s, nres, nnotes = cmd_path(facts, index, callee_n,
+                                             '__no_such__', False, False)
+        checker.check(npf is False and nres['hops'] == [] and nnotes,
+                      'AC-42 unknown target -> found:false + hops:[] + note')
+        lpf, _m, _s, lres, lnotes = cmd_path(facts, index, 'Util',
+                                             'compute_total', False, False)
+        checker.check(lpf is False and lres['hops'] == []
+                      and any('实锤' in n for n in lnotes),
+                      'AC-42 no route between known endpoints -> found:false '
+                      '+ hops:[] + 未找到实锤路径 note')
+
+        # --- map（AC-43）---
+        _mf, _x, _s, mres, _n = cmd_map(facts, 1, None, False)
+        checker.check(sum(n['files'] for n in mres['nodes'])
+                      == facts['counts']['files'],
+                      'AC-43 map node files sum == counts.files')
+        checker.check(all(e['verified'] + e['inferred'] + e['external']
+                          == e['count'] for e in mres['edges']),
+                      'AC-43 per-edge columns sum to count')
+        file_set = set(r['path'] for r in facts['files'])
+        xdir = sum(1 for i in facts['imports']
+                   if not i.get('external') and i['target'] in file_set
+                   and _node_id(i['file'], 1, False)
+                   != _node_id(i['target'], 1, False))
+        checker.check(sum(e['count'] for e in mres['edges']) == xdir,
+                      'AC-43 edge count sum == cross-directory import edges')
+        _mf2, _x, _s, mres_f, _n = cmd_map(facts, 1, None, True)
+        checker.check(len(mres_f['nodes']) == facts['counts']['files'],
+                      'F8 --files granularity: one node per file')
+        _mf3, _x, _s, mres_d, _n = cmd_map(facts, 1, 'langs', False)
+        langs_n = sum(1 for r in facts['files']
+                      if r['path'].startswith('langs/'))
+        checker.check(sum(n['files'] for n in mres_d['nodes']) == langs_n,
+                      'AC-43 --dir restricts the file sum to the subtree')
+
+        # --- entry（AC-44）---
+        _ef, _x, _s, erows2, _n = cmd_entry(facts, None)
+        set_a = set((e['kind'], e['file'], e['line'])
+                    for e in facts['entry_points'])
+        set_b = set((e['kind'], e['file'], e['line']) for e in erows2)
+        checker.check(set_a == set_b and bool(set_a),
+                      'AC-44 entry set equals facts.entry_points')
+        k0 = sorted(set_a)[0][0]
+        _efk, _x, _s, erowsk, _n = cmd_entry(facts, k0)
+        checker.check(erowsk and all(e['kind'] == k0 for e in erowsk),
+                      'AC-44 --kind filters to a subset')
+        checker.check(all(set(e) >= set(ENTRY_KEYS) for e in erows2),
+                      'F9 entry rows carry the frozen five keys')
+
+        # --- search（AC-45）---
+        sf, _m, _s, sres, _n = cmd_search(facts, callee_n, 'all', 200)
+        checker.check(sf is True and sorted(sres)
+                      == ['calls', 'files', 'symbols'],
+                      'F9 search results carry exactly the three domains')
+        facts_symbols = [dict(s) for s in facts['symbols']]
+        checker.check(sf is True and sres['symbols']
+                      and all(any(s == o for o in facts_symbols)
+                              for s in sres['symbols'])
+                      and all(callee_n in s['qualname'].lower()
+                              for s in sres['symbols']),
+                      'AC-45 search rows are facts entries (no invented rows)')
+        sf2, _m, _s, sres2, _n = cmd_search(facts, callee_n.upper(), 'symbol',
+                                            200)
+        checker.check(sf2 is True and bool(sres2['symbols']),
+                      'AC-45 search is case-insensitive')
+        sf3, _m, _s, sres3, _n = cmd_search(facts, callee_n, 'symbol', 200)
+        checker.check(sres3['calls'] == [] and sres3['files'] == []
+                      and bool(sres3['symbols']),
+                      'AC-45 --in symbol excludes the other domains')
+        snf, _m, _s, snres, _n = cmd_search(facts, 'zzz_no_hit_zzz', 'all', 200)
+        checker.check(snf is False
+                      and not any(snres[k] for k in snres),
+                      'AC-45 fake keyword -> found:false, empty domains')
+        _sl, _m, _s, sres_l, _n = cmd_search(facts, 'e', 'symbol', 3)
+        checker.check(len(sres_l['symbols']) <= 3,
+                      'F8 --limit caps result count')
+
+        # --- 退出码与只读（AC-47/48，CLI 端到端）---
+        code, out = _quiet_main([prog, 'callers', '--facts', facts_path])
+        checker.check(code == 2, 'AC-48 missing <symbol> exits 2')
+        code, _out = _quiet_main([prog, 'map', '--facts',
+                                  os.path.join(outdir_w, 'nope.json')])
+        checker.check(code == 1, 'AC-48 missing facts file exits 1 (loud)')
+        bad_json = os.path.join(outdir_w, 'bad.json')
+        with open(bad_json, 'w', encoding='utf-8') as bh:
+            bh.write('{oops')
+        code, _out = _quiet_main([prog, 'map', '--facts', bad_json])
+        checker.check(code == 1, 'AC-48 invalid JSON exits 1 (loud)')
+        mutant_schema = json.loads(dumps_facts(facts))
+        mutant_schema['schema_version'] = SCHEMA_VERSION + 1
+        bad_schema = os.path.join(outdir_w, 'bad-schema.json')
+        with open(bad_schema, 'w', encoding='utf-8') as sh:
+            sh.write(dumps_facts(mutant_schema))
+        code, _out = _quiet_main([prog, 'map', '--facts', bad_schema])
+        checker.check(code == 1,
+                      'AC-48 schema_version mismatch exits 1 (loud)')
+        code, _out = _quiet_main([prog, 'search', 'kw', '--facts', facts_path,
+                                  '--in', 'bogus'])
+        checker.check(code == 2, 'AC-48 invalid --in exits 2')
+        code, _out = _quiet_main([prog, 'entry', '--facts', facts_path,
+                                  '--kind', 'nope'])
+        checker.check(code == 2, 'AC-48 invalid --kind exits 2')
+        code, out = _quiet_main([prog, 'callers', callee_n, '--facts',
+                                 facts_path, '--format', 'md'])
+        checker.check(code == 0 and callee_n in out
+                      and '%s:%d' % (vcall['file'], vcall['line']) in out,
+                      'AC-46 md form carries symbol and file:line')
+        checker.check('实锤' in out,
+                      'AC-46 md marks verified rows (实锤/推断 labels)')
+        checker.check(dumps_facts(facts) == snapshot,
+                      'AC-47 query functions never mutate facts (byte-identical)')
+
+        # --- AC-56 注入必红：verified 边翻推断 + 删除目标符号 ---
+        mutant = json.loads(dumps_facts(facts))
+        mcall = None
+        for c in mutant['calls']:
+            if c['confidence'] == CONF_VERIFIED and c.get('caller') \
+                    and c['candidates'] == 1:
+                mcall = c
+                break
+        checker.check(mcall is not None,
+                      'AC-56 fixture has an unambiguous verified edge to mutate')
+        t_name = mcall['callee']
+        u_name = _lastseg(mcall['caller'])
+        mcall['confidence'] = CONF_INFERRED
+        mutant['symbols'] = [s for s in mutant['symbols']
+                             if _lastseg(s['qualname']) != t_name]
+        mindex = build_query_index(mutant)
+        m_imp_f, _m, _s, m_imp, _n = cmd_impact(mutant, mindex, t_name,
+                                                False, 2, False)
+        checker.check(m_imp_f is False and m_imp['levels'] == [],
+                      'AC-56(1) default impact does not traverse the flipped '
+                      'edge')
+        w_imp_f, _m, _s, w_imp, _n = cmd_impact(mutant, mindex, t_name,
+                                                False, 2, True)
+        checker.check(w_imp_f is True
+                      and u_name in w_imp['levels'][0]['symbols']
+                      and w_imp['levels'][0]['confidences'][u_name]
+                      == CONF_INFERRED,
+                      'AC-56(1b) --include-inferred impact reaches the caller '
+                      'with an inferred label')
+        p56f, _m, _s, p56, p56notes = cmd_path(mutant, mindex,
+                                               mcall['caller'], t_name,
+                                               False, False)
+        checker.check(p56f is False and p56['hops'] == []
+                      and any('实锤' in n for n in p56notes),
+                      'AC-56(2) default path reports found:false + hops:[] '
+                      '+ note')
+        p56bf, _m, _s, p56b, _n = cmd_path(mutant, mindex, mcall['caller'],
+                                           t_name, False, True)
+        checker.check(p56bf is True and p56b['hops']
+                      and all('confidence' in h for h in p56b['hops'])
+                      and any(h['confidence'] == CONF_INFERRED
+                              for h in p56b['hops']),
+                      'AC-56(3) --include-inferred path appears with '
+                      'confidence labels (inferred hop present)')
+        ctrl_f, _m, _s, _ctrl, _n = cmd_path(facts, index, mcall['caller'],
+                                             t_name, False, False)
+        checker.check(ctrl_f is True,
+                      'AC-56 control: the same path exists on unmutated facts')
     finally:
         _rmtree(root)
         _rmtree(tmp)
