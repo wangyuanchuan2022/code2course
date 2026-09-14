@@ -636,7 +636,7 @@ document.querySelectorAll('.translate-pair').forEach(pair => {
 </div>
 ```
 
-### 14a. 数据契约（闭集：nodes 与 links 之外不引入新键）
+### 14a. 数据契约（逐字段闭集：键集以下两表为准，nodes 与 links 之外不引入新键）
 
 `nodes[]`（必填）：
 
@@ -647,6 +647,8 @@ document.querySelectorAll('.translate-pair').forEach(pair => {
 | `kind` | enum | `function` / `method` / `class` / `module` / `file` / `entry`（决定 glyph 与分组色） |
 | `file` | string | POSIX 相对路径（**必填**，指向真实仓库文件） |
 | `line` | int ≥1 | 声明行（**必填**）——调用图不允许无出处的节点 |
+| `about` | string ≤60 字 | 可选。**课程作者综述**——这个符号在这门课里承担什么。综述要么可指回依据（给出对应 `file:line`），要么明确是作者的概括，不许冒充源码事实。空串/超长由 `validate_course.py` 检查 16 报错 |
+| `call` | string ≤80 字 | 可选。**结构事实**——调用关系的概括；其中每个调用关系必须能在 `links[]` 或结构事实的 `calls[]` 里找到对应边（禁止写出源码里查不到的调用）。`call` 优先由 facts 的 `calls[]` 按 (caller,callee) 聚合派生 |
 
 `links[]`（必填）：
 
@@ -656,8 +658,10 @@ document.querySelectorAll('.translate-pair').forEach(pair => {
 | `count` | int ≥1 | 该边承载的调用点数（缺省 1），决定线宽 |
 | `confidence` | enum | **闭集** `verified`（实锤，带 file:line 的确定调用）/ `inferred`（推断）；**缺省即为非法**——诚实边不允许含糊 |
 | `file` / `line` | string / int | 发起调用的那一行（`verified` **必须给**；`inferred` 给最可能的依据行或省略 `line`） |
+| `declared` | int | 可选。这条边的"声明深度"权重，来自结构事实的 import/调用层数；覆盖率 ≥40% 才作为分层基准，否则回落 `count` 并在事实面板显式声明降级 |
+| `back` | bool | 可选。显式声明为回边，一般由算法自动判定，无需手写 |
 
-布局相关（可选，缺省由算法算）：`declared`（int，链接的"声明深度"权重，来自结构事实的 import/调用层数，覆盖率 ≥40% 才作为分层基准，否则回落 `count` 并在事实面板显式声明降级）、`back`（bool，显式声明为回边，一般由算法自动判定，无需手写）。
+`about` / `call` 只属于**节点**：不允许写在 `links[]` 上——边可能成倍于节点，且"这条边为什么存在"本就该写在节点的 `about` 里；写错位置校验器直接报错。
 
 ### 14b. 布局与渲染（引擎内建，确定性）
 
@@ -667,7 +671,7 @@ document.querySelectorAll('.translate-pair').forEach(pair => {
 - **线宽**：`min(6, 1 + log2(count) × 0.7)`——承载 700 个调用点的边明显更粗，但不会粗一百倍
 - **线型 = 置信度**：`verified` 实线、`inferred` 虚线、回边强调色虚线
 - **确定性**：同一份 JSON 必然产出同一张图（不依赖时间、随机数、DOM 测量顺序）
-- **交互**：悬停/聚焦节点 → 高亮它的所有边、淡化其余；悬停连线 → 事实面板显示 `from → to`、调用点数、置信度、`file:line`（**边从调用行长出来**）；节点可 Tab 聚焦，聚焦等同悬停；长标签截断为 `…`，全名保留在 `title` 与事实面板里，不丢信息
+- **交互**：悬停/聚焦节点 → 高亮它的所有边、淡化其余；悬停连线 → 事实面板显示 `from → to`、调用点数、置信度、`file:line`（**边从调用行长出来**）；节点可 Tab 聚焦，聚焦等同悬停；长标签截断为 `…`，全名保留在 `title` 与事实面板里，不丢信息；节点事实为多行（首行结构信息，其后为 `作用：`／`调用：`），空闲态声明分层依据与「未画」清单（自环／截断／同名疑义边，零项不出现）——面板样式必须保留换行（`.callgraph-facts` 的 `white-space: pre-line`，行高 1.55）
 
 ### 14c. 状态类与分工
 

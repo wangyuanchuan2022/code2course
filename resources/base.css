@@ -1013,6 +1013,7 @@ fieldset.fork-param { border: 1px dashed var(--border);
 .callgraph-facts {
   margin-top: var(--space-2); min-height: 1.6em;
   font-family: var(--font-mono); font-size: 0.82rem;
+  white-space: pre-line; line-height: 1.55;
 }
 /* 边：默认细墨线；置信度决定线型（inferred 与回边都是虚线） */
 .cg-edge { stroke: var(--text-muted);

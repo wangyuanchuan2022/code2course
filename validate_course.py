@@ -40,7 +40,9 @@ validate_course.py — code2course 成品课程机械校验（零依赖，Python
   16. 调用图数据块（.callgraph-data，规格 callgraph-block-v1.13.1 §7）：
       每个 link 有 from/to/confidence 且 confidence ∈ {verified, inferred}、
       from/to 命中 nodes[].id、无自环；verified link 必须有 file 与 line；
-      每个 node 必须有 file 与 line（调用图不允许无出处的节点）
+      每个 node 必须有 file 与 line（调用图不允许无出处的节点）；
+      节点可选键 about/call：只允许出现在 nodes[]（links[] 出现即错）、
+      出现即必须是非空字符串且限长（about ≤60 字、call ≤80 字）
 
 退出码：发现 ERROR 非零退出（=1），仅 WARNING 时退出 0。
 """
@@ -371,6 +373,10 @@ def trace_id_check(why_texts, known_ids, errors):
 
 # ---- 16. 调用图数据块契约（规格 callgraph-block-v1.13.1 §7） ----
 CG_CONFIDENCE = ('verified', 'inferred')
+# about/call：节点级可选键（v1.13.4 前提，规格 §14a）。只许挂在 nodes[] 上，
+# 出现即必须是有内容的字符串且有长度上限——事实面板一行放不下超长综述。
+CG_ABOUT_MAX = 60   # 字
+CG_CALL_MAX = 80    # 字
 
 
 def _cg_str(v):
@@ -383,11 +389,12 @@ def _cg_int(v):
 
 
 def callgraph_check(data, where, errors, warnings=None):
-    """调用图数据契约机检（规格 §7 四条）。
+    """调用图数据契约机检（规格 §7 四条 + v1.13.4 前提的 about/call 三检）。
 
     每条独立成错、各自定位到具体节点/连线，便于"注入必红"逐条命中：
     坏 JSON 在 json.loads 处即返回（不落到这里）；缺 confidence、verified
-    缺 line、node 缺 file 三种注入各只命中一条。
+    缺 line、node 缺 file、about 空串、about 超长、about 挂到 links 上
+    六种注入各只命中对应那一条。
     """
     if not isinstance(data, dict):
         errors.append('%s 顶层必须是对象（含 nodes/links）' % where)
@@ -423,11 +430,32 @@ def callgraph_check(data, where, errors, warnings=None):
         if not _cg_int(n.get('line')):
             errors.append('%s 调用图节点「%s」缺 line（或不是 ≥1 的整数）'
                           % (where, who))
+        # 5. about / call（v1.13.4 前提）：可选键，出现即必须是非空字符串
+        #    且限长（about ≤60 / call ≤80）；逐节点定位，缺谁报谁
+        for key, cap in (('about', CG_ABOUT_MAX), ('call', CG_CALL_MAX)):
+            if key not in n:
+                continue
+            v = n[key]
+            if not isinstance(v, str) or not v.strip():
+                errors.append('%s 调用图节点「%s」的 %s 不是非空字符串'
+                              '（可选键：要么不写，写就写有内容的）'
+                              % (where, who, key))
+            elif len(v) > cap:
+                errors.append('%s 调用图节点「%s」的 %s 超长（%d 字 > 上限 %d 字'
+                              '——事实面板一行放不下，综述请精简）'
+                              % (where, who, key, len(v), cap))
 
     for i, e in enumerate(links, 1):
         if not isinstance(e, dict):
             errors.append('%s links[%d] 不是对象' % (where, i))
             continue
+        # 6. about / call 是节点级字段：不允许挂在 links[] 上（防载荷膨胀——
+        #    边可能成倍于节点，且边的「作用」本就是节点 about 的内容）
+        for key in ('about', 'call'):
+            if key in e:
+                errors.append('%s 调用图 links[%d] 出现了 %s'
+                              '（about/call 只允许出现在 nodes[] 的节点上）'
+                              % (where, i, key))
         # 2. from / to / confidence 三者齐全且合法
         for k in ('from', 'to', 'confidence'):
             if not _cg_str(e.get(k)):

@@ -1780,6 +1780,9 @@
   function cgLayout(data) {
     var cmpStr = function (a, b) { return a < b ? -1 : (a > b ? 1 : 0); };
     var nodes = Object.create(null), order = [];
+    /* 降级声明计数（v1.13.4 前提）：没画什么必须说出来，不许静默——
+       自环被丢弃数、标签截断数、两端末段名相同的疑义边数（事实面板用） */
+    var cutCount = 0, droppedSelfLoops = 0, sameTailCount = 0;
     (data.nodes || []).forEach(function (n) {
       if (!n || typeof n.id !== 'string' || !n.id) return;
       if (nodes[n.id]) return;                 /* 重复 id：以首个为准（确定性） */
@@ -1787,6 +1790,7 @@
       var w = Math.max(CG_MIN_COL_W,
                        Math.min(CG_MAX_COL_W, cgTextW(label) + CG_GLYPH_COL + 14));
       var el = cgElide(label, w - CG_GLYPH_COL - 14);
+      if (el.cut) cutCount++;
       nodes[n.id] = {
         id: n.id, label: label, text: el.text, cut: el.cut,
         kind: (typeof n.kind === 'string') ? n.kind : '',
@@ -1801,7 +1805,9 @@
     (data.links || []).forEach(function (l) {
       if (!l || typeof l.from !== 'string' || typeof l.to !== 'string') return;
       if (!nodes[l.from] || !nodes[l.to]) return;   /* 端点不存在：渲染器跳过，校验器报错 */
-      if (l.from === l.to) return;                  /* 自环禁止（规格 §2） */
+      if (l.from === l.to) { droppedSelfLoops++; return; }   /* 自环禁止（规格 §2）：不画，但计入事实面板的「未画」声明 */
+      var ft = l.from.split('.'), tt = l.to.split('.');
+      if (ft[ft.length - 1] === tt[tt.length - 1]) sameTailCount++;
       var rec = {
         i: links.length, from: l.from, to: l.to,
         count: (typeof l.count === 'number' && l.count >= 1) ? l.count : 1,
@@ -1960,6 +1966,8 @@
       nodes: nodes, order: order, links: links, rows: rows, layer: layer,
       mode: mode, layerCount: layerCount,
       declared: declaredLinks.length, total: links.length,
+      cutCount: cutCount, droppedSelfLoops: droppedSelfLoops,
+      sameTailCount: sameTailCount,
       vbw: cgNum(contentWidth + CG_PADDING * 2),
       vbh: cgNum(layerCount * pitch - CG_LAYER_GAP + CG_PADDING * 2)
     };
@@ -2094,7 +2102,23 @@
          ? '⚠ 无声明深度（declared 覆盖 ' + cov + ' < 40%）：按调用点数决定回边方向'
          : '⚠ 无声明深度也无调用点数（declared 覆盖 ' + cov + '）：按调用结构分层');
     function setFacts(t) { if (facts) facts.textContent = t; }
-    function idleFacts() { setFacts((hint ? hint + ' · ' : '') + modeNote); }
+    /* 多句拼接（分行显示靠 .callgraph-facts 的 white-space: pre-line）：
+       提示一句 + 分层依据一句 + 「未画」清单一句；数量为 0 的项不出现，
+       全零时整句不出现（照 CodeGraph MapKey 的省略逐条成句纪律） */
+    function idleFacts() {
+      var lines = [];
+      if (hint) lines.push(hint);
+      lines.push(modeNote);
+      var omitted = [];
+      if (G.droppedSelfLoops > 0)
+        omitted.push(G.droppedSelfLoops + ' 条自环（递归请见栈塔）');
+      if (G.cutCount > 0)
+        omitted.push(G.cutCount + ' 个标签已截断（全名见 title）');
+      if (G.sameTailCount > 0)
+        omitted.push(G.sameTailCount + ' 条同名疑义边（请人工核对）');
+      if (omitted.length) lines.push('未画：' + omitted.join('／'));
+      setFacts(lines.join('\n'));
+    }
 
     /* --- 高亮/淡化：状态类 .is-cg-hot / .is-cg-dim，与探照灯 .is-spot 严格分离 --- */
     function paint(sel) {
