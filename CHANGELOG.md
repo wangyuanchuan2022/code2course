@@ -3,6 +3,22 @@
 本文件记录 code2course 技能包的版本变更（[Keep-a-Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 格式）。
 版本号唯一事实来源：SKILL.md frontmatter `version`；resources 三件套头部 `@version` 与此同步。
 
+## [1.15.0] — 2026-09-15
+
+测试架构重构批次：selftest 与主文件分离 + 真实代码语料设施 + 覆盖率测量协议修正。selftest 371 断言三路全绿（tests 直跑 / `--selftest` 转发 / 拆分前基线）。
+
+### Changed（breaking）
+
+- **测试与主文件分离**：analyze_structure.py 内嵌 selftest（2466 行：fixture 54 常量 + SelftestChecker + run_selftest）整体拆至 `tests/test_analyze_structure.py`——机械切片逐字保真（零人工转录，边界锚点 fail-loud），70 个生产耦合符号以解包块显式登记 + hasattr 哑门防漂移（缺名 AttributeError 响亮失败）；主文件 6110 → 3661 行；`--selftest` 保留为兼容转发入口（subprocess 跑 tests，文件缺失 fail-loud exit 2）。**技能包不再单文件自含测试**——`--selftest` 需 tests/test_analyze_structure.py 在位。
+
+### Added
+
+- **真实代码语料设施**：`tests/corpus/fetch_corpus.py`（零依赖一键下载：幂等 / --force / --only / --skip-smoke，重试上限 2，走本机代理）+ `tests/corpus/CORPUS.md` 清单。14 门语言真实仓库（python=click 6.7 / js=express 4.0.0 / ts=ts-node 9.1.1 / go=gin v1.1 / rust=anyhow 1.0.20 / java=javapoet 1.0.0 / c=jq 1.4 / cpp=fmt 3.0.2 / csharp=Humanizer 1.0.0 / ruby=sinatra 1.2.0 / lua=lapis 1.0.0 / php=monolog 1.10.0 / kotlin=mockito-kotlin 2.0.0 / swift=Alamofire 4.7.3）——全部 MIT/BSD/Apache、全部 <300KB、钉 ref；analyze 冒烟 14/14（68.2s）。语料本体 .gitignore 不入库（避免第三方许可负担），fetch 脚本一键还原。
+
+### Fixed
+
+- **撤回 v1.14.1 批次报告中的覆盖率误报**：stdlib trace 对含深递归探针（deep_nest，1500 层属性链）的套件测量时，trace 回调自身收到 RecursionError 后被 CPython 静默摘除线程 tracer（sys.gettrace() 翻 None），此后全部行事件丢失——此前报告的「语句覆盖 37.2%」「has_generated_header 逐行判定区 0 次执行（43 次调用全被快速拒绝短路、只被 SMOKE 背书）」均为测量假象。真实数字（互补双跑合并口径，merge_trace.py）：语句覆盖 **84.9%**（1675/1974）、has_generated_header 逐行区 28/29（97%）循环体全命中——selftest 覆盖充足，无需补测。五步探针取证链存档 `agent-out/b5-c/`。覆盖率工具配方新增：tracer 存活校验 + 互补双跑合并；口径边界沿用（trace 不跨进程）。
+
 ## [1.14.1] — 2026-09-14
 
 批次 4 技术债三笔（终局核验移交项全处置）。selftest 364→371 断言（+7 条 banner v2 断言）；负向回归五套 66 用例（cg_validate 8→10，新增文件级 id 形态守卫正反用例）；ENGINE_VERSION 1→2（generated 取值分布变化，旧 facts 建议重跑 analyze）。

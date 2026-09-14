@@ -4,3 +4,8 @@ example/
 # Python 字节码
 __pycache__/
 *.pyc
+
+# 真实代码语料：语料本体不入库（第三方许可负担），仅 fetch 脚本与清单入库，可一键还原
+tests/corpus/*
+!tests/corpus/fetch_corpus.py
+!tests/corpus/CORPUS.md
