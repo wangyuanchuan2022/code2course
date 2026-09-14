@@ -3,6 +3,16 @@
 本文件记录 code2course 技能包的版本变更（[Keep-a-Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 格式）。
 版本号唯一事实来源：SKILL.md frontmatter `version`；resources 三件套头部 `@version` 与此同步。
 
+## [1.12.0] — 2026-09-14
+
+本版本来自外部项目调研（colbymchenry/codegraph 借鉴分析，报告在仓库外 codegraph-analysis/）：把"结构事实的诚实性"从数字溯源扩展到调用链溯源。
+
+### Added
+
+- **调用边溯源与"推断"标注**（workflow §3a 新增两条 + quality-gates 陷阱 37/38 + 新验收项 + SKILL.md constraints）：跨文件调用边锚定「文件 + 行号」；凭命名/导入推测、未核实的调用关系显式标"推断"，禁止画成实锤
+- **半流程禁令**（workflow §3a + quality-gates 陷阱 38）：流程链开讲必闭环到数据落点；静态追不到的环节（动态分派/回调注册/事件总线）如实讲断点断因，禁止只演前半段让读者脑补或硬编不存在的边
+- **调用链走读设计基准**（interactive-elements §3 新增小节）：源码行即坐标系（禁力导向/随机布点）、边从调用行长出来（站点标注到行号粒度）、诚实边（线型=置信度）、长函数窗口化（&gt;80 行折叠为"调用点 ±4 行"窗口并注明省略位置）
+
 ## [1.11.2] — 2025-12-21
 
 本版本来自第二轮评审（六角度审视成品课件 `example/course/`，报告在仓库外 review2/，交叉汇总见其 00 号文档）：17 条改进项全部落地。
