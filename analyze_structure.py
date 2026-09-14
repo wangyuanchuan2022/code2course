@@ -676,7 +676,10 @@ LANG_TABLES = {
         'line_comment': ('--',),
         'block_comment': (('--[[', ']]'),),
         'strings': (('"', '"', 'escape'), ("'", "'", ''), ('[[', ']]', 'multiline')),
-        'open_kw': ('function', 'if', 'for', 'while', 'do', 'repeat'),
+        # P1-7：for/while 语法必需的 `do` 恰好开一个块（同线/换行/standalone do
+        # 三形态都正确）；for/while 自身不再计入开块，否则 do 双重计数 → 含循环
+        # 函数系统性 end_line=null。
+        'open_kw': ('function', 'if', 'do', 'repeat'),
         'open_kw_line_start': (),
         'close_kw': ('end', 'until'),
         'decl': (
@@ -1045,40 +1048,48 @@ def analyze_python(root, rel, data, text, symbols, imports, entry_points, warnin
     except (SyntaxError, ValueError, RecursionError) as exc:
         return [], '%s: %s' % (type(exc).__name__, exc)
     calls_raw = []
-    for stmt in tree.body:
-        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            add_symbol(symbols, stmt.name, stmt.name, K_FUNCTION, rel, stmt, src_lines)
-            for dec in stmt.decorator_list:
-                collect_calls(dec, None, calls_raw)
-            for expr in default_exprs(stmt.args):
-                collect_calls(expr, None, calls_raw)
-            for child in stmt.body:
-                collect_calls(child, stmt.name, calls_raw)
-        elif isinstance(stmt, ast.ClassDef):
-            walk_class(stmt, '', symbols, calls_raw, rel, src_lines)
-        elif isinstance(stmt, ast.Assign):
-            kind = K_FUNCTION if isinstance(stmt.value, ast.Lambda) else K_CONSTANT
-            for name in assign_names(stmt.targets):
-                add_symbol(symbols, name, name, kind, rel, stmt, src_lines)
-            if stmt.value is not None:
-                collect_calls(stmt.value, None, calls_raw)
-        elif isinstance(stmt, ast.AnnAssign):
-            if isinstance(stmt.target, ast.Name):
+    try:
+        for stmt in tree.body:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                add_symbol(symbols, stmt.name, stmt.name, K_FUNCTION, rel, stmt, src_lines)
+                for dec in stmt.decorator_list:
+                    collect_calls(dec, None, calls_raw)
+                for expr in default_exprs(stmt.args):
+                    collect_calls(expr, None, calls_raw)
+                for child in stmt.body:
+                    collect_calls(child, stmt.name, calls_raw)
+            elif isinstance(stmt, ast.ClassDef):
+                walk_class(stmt, '', symbols, calls_raw, rel, src_lines)
+            elif isinstance(stmt, ast.Assign):
                 kind = K_FUNCTION if isinstance(stmt.value, ast.Lambda) else K_CONSTANT
-                add_symbol(symbols, stmt.target.id, stmt.target.id, kind, rel, stmt, src_lines)
-            if stmt.value is not None:
-                collect_calls(stmt.value, None, calls_raw)
-        else:
-            collect_calls(stmt, None, calls_raw)
-        if isinstance(stmt, ast.If) and is_main_guard(stmt.test):
-            entry_points.append({
-                'kind': EP_MAIN_GUARD, 'file': rel, 'line': stmt.lineno,
-                'evidence': _line_at(src_lines, stmt.lineno),
-                'confidence': CONF_VERIFIED,
-            })
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            imports.extend(python_import_edges(root, rel, node, src_lines))
+                for name in assign_names(stmt.targets):
+                    add_symbol(symbols, name, name, kind, rel, stmt, src_lines)
+                if stmt.value is not None:
+                    collect_calls(stmt.value, None, calls_raw)
+            elif isinstance(stmt, ast.AnnAssign):
+                if isinstance(stmt.target, ast.Name):
+                    kind = K_FUNCTION if isinstance(stmt.value, ast.Lambda) else K_CONSTANT
+                    add_symbol(symbols, stmt.target.id, stmt.target.id, kind, rel, stmt, src_lines)
+                if stmt.value is not None:
+                    collect_calls(stmt.value, None, calls_raw)
+            else:
+                collect_calls(stmt, None, calls_raw)
+            if isinstance(stmt, ast.If) and is_main_guard(stmt.test):
+                entry_points.append({
+                    'kind': EP_MAIN_GUARD, 'file': rel, 'line': stmt.lineno,
+                    'evidence': _line_at(src_lines, stmt.lineno),
+                    'confidence': CONF_VERIFIED,
+                })
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                imports.extend(python_import_edges(root, rel, node, src_lines))
+    except RecursionError:
+        # P1-3：深嵌套合法文件（超长属性链/加法链）ast.parse 能过、遍历递归爆栈
+        # ——单文件隔离（F1）：按 parse-error 优雅降级，不牵连整仓。截断前已
+        # 提取的符号/入口如实保留，该文件调用/import 边跳过。
+        return [], ('RecursionError: AST traversal exceeded the recursion '
+                    'limit; per-file isolation (calls/imports of this file '
+                    'skipped)')
     return calls_raw, None
 
 
@@ -1419,6 +1430,14 @@ _LISTEN_RE = re.compile(r'\b[A-Za-z_$][\w$]*\s*\.\s*listen\s*\(')
 _JS_EXTS = ('.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx')
 
 
+def _escapes_root(root, parts, ext):
+    """候选绝对路径（解析 `..` 后）是否落在仓库根之外。P1-2：命中仓库外文件
+    一律不产 verified 边（external+inferred），与 F6.4「命中仓库内→verified」
+    及 Python 引擎的根闭包口径对齐。"""
+    abs_p = os.path.abspath(os.path.join(root, *parts) + ext)
+    return not (abs_p == root or abs_p.startswith(root + os.sep))
+
+
 def _fs_exists(root, parts, suffix):
     path = os.path.join(root, *parts) + suffix
     return os.path.isfile(path)
@@ -1451,14 +1470,34 @@ def resolve_import(resolver, root, rel, spec):
     if resolver == 'js':
         if spec.startswith('.'):
             d = rel.split('/')[:-1]
+            ext = os.path.splitext(spec)[1].lower()
+            parts = tuple(part for part in spec.split('/')
+                          if part not in ('', '.'))
             for base in (tuple(d), ()):
-                cand = base + tuple(spec.split('/'))
-                for ext in _JS_EXTS:
-                    if _fs_exists(root, cand, ext):
-                        return _rel_posix(root, os.path.join(root, *cand)) + ext, True, False, False
-                    if _fs_exists(root, cand + ('index',), ext):
-                        return _rel_posix(root, os.path.join(root, *(cand + ('index',)))) + ext, True, False, False
-        return None, False, True, False        # bare specifier → inferred + external
+                cand = base + parts
+                if ext in _JS_EXTS:
+                    # P1-1：已带受支持扩展名 → 按精确路径探测（不再拼扩展名链，
+                    # `./app.js` 不再因 `app.js.js` 永不命中而误判 external）
+                    if _fs_exists(root, cand, '') \
+                            and not _escapes_root(root, cand, ''):
+                        return _rel_posix(root, os.path.join(root, *cand)), \
+                            True, False, False
+                else:
+                    for je in _JS_EXTS:
+                        if _fs_exists(root, cand, je) \
+                                and not _escapes_root(root, cand, je):
+                            return _rel_posix(root,
+                                              os.path.join(root, *cand)) \
+                                + je, True, False, False
+                        if _fs_exists(root, cand + ('index',), je) \
+                                and not _escapes_root(root, cand + ('index',),
+                                                      je):
+                            return _rel_posix(root,
+                                              os.path.join(root,
+                                                           *(cand
+                                                             + ('index',)))) \
+                                + je, True, False, False
+        return None, False, True, False        # bare / 逃逸仓库根 → inferred + external
     if resolver == 'js_dynamic':
         return None, False, True, True         # 动态形态 → inferred + dynamic
     if resolver == 'c_quote':
@@ -1510,19 +1549,22 @@ def resolve_import(resolver, root, rel, spec):
         d = rel.split('/')[:-1]
         for base in (tuple(d), ()):
             cand = base + tuple(part for part in spec.split('/') if part not in ('', '.'))
-            if _fs_exists(root, cand, ''):
+            if _fs_exists(root, cand, '') and not _escapes_root(root, cand, ''):
                 return _rel_posix(root, os.path.join(root, *cand)), True, False, False
         return None, False, True, False
     if resolver == 'ruby_rel':
         d = rel.split('/')[:-1]
         cand = tuple(d) + tuple(spec.split('/'))
         if _fs_exists(root, cand, '.rb'):
+            if _escapes_root(root, cand, '.rb'):
+                return None, False, True, False   # P1-2 逃逸仓库根：external+inferred
             return _rel_posix(root, os.path.join(root, *cand)) + '.rb', True, False, False
         return None, False, False, False
     if resolver == 'ruby':
         d = tuple(rel.split('/')[:-1])
         while True:
-            if _fs_exists(root, d + (spec,), '.rb'):
+            if _fs_exists(root, d + (spec,), '.rb') \
+                    and not _escapes_root(root, d + (spec,), '.rb'):
                 return _rel_posix(root, os.path.join(root, *(d + (spec,)))) + '.rb', True, False, False
             if not d:
                 break
@@ -2836,6 +2878,7 @@ def should_not_appear():
 
 FIXTURE_JS = '''\
 import { helper } from './helper';
+import { helper2 } from './helper.js';
 import React from 'react';
 const reg = /}.*{/g;
 
@@ -3184,6 +3227,15 @@ end
 local function lx2(n)
   return n + 1
 end
+
+function M.loopy(items)
+  for _, it in ipairs(items) do
+    print(it)
+  end
+  while #items > 0 do
+    print('drain')
+  end
+end
 '''
 
 FIXTURE_LUA_HELPER = '''\
@@ -3368,6 +3420,11 @@ def run_selftest():
     tmp, root = _fixture_root()
     try:
         _materialize_fixture(root)
+        # P1-3 深嵌套探针文件（程序化生成，勿在 fixture 文本硬写巨串）：
+        # ast.parse 可过、collect_calls 递归爆栈的真实形态。
+        with open(os.path.join(root, 'src', 'deep_nest.py'), 'w',
+                  encoding='utf-8') as dh:
+            dh.write('x = ' + 'a.' * 1500 + 'b\n')
         facts = build_facts(root)
         again = build_facts(root)
         excluded = build_facts(root, extra_excludes=['docs'])
@@ -3525,13 +3582,18 @@ def run_selftest():
                       and script[0]['confidence'] == 'verified',
                       'F6.6 console-script via section scan (no TOML library)')
 
-        # --- 单文件解析失败不牵连（F1）---
+        # --- 单文件解析失败不牵连（F1）+ P1-3 深嵌套隔离 ---
         bad = [r for r in facts['files'] if r['path'] == 'src/bad.py']
-        parse_warns = [w for w in facts['warnings'] if w['kind'] == 'parse-error']
+        bad_warns = [w for w in facts['warnings']
+                     if w['kind'] == 'parse-error' and w['file'] == 'src/bad.py']
+        deep_files = [r for r in facts['files']
+                      if r['path'] == 'src/deep_nest.py']
         checker.check(len(bad) == 1 and bad[0]['parse_error']
-                      and len(parse_warns) == 1
-                      and facts['counts']['parse_errors'] == 1,
-                      'F1 parse failure -> warning + parse_error, others unaffected')
+                      and len(bad_warns) == 1
+                      and len(deep_files) == 1 and deep_files[0]['parse_error']
+                      and facts['counts']['parse_errors'] == 2,
+                      'F1 parse failure + P1 deep-nest isolation: per-file '
+                      'parse_error/warning, others unaffected')
 
         # --- AC-28 逐目录探针负例（四个清单零出现）---
         for name in PROBE_DIR_NAMES:
@@ -3551,9 +3613,9 @@ def run_selftest():
         # ============ 1b：多语言矩阵断言（数据表驱动——R9 缓解：加语言=加一行）============
         EXPECT_SYMBOLS = (
             ('python', 'compute_total', 'function', 8, 11),
-            ('javascript', 'greet', 'function', 5, 10),
-            ('javascript', 'Greeter', 'class', 12, 17),
-            ('javascript', 'Greeter.hello', 'method', 13, 16),
+            ('javascript', 'greet', 'function', 6, 11),
+            ('javascript', 'Greeter', 'class', 13, 18),
+            ('javascript', 'Greeter.hello', 'method', 14, 17),
             ('typescript', 'Config', 'interface', 3, 5),
             ('typescript', 'Alias', 'type_alias', 7, 7),
             ('typescript', 'Mode', 'enum', 9, 9),
@@ -3614,6 +3676,7 @@ def run_selftest():
             ('dart', 'main', 'function', 17, 20),
             ('lua', 'M.shout', 'method', 5, 8),
             ('lua', 'lx2', 'function', 10, 12),
+            ('lua', 'M.loopy', 'method', 14, 21),
             ('lua', 'LIMIT', 'variable', 3, 3),
         )
         sym_langs = set()
@@ -3645,7 +3708,8 @@ def run_selftest():
             ('src/core.py', 3, 'src/helper.py', 'verified', False),
             ('src/core.py', 2, 'os', 'inferred', True),
             ('langs/hello.js', 1, 'langs/helper.js', 'verified', False),
-            ('langs/hello.js', 2, 'react', 'inferred', True),
+            ('langs/hello.js', 2, 'langs/helper.js', 'verified', False),
+            ('langs/hello.js', 3, 'react', 'inferred', True),
             ('langs/Main.java', 3, 'com/example/Util.java', 'verified', False),
             ('langs/main.c', 1, 'langs/header.h', 'verified', False),
             ('langs/main.c', 2, 'stdio.h', 'inferred', True),
@@ -3757,6 +3821,55 @@ def run_selftest():
                       'P0 resolver branch coverage: every table resolver '
                       'directly probed, no stray probes (%d direct branches)'
                       % len(probed))
+
+        # P1-2 逃逸闭包探针：仓库根 = out/，`../shared/` 真实存在于仓库根外
+        # ——`../` 相对导入一律 external+inferred（永不 verified）；仓内控制组
+        # 仍 verified。
+        esc_repo = os.path.join(os.path.dirname(root), 'escape-probe', 'out')
+        os.makedirs(esc_repo, exist_ok=True)
+        os.makedirs(os.path.join(os.path.dirname(esc_repo), 'shared'),
+                    exist_ok=True)
+        open(os.path.join(esc_repo, 'a.js'), 'w',
+             encoding='utf-8').write('import { u } from "../shared/util";\n')
+        open(os.path.join(esc_repo, 'a.dart'), 'w',
+             encoding='utf-8').write("import '../shared/util.dart';\n")
+        open(os.path.join(esc_repo, 'a.rb'), 'w',
+             encoding='utf-8').write("require_relative '../shared/helper'\n")
+        open(os.path.join(esc_repo, 'self.js'), 'w',
+             encoding='utf-8').write('const self = 1;\n')
+        open(os.path.join(os.path.dirname(esc_repo), 'shared', 'util.js'),
+             'w', encoding='utf-8').write('export const u = 1;\n')
+        open(os.path.join(os.path.dirname(esc_repo), 'shared', 'util.dart'),
+             'w', encoding='utf-8').write('const u = 1;\n')
+        open(os.path.join(os.path.dirname(esc_repo), 'shared', 'helper.rb'),
+             'w', encoding='utf-8').write('def u_helper(x)\n  x\nend\n')
+        esc_cases = (
+            ('js', 'a.js', '../shared/util'),
+            ('js', 'a.js', '../shared/util.js'),
+            ('path', 'a.dart', '../shared/util.dart'),
+            ('ruby_rel', 'a.rb', '../shared/helper'),
+            ('ruby', 'a.rb', '../shared/helper'),
+        )
+        for resolver, rel, spec in esc_cases:
+            got = resolve_import(resolver, esc_repo, rel, spec)
+            checker.check(got == (None, False, True, False),
+                          'P1 escape blocked: %s %r -> inferred+external '
+                          '(got %r)' % (resolver, spec, got))
+        got = resolve_import('js', esc_repo, 'a.js', './self')
+        checker.check(got == ('self.js', True, False, False),
+                      'P1 in-root control still verified (got %r)' % (got,))
+
+        # P1-3 深嵌套隔离断言：该文件 parse-error 优雅降级、其余文件照常
+        deep_errs = [w for w in facts['warnings']
+                     if w['file'] == 'src/deep_nest.py'
+                     and w['kind'] == 'parse-error']
+        checker.check(
+            len(deep_errs) == 1 and 'RecursionError' in deep_errs[0]['message'],
+            'P1 deep-nested file degrades to per-file parse-error warning')
+        checker.check('src/deep_nest.py' in [r['path'] for r in facts['files']],
+                      'P1 deep-nest file still inventoried')
+        checker.check(_find_symbol(facts, 'compute_total') is not None,
+                      'P1 deep-nested file does not taint the rest of the repo')
 
         # AC-25：入口点八类各 ≥1（F-a：多 manifest 各自产条目，evidence 带相对路径）
         entry_kinds = set(e['kind'] for e in facts['entry_points'])

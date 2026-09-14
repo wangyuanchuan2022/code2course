@@ -13,7 +13,7 @@
 - **16 门 Tier-1 语言三引擎**：python 走 ast 确定性提取，其余 15 门走表驱动启发式（brace/end 双引擎）；token 模式校准自 Pygments 2.21.0（BSD-2-Clause）lexer，出处注记见脚本 docstring（https://pygments.org/docs/lexers/）
 - **kind / 语言闭集契约**：符号类型、extractor、入口点 kind 等枚举闭集随 schema_version=2 冻结，只增不改名
 - **MD 断点清单**：底稿新增「断点清单（Where the graph stops）」小节，逐条列出推断边及其调用点
-- **自测 ≥60 断言**：`--selftest` 内联多语言 fixture 自证，当前 216 条（语言矩阵/查询层/确定性/边诚实性/负例含注入必红）
+- **自测 ≥60 断言**：`--selftest` 内联多语言 fixture 自证（语言矩阵/查询层/确定性/边诚实性/负例含注入必红），断言总数以每次运行的实时统计行为准，不在文档写死具体数字
 - **workflow §3 可选辅助段落**（只增不改）：底稿 + 查询用法，明确「可选的加速器，不是替代品——手工读码仍完全合法；底稿与源码冲突时以源码为准」
 - **README 文件结构表**新增 `analyze_structure.py` 条目
 - 示例课件重拼（随安装副本同步后执行，见发布检查项）
