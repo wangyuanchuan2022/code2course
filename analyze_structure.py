@@ -1520,7 +1520,7 @@ def resolve_import(resolver, root, rel, spec):
             return _rel_posix(root, os.path.join(root, *cand)) + '.rb', True, False, False
         return None, False, False, False
     if resolver == 'ruby':
-        d = rel.split('/')[:-1]
+        d = tuple(rel.split('/')[:-1])
         while True:
             if _fs_exists(root, d + (spec,), '.rb'):
                 return _rel_posix(root, os.path.join(root, *(d + (spec,)))) + '.rb', True, False, False
@@ -3055,6 +3055,8 @@ FIXTURE_PHP_CFG = '<?php\n// config\n'
 
 FIXTURE_RUBY = '''\
 require_relative 'rhelper'
+require 'rhelper'
+require 'no_such_ruby_gem'
 
 module Greet
   SIZE = 10
@@ -3586,11 +3588,11 @@ def run_selftest():
             ('php', 'shout', 'function', 7, 9),
             ('php', 'Echo', 'class', 15, 19),
             ('php', 'Echo.send', 'method', 16, 18),
-            ('ruby', 'Greet', 'module', 3, 19),
-            ('ruby', 'Greet.SIZE', 'constant', 4, 4),
-            ('ruby', 'Greet.Greeter', 'class', 6, 18),
-            ('ruby', 'Greet.Greeter.initialize', 'method', 7, 9),
-            ('ruby', 'Greet.Greeter.shout', 'method', 11, 17),
+            ('ruby', 'Greet', 'module', 5, 21),
+            ('ruby', 'Greet.SIZE', 'constant', 6, 6),
+            ('ruby', 'Greet.Greeter', 'class', 8, 20),
+            ('ruby', 'Greet.Greeter.initialize', 'method', 9, 11),
+            ('ruby', 'Greet.Greeter.shout', 'method', 13, 19),
             ('kotlin', 'Widget', 'class', 3, 7),
             ('kotlin', 'Widget.render', 'method', 4, 6),
             ('kotlin', 'main', 'function', 9, 12),
@@ -3653,6 +3655,8 @@ def run_selftest():
             ('src/main.rs', 2, 'src/util.rs', 'verified', False),
             ('langs/index.php', 2, 'langs/config.php', 'verified', False),
             ('langs/app.rb', 1, 'langs/rhelper.rb', 'verified', False),
+            ('langs/app.rb', 2, 'langs/rhelper.rb', 'verified', False),
+            ('langs/app.rb', 3, 'no_such_ruby_gem', 'inferred', True),
             ('langs/main.lua', 1, 'langs/lhelper.lua', 'verified', False),
             ('langs/app.ts', 1, 'react', 'inferred', True),
             ('langs/MainWindow.cs', 1, 'System', 'inferred', True),
@@ -3669,6 +3673,90 @@ def run_selftest():
                 imp is not None and imp['target'] == tgt
                 and imp['confidence'] == conf and imp['external'] == ext,
                 'AC-22 import %s:%s -> %s (%s)' % (f, ln, tgt, conf))
+
+        # P0 回归锁（ruby 裸 require 分支，2026-09-14 崩溃修复）：resolved /
+        # evidence 语义断言——可解析裸 require 走逐级上溯命中 verified；不可解析
+        # 保持 inferred + external。
+        bare = imp_index.get(('langs/app.rb', 2))
+        checker.check(
+            bare is not None and bare['target'] == 'langs/rhelper.rb'
+            and bare['confidence'] == CONF_VERIFIED and bare['external'] is False,
+            'P0 ruby bare require resolves via the walked-up branch '
+            '(langs/rhelper.rb, verified)')
+        bare2 = imp_index.get(('langs/app.rb', 3))
+        checker.check(
+            bare2 is not None and bare2['target'] == 'no_such_ruby_gem'
+            and bare2['confidence'] == CONF_INFERRED and bare2['external'] is True,
+            'P0 unresolvable bare require keeps inferred+external semantics')
+
+        # 分支级覆盖表：LANG_TABLES imports 引用的每个 resolver 分支都必须被
+        # 一条最小合成片段探针执行到（防「分支从未被断言执行」——本表由 P0
+        # ruby 漏测事故引入）。go_block 是 analyze_generic 的分发伪 resolver
+        # （内部逐行转调 'go'），由 fixture 管线覆盖（EXPECT_IMPORTS main.go），
+        # 不进直接探针表。
+        RESOLVER_PROBES = (
+            # (resolver, rel, spec, 期望 (target 后缀|None, found, external, dynamic))
+            ('js', 'langs/hello.js', './helper',
+             ('langs/helper.js', True, False, False)),
+            ('js', 'langs/hello.js', 'react', (None, False, True, False)),
+            ('js_dynamic', 'langs/hello.js', 'dyn()',
+             (None, False, True, True)),
+            ('c_quote', 'langs/main.c', 'header.h',
+             ('langs/header.h', True, False, False)),
+            ('c_angle', 'langs/main.c', 'stdio.h', (None, False, True, False)),
+            ('dotfile', 'com/example/Main.java', 'Util',
+             ('com/example/Util.java', True, False, False)),
+            ('dotfile_cs', 'src/X.cs', 'System.Drawing',
+             (None, False, True, False)),
+            ('dotfile_kt', 'langs/main.kt', 'java.util.Locale',
+             (None, False, True, False)),
+            ('dotfile_swift', 'langs/app.swift', 'Foundation',
+             (None, False, True, False)),
+            ('dotfile_scala', 'langs/app.scala', 'scala.math',
+             (None, False, True, False)),
+            ('go', 'langs/main.go', 'fmt', (None, False, True, False)),
+            ('rust', 'src/main.rs', 'crate::util',
+             ('src/util.rs', True, False, False)),
+            ('rust', 'src/main.rs', 'serde_json', (None, False, True, False)),
+            ('php_use', 'langs/index.php', 'App\\Nope',
+             (None, False, True, False)),
+            ('path', 'langs/main.dart', 'dart:math',
+             (None, False, True, False)),
+            ('path', 'langs/main.dart', './nope.dart',
+             (None, False, True, False)),
+            ('ruby_rel', 'langs/app.rb', 'rhelper',
+             ('langs/rhelper.rb', True, False, False)),
+            ('ruby', 'langs/app.rb', 'rhelper',
+             ('langs/rhelper.rb', True, False, False)),
+            ('ruby', 'langs/app.rb', 'no_such_ruby_gem',
+             (None, False, True, False)),
+            ('lua', 'langs/main.lua', 'lhelper',
+             ('langs/lhelper.lua', True, False, False)),
+            ('lua', 'langs/main.lua', 'no_such_mod',
+             (None, False, True, False)),
+        )
+        probed = set()
+        for resolver, rel, spec, expect in RESOLVER_PROBES:
+            got = resolve_import(resolver, root, rel, spec)
+            suffix, p_found, p_ext, p_dyn = expect
+            ok = (got[1] == p_found and got[2] == p_ext and got[3] == p_dyn
+                  and (got[0].endswith(suffix) if suffix else got[0] is None))
+            checker.check(ok,
+                          'P0 resolver probe %s %r -> %r (got %r)'
+                          % (resolver, spec, expect, got))
+            probed.add(resolver)
+        table_resolvers = set()
+        for lang_id in LANG_IDS:
+            tbl = LANG_TABLES.get(lang_id) or {}
+            for _pat, _kind, resolver in tbl.get('imports', ()):
+                table_resolvers.add(resolver)
+        checker.check('go_block' in table_resolvers,
+                      'P0 go_block pseudo-resolver present in tables '
+                      '(pipeline-covered via EXPECT_IMPORTS main.go)')
+        checker.check(table_resolvers - {'go_block'} == probed,
+                      'P0 resolver branch coverage: every table resolver '
+                      'directly probed, no stray probes (%d direct branches)'
+                      % len(probed))
 
         # AC-25：入口点八类各 ≥1（F-a：多 manifest 各自产条目，evidence 带相对路径）
         entry_kinds = set(e['kind'] for e in facts['entry_points'])
