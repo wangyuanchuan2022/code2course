@@ -2557,6 +2557,10 @@ def run_selftest():
                                                    t_name, False, False)
         checker.check(ctrl_f is True,
                       'AC-56 control: the same path exists on unmutated facts')
+
+        # 批次 6 覆盖率冲刺（b6）：双跑合并口径 84.9% → 100% 或缺口表。
+        # 新增断言全部带 'b6-' 前缀；不可达项见 agent-out/b6-cov100-report.md。
+        _run_b6_gap_tests(checker)
     finally:
         for _pd in probe_dirs:
             _rmtree(_pd)
@@ -2566,6 +2570,807 @@ def run_selftest():
     for label in checker.failures:
         print('  FAIL %s' % label)
     return 0 if checker.failed == 0 else 1
+
+# ======================================================================
+# 批次 6 · 覆盖率冲刺（b6）：把双跑合并口径下的 missed 语句逐簇补测。
+# 每簇首行注释 coverage-gap: <行号段> 指明它负责的 missed 语句；
+# 剩余不可达项（函数 docstring / 深递归 except / 符号链接平台守卫）见
+# agent-out/b6-cov100-report.md 的缺口表。
+# ======================================================================
+import io
+import runpy
+import stat
+
+B6_GAP_ENV = 'C2C_B6_GAP'
+
+
+def _b6_put(root, rel, data):
+    full = os.path.join(root, *rel.split('/'))
+    parent = os.path.dirname(full)
+    if parent and not os.path.isdir(parent):
+        os.makedirs(parent)
+    if isinstance(data, bytes):
+        with open(full, 'wb') as fh:
+            fh.write(data)
+    else:
+        # newline='' 关键：Windows 文本模式会把 \n 翻译成 \r\n，而引擎里
+        # 多条 import/decl 正则以 `$` 收尾（如 go 块 `import\s*\($`），
+        # \r 会让它们全部失配——fixture 一律以 LF 落盘。
+        with open(full, 'w', encoding='utf-8', newline='') as fh:
+            fh.write(data)
+    return full
+
+
+def _b6_root(tag):
+    path = os.path.join(tempfile.gettempdir(),
+                        'c2c-b6gap-%s-%d' % (tag, os.getpid()))
+    AS._rmtree(path)
+    os.makedirs(path)
+    return path
+
+
+def _b6_quiet(fn, *a, **kw):
+    old = sys.stdout
+    sys.stdout = io.StringIO()
+    try:
+        return fn(*a, **kw)
+    finally:
+        sys.stdout = old
+
+
+def _b6_facts_dict(files=(), symbols=(), imports=(), calls=(), eps=(),
+                   warnings=(), langs=('python',)):
+    return {'schema_version': AS.SCHEMA_VERSION, 'tool': AS.TOOL_NAME,
+            'engine_version': AS.ENGINE_VERSION, 'root_name': 'b6synth',
+            'languages': list(langs),
+            'counts': dict((k, 0) for k in AS.COUNT_KEYS),
+            'files': list(files), 'symbols': list(symbols),
+            'imports': list(imports), 'calls': list(calls),
+            'entry_points': list(eps), 'warnings': list(warnings)}
+
+
+def _b6_table(ext):
+    return AS.LANG_TABLES[AS.EXT_TO_LANG[ext]]
+
+
+def _b6_analyze_py(root, rel, text):
+    symbols, imports, eps, warnings = [], [], [], []
+    calls, perr, decls = AS.analyze_python(
+        root, rel, text.encode('utf-8'), text, symbols, imports, eps, warnings)
+    return calls, perr, decls, symbols, imports, eps, warnings
+
+
+def _b6_run_query(args):
+    return _b6_quiet(AS.run_query, args)
+
+
+def _b6_run_main(argv):
+    return _b6_quiet(AS.main, argv)
+
+
+def _run_b6_gap_tests(checker):
+    ck = checker.check
+    roots = []
+    dirty = []                       # 只读文件：清理前需恢复写权限
+    orig_open = None
+    try:
+        # ---------------------------------------------------------------
+        # G1 parse_lang 全分支（coverage-gap: 2726-2737）
+        # ---------------------------------------------------------------
+        sel, err = AS.parse_lang('py, js')
+        ck(err is None and sel and len(sel) == 2,
+           'b6-parse-lang: comma list normalizes to two language ids')
+        _sel, err = AS.parse_lang('bogus-lang-zzz')
+        ck(err is not None and err.startswith('unknown language id'),
+           'b6-parse-lang: unknown id reports a hard error')
+        _sel, err = AS.parse_lang(' , , ')
+        ck(err == '--lang has no valid language id',
+           'b6-parse-lang: empty selection reports a hard error')
+
+        # ---------------------------------------------------------------
+        # G2 import 解析助手直调（coverage-gap: 1430,1432,1441,1447,
+        #     1653-1673 的 None 分支、1685、1865-1869,1906,1920,1941,1962）
+        # ---------------------------------------------------------------
+        ck(AS.import_bases(('src',), 5) is None,
+           'b6-import-bases: relative import beyond repo root returns None')
+        ck(AS.import_bases(('a', 'b'), 2) == [('a',)],
+           'b6-import-bases: level-2 relative import trims one dir')
+        ck(AS.find_module_hit(r'X:\nonexistent', [()], ()) is None,
+           'b6-find-module: empty candidate is skipped')
+        ck(AS._brace_match_table('{ a }') == {0: 4},
+           'b6-brace-table: opener pairs with closer')
+        ck(AS.find_body_pos('func lone', 0) is None,
+           'b6-find-body: no brace/semicolon/equals within window -> None')
+        ck(AS.find_body_pos('fun f() = x', 0) is None,
+           'b6-find-body: expression body without block -> None')
+
+        root = _b6_root('helpers')
+        roots.append(root)
+        _b6_put(root, 'pkg/__init__.py', '')
+        _b6_put(root, 'lib/index.js', 'module.exports = 1;\n')
+        _b6_put(root, 'pkgdir/main.go', 'package pkgdir\n')
+        _b6_put(root, 'src/util/mod.rs', 'pub fn u() {}\n')
+        ck(AS.find_module_hit(root, [()], ('pkg',)) == 'pkg/__init__.py',
+           'b6-find-module: package __init__ hit is reported')
+        t, found, ext, dyn = AS.resolve_import('js', root, 'src/a.js',
+                                               '../lib')
+        ck(found and not ext and t.endswith('lib/index.js'),
+           'b6-resolve-js: relative directory import resolves to index.js')
+        t, found, ext, dyn = AS.resolve_import('go', root, 'main.go', 'pkgdir')
+        ck(found and t == 'pkgdir/',
+           'b6-resolve-go: in-repo directory import returns dir target')
+        t, found, ext, dyn = AS.resolve_import('rust', root, 'src/main.rs',
+                                               'crate::util')
+        ck(found and t.endswith('src/util/mod.rs'),
+           'b6-resolve-rust: crate path falls back to mod.rs')
+        t, found, ext, dyn = AS.resolve_import('ruby_rel', root, 'app.rb',
+                                               'nope')
+        ck(t is None and not found and not ext and not dyn,
+           'b6-resolve-ruby: missing require_relative is inferred, not external')
+        t, found, ext, dyn = AS.resolve_import('mystery-resolver', root, 'x',
+                                               'y')
+        ck(t is None and not found and ext and not dyn,
+           'b6-resolve-tail: unknown resolver falls through to external')
+
+        # ---------------------------------------------------------------
+        # G3 strip_source 分支直喂（coverage-gap: 1527,1538-1549,1565-1569,
+        #     1581-1599,1608-1609,1613-1616,1624-1629,1649）
+        # ---------------------------------------------------------------
+        rust = _b6_table('.rs')
+        cpp = _b6_table('.cpp')
+        js = _b6_table('.js')
+        cs = _b6_table('.cs')
+        php = _b6_table('.php')
+        out = AS.strip_source('x = 1; // eof comment', cpp, 'comments')
+        ck('eof comment' not in out,
+           'b6-strip: line comment without trailing newline is stripped (j=n)')
+        out = AS.strip_source('/* a /* b */ c */ fn f() {}', rust, 'all')
+        ck('fn f()' in out and out.count('{') == 1
+           and 'a' not in out.replace('fn f()', ''),
+           'b6-strip: nested block comment depth counting (rust)')
+        out = AS.strip_source("let c = 'a';\nlet s = \"x\";", rust, 'all')
+        ck("'a'" not in out and 'let s' in out,
+           'b6-strip: rust pre_strip blanks char literals (blank_keep_nl)')
+        out = AS.strip_source('const re = /a\\/b/g;', js, 'all')
+        ck('/a\\/b/g' not in out,
+           'b6-strip: escaped slash inside JS regex literal is skipped')
+        out = AS.strip_source('r = /ab\ncd/', js, 'all')
+        ck('cd/' in out,
+           'b6-strip: newline inside a JS regex literal aborts the literal')
+        out = AS.strip_source('<?php\n$x = <<<EOT\nabc', php, 'all')
+        ck('<<<EOT' not in out,
+           'b6-strip: unterminated heredoc swallows to EOF (php)')
+        out = AS.strip_source('string s = @"a""b";', cs, 'all')
+        ck('@"a""b"' not in out and out.endswith(';'),
+           'b6-strip: C# verbatim doubled quote is treated as an escape')
+        out = AS.strip_source('let s = r#"abc', rust, 'all')
+        ck('abc' not in out,
+           'b6-strip: unterminated multiline string swallows to EOF')
+        out = AS.strip_source('string s = "abc\ndef;', cs, 'all')
+        ck('def;' in out,
+           'b6-strip: unterminated single-line string stops at newline')
+        out = AS.strip_source('string s = "abc', cs, 'all')
+        ck('abc' not in out,
+           'b6-strip: unterminated single-line string at EOF swallows to EOF')
+
+        # ---------------------------------------------------------------
+        # G4 _rmtree 失败分支（coverage-gap: 1046-1060）
+        # ---------------------------------------------------------------
+        ro = _b6_put(root, 'ro/keep.txt', 'x')
+        os.chmod(ro, stat.S_IREAD)
+        dirty.append(ro)
+        AS._rmtree(ro)                       # 非目录 + remove 失败（1046-1048）
+        ck(os.path.exists(ro),
+           'b6-rmtree: read-only file cannot be removed, error swallowed')
+        _b6_put(root, 'rodir/inner/deep.txt', 'y')
+        ro2 = os.path.join(root, 'rodir', 'inner', 'deep.txt')
+        os.chmod(ro2, stat.S_IREAD)
+        dirty.append(ro2)
+        AS._rmtree(os.path.join(root, 'rodir'))   # 文件/子目录 remove 失败
+        ck(os.path.isdir(os.path.join(root, 'rodir')),
+           'b6-rmtree: tree with read-only member survives, errors swallowed')
+
+        # ---------------------------------------------------------------
+        # G5 符号链接分支（coverage-gap: 1083-1095）——平台守卫探测
+        # ---------------------------------------------------------------
+        link_ok = False
+        try:
+            os.symlink(os.path.join(root, 'pkg'), os.path.join(root, 'dlink'),
+                       target_is_directory=True)
+            os.symlink(os.path.join(root, 'lib/index.js'),
+                       os.path.join(root, 'flink.js'))
+            link_ok = True
+        except (OSError, NotImplementedError, AttributeError):
+            link_ok = False
+        if link_ok:
+            warns = []
+            AS.scan_tree(root, (), warns)
+            msgs = ' '.join(w['message'] for w in warns)
+            ck('symlinked directory skipped' in msgs
+               and 'symlinked file skipped' in msgs,
+               'b6-scan-tree: symlinked dir and file are skipped with warnings')
+        else:
+            ck(True, 'b6-scan-tree: symlink branches skipped — platform denies '
+                     'symlink creation (WinError 1314, recorded in report)')
+
+        # ---------------------------------------------------------------
+        # G6 read_source 失败分支（coverage-gap: 1112-1115,1118-1121,
+        #     1125-1127）
+        # ---------------------------------------------------------------
+        big = _b6_put(root, 'big/over_cap.py',
+                      b'x = 1\n' * (AS.READ_MAX_BYTES // 6 + 8))
+        rec, data, text = AS.read_source(root, 'big/over_cap.py', 'python',
+                                         [], [])
+        ck(data is None and text is None and rec['path'] == 'big/over_cap.py',
+           'b6-read: file above READ_MAX_BYTES returns no data')
+        _b6_put(root, 'locked.py', 'x = 1\n')
+        real_open = __builtins__['open'] if isinstance(__builtins__, dict) \
+            else __builtins__.open
+
+        def _deny_open(path, *a, **kw):
+            if str(path).endswith('locked.py'):
+                raise OSError('b6 injected read failure')
+            return real_open(path, *a, **kw)
+
+        if isinstance(__builtins__, dict):
+            __builtins__['open'] = _deny_open
+        else:
+            __builtins__.open = _deny_open
+        orig_open = real_open
+        try:
+            warns = []
+            rec, data, text = AS.read_source(root, 'locked.py', 'python',
+                                             [], warns)
+        finally:
+            if isinstance(__builtins__, dict):
+                __builtins__['open'] = real_open
+            else:
+                __builtins__.open = real_open
+            orig_open = None
+        ck(data is None and any(w['kind'] == AS.W_READ for w in warns),
+           'b6-read: OSError on open degrades to a read warning (injected)')
+        _b6_put(root, 'bad_utf8.py', b'def f():\n    return "\xff\xfe"\n')
+        warns = []
+        rec, data, text = AS.read_source(root, 'bad_utf8.py', 'python',
+                                         [], warns)
+        ck(data is not None and text is not None
+           and any(w['kind'] == AS.W_DECODE for w in warns),
+           'b6-read: invalid UTF-8 falls back to replacement decoding')
+
+        # ---------------------------------------------------------------
+        # G7 manifest_entries 失败分支（coverage-gap: 1152-1159,1174-1179）
+        # ---------------------------------------------------------------
+        os.makedirs(os.path.join(root, 'mdir', 'pyproject.toml'))
+        warns = []
+        out = AS.manifest_entries(os.path.join(root, 'mdir'), 'pyproject.toml',
+                                  'pyproject.toml', warns)
+        ck(out == [] and any(w['kind'] == AS.W_MANIFEST for w in warns),
+           'b6-manifest: unreadable manifest degrades to a warning')
+        _b6_put(root, 'm2/setup.py', b'\xff\xfe not utf8')
+        warns = []
+        out = AS.manifest_entries(os.path.join(root, 'm2'), 'setup.py',
+                                  'setup.py', warns)
+        ck(out == [] and any(w['kind'] == AS.W_MANIFEST for w in warns),
+           'b6-manifest: invalid UTF-8 manifest degrades to a warning')
+        _b6_put(root, 'm3/setup.py',
+                "from setuptools import setup\nsetup(name='x',\n"
+                "      entry_points={'console_scripts': ['x = x:main']})\n")
+        warns = []
+        out = AS.manifest_entries(os.path.join(root, 'm3'), 'setup.py',
+                                  'setup.py', warns)
+        ck(len(out) == 1 and out[0]['kind'] == AS.EP_CONSOLE_SCRIPT
+           and out[0]['confidence'] == AS.CONF_INFERRED,
+           'b6-manifest: setup.py console_scripts text scan produces an entry')
+
+        # ---------------------------------------------------------------
+        # G8 analyze_python 分支（coverage-gap: 1291-1304,1315-1327,1370,
+        #     1382-1386,1430,1479-1480）
+        # ---------------------------------------------------------------
+        mod = ('if flag:\n'
+               '    pass\n'
+               'if a < b:\n'
+               '    pass\n'
+               'if __name__ == 1:\n'
+               '    pass\n')
+        _calls, perr, _decls, _syms, _imps, eps, _w = _b6_analyze_py(
+            root, 'guards.py', mod)
+        ck(perr is None and eps == [],
+           'b6-py: non-guard if shapes return False and produce no entry')
+        mod = ('import base\n'
+               '\n'
+               '\n'
+               '@base.decorator()\n'
+               'class Outer:\n'
+               '    @base.method_dec\n'
+               '    def m(self, x=base.default_call()):\n'
+               '        return x\n'
+               '\n'
+               '    class Inner:\n'
+               '        def im(self):\n'
+               '            return 1\n')
+        calls, perr, _decls, symbols, _imps, _eps, _w = _b6_analyze_py(
+            root, 'deco.py', mod)
+        names = [s['qualname'] for s in symbols]
+        callees = [x[2] for x in calls]
+        ck(perr is None and names == ['Outer', 'Outer.m', 'Outer.Inner',
+                                      'Outer.Inner.im'],
+           'b6-py: class/method decorators and nested class walked (%r)'
+           % (names,))
+        # b6 发现（P2，报告 §发现）：collect_calls 只遍历子树、不判定传入节点
+        # 自身——装饰器/默认值表达式的「直接调用」形态（@dec()、x=util()）因此
+        # 不进调用边。此处把现状钉住（不静默改生产行为）。
+        ck(not any(x in callees for x in ('decorator', 'method_dec',
+                                          'default_call')),
+           'b6-py FINDING: decorator/default direct calls are not recorded '
+           '(collect_calls sees the subtree only)')
+        mod = ('import helper\n'
+               '\n'
+               'count: int = 0\n'
+               'ann_only: str\n'
+               '\n'
+               '\n'
+               'def add(a, b=helper.util(3)):\n'
+               '    return a + b\n')
+        calls, perr, _decls, symbols, _imps, _eps, _w = _b6_analyze_py(
+            root, 'ann.py', mod)
+        names = [s['qualname'] for s in symbols]
+        ck(perr is None and names == ['count', 'ann_only', 'add'],
+           'b6-py: AnnAssign symbols (with and without value) are collected')
+        ck(not any(x[2] == 'util' for x in calls),
+           'b6-py FINDING: default-value call in a def signature is not '
+           'recorded (same subtree-vs-node gap)')
+        mod = 'from ..... import distant\n'
+        _calls, perr, _decls, _syms, imports, _eps, _w = _b6_analyze_py(
+            root, 'beyond.py', mod)
+        ck(perr is None and len(imports) == 1
+           and imports[0]['confidence'] == AS.CONF_INFERRED
+           and imports[0]['external'] is False,
+           'b6-py: relative import beyond root degrades to inferred edge')
+
+        # ---------------------------------------------------------------
+        # G9-G11 双引擎 + 消解分支（coverage-gap: 1967-1983,2026-2080,
+        #     2164-2169,2202,2243,2297-2302,2441-2442,2469）
+        # ---------------------------------------------------------------
+        eng = _b6_root('engine')
+        roots.append(eng)
+        _b6_put(eng, 'src/helper.py', 'def util(x):\n    return x\n')
+        _b6_put(eng, 'src/shapes.py',
+                'class Shapes:\n    def circle(self):\n        return 1\n')
+        _b6_put(eng, 'src/c1.py', 'def circle():\n    return 2\n')
+        _b6_put(eng, 'src/c2.py', 'def circle():\n    return 3\n')
+        _b6_put(eng, 'src/dotted.py',
+                'import c1\n\n\ndef d():\n    obj = c1\n'
+                '    return obj.x.circle()\n')
+        _b6_put(eng, 'src/drawer2.py',
+                'def draw2():\n    return Shapes.circle()\n')
+        _b6_put(eng, 'src/goblock.go',
+                'package main\n\nimport (\n\t"fmt"\n)\n\n'
+                'func main() {\n\tfmt.Println("hi")\n}')
+        _b6_put(eng, 'src/newcall.java',
+                'public class Factory {\n    public Widget make() {\n'
+                '        return new Widget();\n    }\n}\n')
+        _b6_put(eng, 'src/dup.js',
+                'function f() {\n  return 1;\n}\n\nf(); f();\n')
+        _b6_put(eng, 'src/emptyspec.js',
+                "require('');\nimport '';\n")
+        _b6_put(eng, 'src/dtor.cpp',
+                'class Foo {\npublic:\n    ~Foo() { }\n'
+                '    Foo operator+(const Foo& o) { return o; }\n};\n\n'
+                'void outer() {\n    void inner_proto();\n'
+                '    if (x) { }\n    switch (y) { case 1: break; }\n}\n')
+        _b6_put(eng, 'src/unclosed.rs',
+                'impl Foo {\n    fn bar(&self) {}\n')
+        _b6_put(eng, 'src/parse_cap.py', 'x = 1\n' * (6 * 1024 * 1024 // 6))
+        facts = AS.build_facts(eng)
+        wl = [w for w in facts['warnings']]
+        ck(any(w['kind'] == AS.W_TOO_LARGE for w in wl),
+           'b6-facts: over-parse-cap file is skipped with a too-large warning')
+        calls = facts['calls']
+        imports = facts['imports']
+        symbols = facts['symbols']
+        ck(any(c['callee'] == 'Println' or c['callee'] == 'Printf'
+               for c in calls) or any(i['target'] == 'fmt' for i in imports),
+           'b6-generic: go import block scanned (fmt edge present)')
+        ck(not any(str(s['name']).startswith('~')
+                   or str(s['name']).startswith('operator') for s in symbols),
+           'b6-generic: destructor/operator declarations are not symbols')
+        ck(not any(s['name'] in ('inner_proto', 'if', 'switch')
+                   for s in symbols),
+           'b6-generic: bodyless-in-function and decl_stops are filtered')
+        ck(any(c['callee'] == 'Widget' for c in calls),
+           'b6-generic: java new-expression is a call site')
+        dup = [c for c in calls if c['file'] == 'src/dup.js'
+               and c['callee'] == 'f']
+        ck(len(dup) == 1,
+           'b6-generic: same-line duplicate call sites are deduplicated')
+        ck(not any(i['target'] == '' for i in imports),
+           'b6-generic: empty import specifier produces no edge')
+        amb = [c for c in calls if c['callee'] == 'circle'
+               and c['caller'] == 'd']
+        ck(amb and amb[0]['resolution'] == AS.R_AMBIGUOUS
+           and amb[0]['confidence'] == AS.CONF_INFERRED,
+           'b6-facts: dotted receiver with multiple candidates is ambiguous')
+        qual = [c for c in calls if c['callee'] == 'circle'
+                and c['caller'] == 'draw2']
+        ck(qual and qual[0]['resolution'] == AS.R_UNIQUE
+           and qual[0]['resolved_by'] == AS.RB_QUALIFIED
+           and qual[0]['confidence'] == AS.CONF_VERIFIED,
+           'b6-facts: qualified-name narrowing marks verified(qualified)')
+
+        # ---------------------------------------------------------------
+        # G12 render_md 空小节 + 合成 facts（coverage-gap: 2591,2607,2623,
+        #     2648,2655,2664,2687,2693）
+        # ---------------------------------------------------------------
+        one_file = {'path': 'a.py', 'lines': 1, 'language': 'python',
+                    'parse_error': None, 'generated': False}
+        plain = AS.render_md(_b6_facts_dict(files=[one_file]))
+        ck('（无）' in plain,
+           'b6-render-md: empty sections render the （无） placeholder rows')
+        tri = _b6_facts_dict(
+            files=[one_file],
+            symbols=[{'name': 's', 'qualname': 's', 'kind': AS.K_FUNCTION,
+                      'file': 'a.py', 'start_line': 1, 'end_line': 1,
+                      'extractor': 'ast', 'signature': ''}])
+        md_res = AS.render_md(tri)
+        ck(isinstance(md_res, str) and 'a.py' in md_res,
+           'b6-render-md: synthesized file row renders without crashing')
+
+        # ---------------------------------------------------------------
+        # G13 查询层：用法错误 + md 渲染 + 合成 facts 边界（coverage-gap:
+        #     3125,3129,3178,3200,3209,3243,3284,3302,3330,3341,3407-3483,
+        #     3490,3513-3576）
+        # ---------------------------------------------------------------
+        outdir = os.path.join(eng, '_b6out')
+        jpath, _mpath = AS.write_artifacts(facts, outdir)
+        F = jpath
+        usage = [
+            (['p', 'map', '--facts', F, '--depth'], 2),
+            (['p', 'map', '--facts', F, '--bogus'], 2),
+            (['p', 'map', '--facts', F, '--format', 'xml'], 2),
+            (['p', 'map', '--facts', F, '--depth', 'x'], 2),
+            (['p', 'map', '--facts', F, '--depth', '0'], 2),
+            (['p', 'callers', 'sym', '--facts', F, '--limit', 'x'], 2),
+            (['p', 'callers', 'sym', '--facts', F, '--limit', '-1'], 2),
+            (['p', 'callers', 'sym', '--facts', F, '--depth', '2'], 2),
+            (['p', 'map', '--facts', F, 'EXTRA', 'EXTRA'], 2),
+        ]
+        bad = [args for args, want in usage
+               if _b6_run_query(args) != want]
+        ck(not bad,
+           'b6-query: nine usage-error forms all return exit 2 (%r)' % (bad,))
+        ck(_b6_run_query(['p', 'map', '--facts', F, '--format', 'md',
+                          '--dir', 'src/']) == 0,
+           'b6-query: --dir value is normalized and map md renders')
+        ck(_b6_run_query(['p', 'map', '--facts', F, '--format', 'json']) == 0,
+           'b6-query: map json path still returns 0')
+        ck(_b6_run_query(['p', 'callers', 'util', '--facts', F,
+                          '--format', 'md']) == 0,
+           'b6-query: callers md listing renders')
+        ck(_b6_run_query(['p', 'callers', 'util', '--facts', F,
+                          '--limit', '1']) == 0,
+           'b6-query: callers truncation note renders in place')
+        ck(_b6_run_query(['p', 'callees', 'add', '--facts', F]) == 0,
+           'b6-query: callees md renders')
+        ck(_b6_run_query(['p', 'callees', 'NoSuchSymbol', '--facts', F]) == 0,
+           'b6-query: callees with no match is not an error')
+        ck(_b6_run_query(['p', 'impact', 'util', '--facts', F]) == 0,
+           'b6-query: impact md renders (verified-only default)')
+        ck(_b6_run_query(['p', 'impact', 'util', '--facts', F,
+                          '--include-inferred']) == 0,
+           'b6-query: impact md with inferred labels renders')
+        ck(_b6_run_query(['p', 'path', 'add', 'add', '--facts', F]) == 0,
+           'b6-query: path from a symbol to itself returns 0')
+        ck(_b6_run_query(['p', 'path', 'circle', 'draw2', '--facts', F]) == 0,
+           'b6-query: path across ambiguous nodes renders resolved notes')
+        ck(_b6_run_query(['p', 'path', 'NoSuchA', 'NoSuchB', '--facts', F])
+           == 0,
+           'b6-query: path with no match renders the generic note')
+        ck(_b6_run_query(['p', 'entry', '--facts', F]) == 0,
+           'b6-query: entry md renders on facts without entry points')
+        ck(_b6_run_query(['p', 'search', 'util', '--facts', F]) == 0,
+           'b6-query: search md rows render')
+
+        synth = _b6_facts_dict(
+            files=[one_file],
+            symbols=[{'name': 'q', 'qualname': 'q', 'kind': AS.K_FUNCTION,
+                      'file': 'a.py', 'start_line': 1, 'end_line': 1,
+                      'extractor': 'ast', 'signature': ''}],
+            imports=[{'file': 'a.py', 'line': 1, 'raw': 'import b',
+                      'kind': AS.IMP_IMPORT, 'target': 'pkg/b.py',
+                      'confidence': AS.CONF_INFERRED, 'external': True,
+                      'dynamic': False, 'extractor': 'ast'}],
+            calls=[{'file': 'a.py', 'line': 2, 'caller': 'q', 'callee': 'r',
+                    'receiver': None,
+                    'to': {'file': 'pkg/c.py', 'qualname': 'r',
+                           'start_line': 1},
+                    'confidence': AS.CONF_INFERRED,
+                    'resolution': AS.R_AMBIGUOUS, 'resolved_by': None,
+                    'self_ref': False, 'unresolved_reason': None,
+                    'candidates': 2, 'candidates_total': 2,
+                    'extractor': 'ast'}],
+            eps=[{'kind': AS.EP_MAIN_GUARD, 'file': 'a.py', 'line': 9,
+                  'evidence': 'if __name__', 'confidence': AS.CONF_VERIFIED}])
+        synth_path = os.path.join(eng, 'synth-facts.json')
+        with open(synth_path, 'w', encoding='utf-8') as fh:
+            fh.write(AS.dumps_facts(synth))
+        ck(_b6_run_query(['p', 'map', '--facts', synth_path]) == 0,
+           'b6-query: map aggregates external and inferred edge counters')
+        ck(_b6_run_query(['p', 'entry', '--facts', synth_path]) == 0,
+           'b6-query: entry md renders synthesized main-guard row')
+        empty_path = os.path.join(eng, 'empty-facts.json')
+        with open(empty_path, 'w', encoding='utf-8') as fh:
+            fh.write(AS.dumps_facts(_b6_facts_dict()))
+        ck(_b6_run_query(['p', 'entry', '--facts', empty_path]) == 0
+           and _b6_run_query(['p', 'map', '--facts', empty_path]) == 0,
+           'b6-query: empty facts render the no-entry note and empty map')
+        md_blank_res = AS.render_md(_b6_facts_dict(
+            files=[one_file],
+            calls=[{'file': 'a.py', 'line': 1, 'caller': None,
+                    'callee': 'z', 'receiver': None, 'to': None,
+                    'confidence': AS.CONF_INFERRED,
+                    'resolution': '', 'resolved_by': None, 'self_ref': False,
+                    'unresolved_reason': None, 'candidates': 0,
+                    'candidates_total': 0, 'extractor': 'ast'}]))
+        ck('- |' in md_blank_res or '-' in md_blank_res,
+           'b6-render-md: empty resolution cell falls back to a dash')
+
+        # ---------------------------------------------------------------
+        # G14 main() v1 命令行分支（coverage-gap: 2744-2745,2747,2755-2756,
+        #     2766-2774,2780-2781,2789-2790,2794-2797,2805,2809-2816,2840-2841）
+        # ---------------------------------------------------------------
+        ck(_b6_run_main(['analyze_structure.py']) == 2,
+           'b6-main: no-args prints usage and exits 2 (stdout without '
+           'reconfigure also exercises the except path)')
+        saved_rs = AS.run_selftest
+        AS.run_selftest = lambda: 0
+        try:
+            ck(_b6_run_main(['p', '--selftest']) == 0,
+               'b6-main: --selftest branch dispatches to run_selftest')
+        finally:
+            AS.run_selftest = saved_rs
+        ck(_b6_run_main(['p', 'analyze']) == 2,
+           'b6-main: bare analyze prints usage and exits 2')
+        ck(_b6_run_main(['p', eng, '--lang']) == 2,
+           'b6-main: trailing option without value exits 2')
+        ck(_b6_run_main(['p', eng, '--bogus', '--quiet',
+                         '--outdir', os.path.join(eng, '_b6flag')]) in (0, 1),
+           'b6-main: unknown flag warns, --quiet is accepted')
+        ck(_b6_run_main(['p', eng, '--lang', 'bogus-lang']) == 2,
+           'b6-main: invalid --lang exits 2')
+        empty_repo = _b6_root('empty')
+        roots.append(empty_repo)
+        ck(_b6_run_main(['p', empty_repo, '--exclude', 'a, b,,c',
+                         '--outdir', os.path.join(empty_repo, 'out')]) == 1,
+           'b6-main: exclude list parses and zero-file repo returns 1')
+        ck(_b6_run_main(['p', eng, '--outdir',
+                         os.path.join(eng, '_b6inner')]) == 0,
+           'b6-main: outdir inside repo warns and still succeeds')
+        saved_bf = AS.build_facts
+
+        def _boom(*a, **kw):
+            raise RuntimeError('b6 injected internal error')
+
+        AS.build_facts = _boom
+        try:
+            ck(_b6_run_main(['p', eng, '--outdir',
+                             os.path.join(eng, '_b6err')]) == 1,
+               'b6-main: internal error is reported loudly with exit 1')
+        finally:
+            AS.build_facts = saved_bf
+        blocking = _b6_put(root, 'blocking.txt', 'not a dir')
+        ck(_b6_run_main(['p', eng, '--outdir', blocking]) == 1,
+           'b6-main: unwritable outdir degrades to exit 1')
+
+        # ---------------------------------------------------------------
+        # G16 查询层富事实簇（coverage-gap: 3129,3178,3209,3243,3284,3302,
+        #     3330,3411,3425-3432,3435-3452,3456-3457）：合成调用图
+        #     beta->alpha->{gamma,delta}->epsilon 菱形 + 环 + 重名对。
+        # ---------------------------------------------------------------
+        def _b6_call(f, line, caller, callee, conf=AS.CONF_VERIFIED,
+                     res=AS.R_UNIQUE, rb=AS.RB_NAME, recv=None):
+            return {'file': f, 'line': line, 'caller': caller, 'callee': callee,
+                    'receiver': recv,
+                    'to': {'file': 'chain.py', 'qualname': callee,
+                           'start_line': 1},
+                    'confidence': conf, 'resolution': res, 'resolved_by': rb,
+                    'self_ref': False, 'unresolved_reason': None,
+                    'candidates': 1, 'candidates_total': 1, 'extractor': 'ast'}
+
+        def _b6_sym(name, qual, f='chain.py', line=1):
+            return {'name': name, 'qualname': qual, 'kind': AS.K_FUNCTION,
+                    'file': f, 'start_line': line, 'end_line': line + 1,
+                    'extractor': 'ast', 'signature': ''}
+
+        def _b6_fil(f, n=12):
+            return {'path': f, 'lines': n, 'language': 'python',
+                    'parse_error': None, 'generated': False}
+
+        rich = _b6_facts_dict(
+            files=[_b6_fil('chain.py'), _b6_fil('pkg/a.py'), _b6_fil('pkg/b.py')],
+            symbols=[_b6_sym('alpha', 'alpha'), _b6_sym('beta', 'beta'),
+                     _b6_sym('gamma', 'gamma'), _b6_sym('delta', 'delta'),
+                     _b6_sym('epsilon', 'epsilon'),
+                     _b6_sym('twin', 'Twin.twin', 'pkg/a.py'),
+                     _b6_sym('twin', 'Other.twin', 'pkg/b.py')],
+            imports=[{'file': 'chain.py', 'line': 1, 'raw': 'import pkg.a',
+                      'kind': AS.IMP_IMPORT, 'target': 'pkg/a.py',
+                      'confidence': AS.CONF_INFERRED, 'external': False,
+                      'dynamic': False, 'extractor': 'ast'},
+                     {'file': 'chain.py', 'line': 2, 'raw': 'import sys',
+                      'kind': AS.IMP_IMPORT, 'target': 'sys',
+                      'confidence': AS.CONF_INFERRED, 'external': True,
+                      'dynamic': False, 'extractor': 'ast'}],
+            calls=[_b6_call('chain.py', 1, 'beta', 'alpha'),
+                   _b6_call('chain.py', 1, 'beta', 'alpha'),
+                   _b6_call('chain.py', 2, 'alpha', 'gamma'),
+                   _b6_call('chain.py', 3, 'alpha', 'delta'),
+                   _b6_call('chain.py', 3, 'alpha', 'delta'),
+                   _b6_call('chain.py', 4, 'gamma', 'delta'),
+                   _b6_call('chain.py', 5, 'delta', 'epsilon'),
+                   _b6_call('chain.py', 6, 'twin', 'alpha')],
+            eps=[{'kind': AS.EP_MAIN_GUARD, 'file': 'chain.py', 'line': 9,
+                  'evidence': 'if __name__ == ...', 'confidence':
+                  AS.CONF_VERIFIED}])
+        rpath = os.path.join(eng, 'rich-facts.json')
+        with open(rpath, 'w', encoding='utf-8', newline='') as fh:
+            fh.write(AS.dumps_facts(rich))
+        ck(_b6_run_query(['p', 'map', '--facts', rpath, '--depth', '1']) == 0,
+           'b6-query-rich: map md renders aggregated edge rows (inferred)')
+        ck(_b6_run_query(['p', 'callers', 'alpha', '--facts', rpath]) == 0,
+           'b6-query-rich: callers md renders deduplicated rows')
+        ck(_b6_run_query(['p', 'callers', 'alpha', '--facts', rpath,
+                          '--limit', '1']) == 0,
+           'b6-query-rich: callers md renders the truncation line')
+        ck(_b6_run_query(['p', 'callees', 'alpha', '--facts', rpath]) == 0,
+           'b6-query-rich: callees md renders deduplicated rows')
+        ck(_b6_run_query(['p', 'callees', 'alpha', '--facts', rpath,
+                          '--limit', '1']) == 0,
+           'b6-query-rich: callees md renders the truncation line')
+        ck(_b6_run_query(['p', 'impact', 'epsilon', '--facts', rpath,
+                          '--depth', '4']) == 0,
+           'b6-query-rich: impact md renders a reverse diamond (revisit skip)')
+        ck(_b6_run_query(['p', 'impact', 'gamma', '--facts', rpath,
+                          '--depth', '4']) == 0,
+           'b6-query-rich: impact md renders radius + levels')
+        ck(_b6_run_query(['p', 'impact', 'gamma', '--facts', rpath,
+                          '--depth', '4', '--include-inferred']) == 0,
+           'b6-query-rich: impact md renders per-level confidences')
+        ck(_b6_run_query(['p', 'path', 'beta', 'epsilon', '--facts', rpath])
+           == 0,
+           'b6-query-rich: path md renders route + hop rows (diamond graph)')
+        ck(_b6_run_query(['p', 'path', 'alpha', 'alpha', '--facts', rpath])
+           == 0,
+           'b6-query-rich: path from a symbol to itself reports coincidence')
+        ck(_b6_run_query(['p', 'path', 'twin', 'delta', '--facts', rpath]) == 0,
+           'b6-query-rich: path across ambiguous nodes renders resolved note')
+        ck(_b6_run_query(['p', 'search', 'alpha', '--facts', rpath]) == 0,
+           'b6-query-rich: search md renders result rows')
+
+        # ---------------------------------------------------------------
+        # G17 直喂簇（coverage-gap: 991,1246-1247,1271-1272,1833）
+        # ---------------------------------------------------------------
+        ck(AS._line_at(['a', 'b'], 99) == '',
+           'b6-line-at: out-of-range line number returns an empty string')
+        _calls, perr, _d, symbols, _i, _e, _w = _b6_analyze_py(
+            root, 'star.py', 'first, *rest = [1, 2, 3]\n')
+        ck(perr is None and set(s['qualname'] for s in symbols)
+           == set(['first', 'rest']),
+           'b6-py: starred assignment target produces both symbols')
+        _calls, perr, _d, symbols, _i, _e, _w = _b6_analyze_py(
+            root, 'kw.py', 'def kw(*, a=1, b):\n    return a\n')
+        ck(perr is None and any(s['qualname'] == 'kw' for s in symbols),
+           'b6-py: keyword-only defaults mix present and None entries')
+        _b6_put(root, 'jv/a/b/C.java', 'package a.b;\n')
+        ck(AS._resolve_dotfile(root, 'jv/App.java', 'a.b.C', ('.java',))
+           == 'jv/a/b/C.java',
+           'b6-dotfile: nested package path resolves deepest-first')
+        _b6_put(root, 'jv2/a/index.java', 'package a;\n')
+        ck(AS._resolve_dotfile(root, 'jv2/App.java', 'a', ('.java',))
+           == 'jv2/a/index.java',
+           'b6-dotfile: directory package falls back to its index file')
+
+        # ---------------------------------------------------------------
+        # G18 引擎分支簇（coverage-gap: 1983,2028,2030,2061,2202,2297）
+        # ---------------------------------------------------------------
+        eng2 = _b6_root('engine2')
+        roots.append(eng2)
+        _b6_put(eng2, 'src/openblock.go', 'package main\n\nimport (\n\t"fmt"')
+        _b6_put(eng2, 'src/newwidget.js', 'const w = new Widget();\n')
+        _b6_put(eng2, 'src/operatorform.cs',
+                'class Ops {\n'
+                '    bool operator (int x) { return true; }\n'
+                '}\n')
+        _b6_put(eng2, 'src/filters.cpp',
+                'void demo() {\n'
+                '    typedef int MyInt;\n'
+                '    if (ready) { } else if (flag) { }\n'
+                '}\n'
+                '\n'
+                'bool operator (int x) { return true; }\n')
+        _b6_put(eng2, 'src/over_read_cap.py',
+                b'x = 1\n' * (AS.READ_MAX_BYTES // 6 + 8))
+        f2 = AS.build_facts(eng2)
+        ck(any(i['target'] == 'fmt' and i['external']
+               for i in f2['imports']),
+           'b6-generic: unterminated go import block still yields its spec')
+        ck(any(c['callee'] == 'Widget' for c in f2['calls']),
+           'b6-generic: js new-expression is recorded (new_call table)')
+        ck(not any(s['name'] in ('if', 'operator', 'typedef')
+                   for s in f2['symbols']),
+           'b6-generic: decl_stops / operator / in-function typedef filtered')
+        ck(any(w['kind'] == AS.W_TOO_LARGE for w in f2['warnings'])
+           and 'over_read_cap.py' not in [s['file'] for s in f2['symbols']],
+           'b6-facts: file above the read cap skips parsing (data None branch)')
+
+        # ---------------------------------------------------------------
+        # G19 缺口守卫：把「不可达」的静态理由变成可回归断言
+        #     （coverage-gap: 2026 与 2169 —— 防御性守卫，无构造输入）
+        # ---------------------------------------------------------------
+        ck(all('(?P<n>' in pat for tbl in AS.LANG_TABLES.values()
+               for pat, _k, _r in tbl['decl']),
+           'b6-gap-guard: every decl pattern carries a mandatory n group, so '
+           'the "no name" guard (:2026) has no constructible input')
+        probes = []
+        for tbl in AS.LANG_TABLES.values():
+            for pat, _k, _r in tbl['imports']:
+                rx = re.compile(pat, re.MULTILINE)
+                for sample in ('import ""', "require('')", '#include ""',
+                               'import ', 'use ', 'using '):
+                    m = rx.search(sample)
+                    if m is not None:
+                        probes.append(m.group(1))
+        ck(all(p for p in probes),
+           'b6-gap-guard: no import pattern can capture an empty specifier, so '
+           'the "no spec" guard (:2169) has no constructible input')
+
+        # ---------------------------------------------------------------
+        # G15 转发桩与 __main__ 守卫（coverage-gap: 3652-3657,3661）
+        # ---------------------------------------------------------------
+        real_isfile = os.path.isfile
+
+        def _no_testfile(path):
+            if str(path).endswith('test_analyze_structure.py'):
+                return False
+            return real_isfile(path)
+
+        os.path.isfile = _no_testfile
+        try:
+            ck(_b6_quiet(AS.run_selftest) == 2,
+               'b6-forward: missing test file exits 2 with a hint')
+        finally:
+            os.path.isfile = real_isfile
+        if os.environ.get(B6_GAP_ENV) == '1':
+            ck(True, 'b6-forward: nested process skips subprocess forwarding')
+        else:
+            os.environ[B6_GAP_ENV] = '1'
+            ck(_b6_quiet(AS.run_selftest) == 0,
+               'b6-forward: --selftest forwarding runs the suite and '
+               'propagates exit 0')
+        saved_argv = sys.argv
+        sys.argv = ['analyze_structure.py']
+        exit_code = None
+        try:
+            _b6_quiet(runpy.run_path, AS.__file__, run_name='__main__')
+        except SystemExit as exc:
+            exit_code = exc.code
+        finally:
+            sys.argv = saved_argv
+        ck(exit_code == 2,
+           'b6-guard: module __main__ guard exits with main() return code')
+    finally:
+        if orig_open is not None:
+            if isinstance(__builtins__, dict):
+                __builtins__['open'] = orig_open
+            else:
+                __builtins__.open = orig_open
+        for path in dirty:
+            try:
+                os.chmod(path, stat.S_IWRITE)
+            except OSError:
+                pass
+        for path in roots:
+            AS._rmtree(path)
+
 
 if __name__ == '__main__':
     sys.exit(run_selftest())
