@@ -105,7 +105,9 @@ class SelftestChecker(object):
     def __init__(self):
         self.passed = 0
         self.failed = 0
+        self.skipped = 0
         self.failures = []
+        self.skips = []
 
     def check(self, condition, label):
         if condition:
@@ -113,6 +115,11 @@ class SelftestChecker(object):
         else:
             self.failed += 1
             self.failures.append(label)
+
+    def skip(self, label):
+        """诚实跳过：单独计数，不计入 passed（批次 7）。"""
+        self.skipped += 1
+        self.skips.append(label)
 
 
 FIXTURE_CORE = '''\
@@ -962,8 +969,17 @@ def _writable_dir(base):
 
 
 def _probe_dir(base, name, registry):
-    """selftest 探针目录（物化在临时区；收尾按 registry 统一删除——含大体积 DoS 夹具）。"""
-    path = os.path.join(base, name)
+    """selftest 探针目录（物化在临时区；收尾按 registry 统一删除——含大体积 DoS 夹具）。
+
+    批次 7r（P2-2）：实际目录名并入 pid。_fixture_root 走 SIBLING 回退时
+    （mkdtemp 0700 症候），探针基座会退化为共享临时目录顶层，固定名探针
+    目录会跨进程互踩（验证者实测：两套件并发 → AC-37 行数减半 + b6-forward
+    假红）。pid 后缀后各进程各用各的探针目录；调用方一律使用返回值，名字
+    后缀对外不可见。注意：三套件仍约定串行运行，本修复只消除探针目录层面
+    的互踩，不构成并发安全承诺。
+    """
+    unique = '%s-%d' % (name, os.getpid())
+    path = os.path.join(base, unique)
     os.makedirs(path, exist_ok=True)
     registry.append(path)
     return path
@@ -1597,8 +1613,8 @@ def run_selftest():
                           'secP2-2 symlinked file is skipped with a '
                           'symlink-skipped warning')
         else:
-            checker.check(True, 'secP2-2 file-symlink skip host-gated: os.symlink '
-                                'denied on this host (no such privilege)')
+            checker.skip('secP2-2 file-symlink skip host-gated: os.symlink '
+                         'denied on this host (no such privilege)')
         # AC-37②/D2：性能软门实测——10k 行多语言合成仓库（100k 行一次性探针见
         # agent-out\ac37b-probe-1132.py）。软门语义：超时只 WARN、退出码仍 0；
         # 本工具无超时逻辑，故此处以 CPU 上限锁「不得退化为分钟级」。
@@ -2566,9 +2582,12 @@ def run_selftest():
             _rmtree(_pd)
         _rmtree(root)
         _rmtree(tmp)
-    print('selftest: %d passed / %d failed' % (checker.passed, checker.failed))
+    print('selftest: %d passed / %d failed / %d skipped'
+          % (checker.passed, checker.failed, checker.skipped))
     for label in checker.failures:
         print('  FAIL %s' % label)
+    for label in checker.skips:
+        print('  SKIP %s' % label)
     return 0 if checker.failed == 0 else 1
 
 # ======================================================================
@@ -2648,57 +2667,123 @@ def _b6_run_main(argv):
     return _b6_quiet(AS.main, argv)
 
 
+try:
+    import re._parser as _sre_parse       # Python 3.11+（re 为包）
+except ImportError:                       # Python 3.10：re 为单模块，旧名等价
+    import sre_parse as _sre_parse
+
+
+def _sre_group_seq(pattern, gid):
+    """在 pattern 的 sre_parse 语句树里找编号 gid 的捕获组子树。"""
+    def walk(node):
+        for op, av in node:
+            if op == _sre_parse.SUBPATTERN:
+                if av[0] == gid:
+                    return av[3]
+                found = walk(av[3])
+                if found is not None:
+                    return found
+            elif op == _sre_parse.BRANCH:
+                for branch in av[1]:
+                    found = walk(branch)
+                    if found is not None:
+                        return found
+            elif op in (_sre_parse.ASSERT, _sre_parse.ASSERT_NOT):
+                found = walk(av[1])
+                if found is not None:
+                    return found
+    return walk(_sre_parse.parse(pattern))
+
+
+def _seq_captures_can_be_empty(node):
+    """组序列是否可能捕获空文本（未知操作码按可空处理 = 响亮失败）。"""
+    def item(op, av):
+        if op in (_sre_parse.LITERAL, _sre_parse.NOT_LITERAL, _sre_parse.IN,
+                  _sre_parse.ANY, _sre_parse.ANY_ALL):
+            return False
+        if op == _sre_parse.AT or op in (_sre_parse.ASSERT,
+                                        _sre_parse.ASSERT_NOT):
+            return True
+        if op == _sre_parse.SUBPATTERN:
+            return _seq_captures_can_be_empty(av[3])
+        if op in (_sre_parse.MAX_REPEAT, _sre_parse.MIN_REPEAT):
+            return True if av[0] == 0 else _seq_captures_can_be_empty(av[2])
+        if op == _sre_parse.BRANCH:
+            return any(_seq_captures_can_be_empty(b) for b in av[1])
+        return True        # GROUPREF 等未知形态按可空处理（响亮失败）
+    return all(item(op, av) for op, av in node)
+
+
+def _seq_contains_group(items, gid):
+    """语句树序列中是否存在编号 gid 的捕获组定义。"""
+    def walk(items):
+        for op, av in items:
+            if op == _sre_parse.SUBPATTERN:
+                if av[0] == gid or walk(av[3]):
+                    return True
+            elif op in (_sre_parse.MAX_REPEAT, _sre_parse.MIN_REPEAT):
+                if walk(av[2]):
+                    return True
+            elif op == _sre_parse.BRANCH:
+                if any(walk(b) for b in av[1]):
+                    return True
+            elif op in (_sre_parse.ASSERT, _sre_parse.ASSERT_NOT):
+                if walk(av[1]):
+                    return True
+        return False
+    return walk(items)
+
+
+def _seq_can_skip_group(items, gid):
+    """语句树中编号 gid 的捕获组是否可能不参与匹配（批次 7r，P1-2）。
+
+    判据（MANDATORY 侧，与 _seq_captures_can_be_empty 的 NONNULL 侧互补）：
+      · 组处于 min=0 的重复体内（(?:组)? / 组? —— 整体可跳过）；
+      · 组所在重复 min>0 但重复体自身可内部跳过该组；
+      · 组处于 BRANCH 且存在不含该组的可走替代分支；
+      · ASSERT/ASSERT_NOT 体内按同规则递归（断言随外层必经性裁定）；
+      · 未知操作码（GROUPREF_EXISTS 等）按「可跳过」处理 = 响亮失败，
+        宁可误红不可漏红——漏掉的正是让 :2033/:2176 守卫重新可达的改法。
+    返回 True = 存在一条不经过组 gid 的成功匹配路径（守卫可达）。
+    """
+    def one(op, av):
+        if op == _sre_parse.SUBPATTERN:
+            if av[0] == gid:
+                return False          # 组定义就在此：该 SUBPATTERN 自身必经
+            return seq(av[3])
+        if op in (_sre_parse.MAX_REPEAT, _sre_parse.MIN_REPEAT):
+            return av[0] == 0 or seq(av[2])
+        if op == _sre_parse.BRANCH:
+            return any((not _seq_contains_group(b, gid)) or seq(b)
+                       for b in av[1])
+        if op in (_sre_parse.ASSERT, _sre_parse.ASSERT_NOT):
+            return seq(av[1])
+        return True                   # 未知形态按可跳过处理（响亮失败）
+
+    def seq(items):
+        # 组在合法 pattern 中只定义一次：找到含组的唯一 item，其可跳过性
+        # 即整条序列「存在跳过组的匹配路径」的答案。
+        for op, av in items:
+            if _seq_contains_group([(op, av)], gid):
+                return one(op, av)
+        return False                  # 组不在本序列（调用方保证不发生）
+    return seq(items)
+
+
 def _imports_spec_guard(tables):
-    """:2167-2170「空 spec 守卫」的等价不变式（6c 重写，替代空真断言）。
+    """:2167-2170「空 spec 守卫」的等价不变式（6c 重写；批次 7r 补 MANDATORY 判据）。
 
     对全部表的每条 imports 模式断言：除 go_block（:2163-2166 提前分流、
     不达 :2167 的 spec 行）外——
       ① 存在捕获组 1（否则 :2167 的 m.group(1) 直接 IndexError）；
-      ② 组 1 不可能捕获空文本（sre_parse 语句树可空分析；GROUPREF 等
-        未知操作码按「可空」处理 = 响亮失败，宁可误红不可漏红）。
+      ② 组 1 不可能捕获空文本（sre_parse 语句树可空分析；_seq_captures_
+        can_be_empty）；
+      ③ 组 1 不可能整体不参与匹配（MANDATORY；_seq_can_skip_group）——
+        组处于可选位置时 :2167 的 m.group(1) 返回 None，:2168 守卫同样
+        可达，仅查①②防不住这类改法。
+      未知操作码一律按最坏情形处理（响亮失败，宁误红不漏红）。
     返回 (模式总数, 违规列表 [(lang, pattern 摘录, 理由)])。
     """
-    try:
-        import re._parser as sre_parse   # Python 3.11+（re 为包）
-    except ImportError:                  # Python 3.10：re 为单模块，旧顶层名等价
-        import sre_parse
-
-    def group_seq(node, gid):
-        for op, av in node:
-            if op == sre_parse.SUBPATTERN:
-                if av[0] == gid:
-                    return av[3]
-                found = group_seq(av[3], gid)
-                if found is not None:
-                    return found
-            elif op == sre_parse.BRANCH:
-                for branch in av[1]:
-                    found = group_seq(branch, gid)
-                    if found is not None:
-                        return found
-            elif op in (sre_parse.ASSERT, sre_parse.ASSERT_NOT):
-                found = group_seq(av[1], gid)
-                if found is not None:
-                    return found
-        return None
-
-    def seq_can_be_empty(node):
-        def item(op, av):
-            if op in (sre_parse.LITERAL, sre_parse.NOT_LITERAL, sre_parse.IN,
-                      sre_parse.ANY, sre_parse.ANY_ALL):
-                return False
-            if op == sre_parse.AT or op in (sre_parse.ASSERT,
-                                            sre_parse.ASSERT_NOT):
-                return True
-            if op == sre_parse.SUBPATTERN:
-                return seq_can_be_empty(av[3])
-            if op in (sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT):
-                return True if av[0] == 0 else seq_can_be_empty(av[2])
-            if op == sre_parse.BRANCH:
-                return any(seq_can_be_empty(b) for b in av[1])
-            return True        # GROUPREF 等未知形态按可空处理（响亮失败）
-        return all(item(op, av) for op, av in node)
-
     total, violations = 0, []
     for lang, table in sorted(tables.items()):
         for pat, _kind, resolver in table['imports']:
@@ -2713,10 +2798,52 @@ def _imports_spec_guard(tables):
             if rx.groups < 1:
                 violations.append((lang, pat[:60], 'no capturing group 1'))
                 continue
-            seq = group_seq(sre_parse.parse(pat), 1)
-            if seq is not None and seq_can_be_empty(seq):
+            seq = _sre_group_seq(pat, 1)
+            if seq is not None and _seq_captures_can_be_empty(seq):
                 violations.append((lang, pat[:60],
                                    'group 1 can capture empty text'))
+            tree = list(_sre_parse.parse(pat))
+            if _seq_can_skip_group(tree, 1):
+                violations.append((lang, pat[:60],
+                                   'group 1 can be skipped (optional '
+                                   'position)'))
+    return total, violations
+
+
+def _decl_n_guard(tables):
+    """:2025-2026「缺 name 守卫」的等价不变式（批次 7 强化；批次 7r 补 MANDATORY 判据）。
+
+    对全部表的每条 decl 模式断言：命名组 n 存在（re.compile(...).groupindex）
+    且组 n 满足双判据（sre_parse 语句树分析，语义同 _imports_spec_guard）——
+      · NONNULL：组 n 不可能捕获空文本（_seq_captures_can_be_empty）；
+      · MANDATORY：组 n 不可能整体不参与匹配（_seq_can_skip_group）——
+        组可选时 :2024 m.groupdict().get('n') 返回 None，:2026 守卫同样
+        可达，仅查可空防不住这类改法（验证者注入实证的漏判形态）。
+    保证 :2024 的取值永不为 None/空串，:2026 守卫无可构造输入。
+    返回 (模式总数, 违规列表 [(lang, pattern 摘录, 理由)])。
+    """
+    total, violations = 0, []
+    for lang, table in sorted(tables.items()):
+        for pat, _kind, _role in table['decl']:
+            total += 1
+            try:
+                rx = re.compile(pat)
+            except re.error as exc:
+                violations.append((lang, pat[:60], 'unparseable: %r' % (exc,)))
+                continue
+            gnum = rx.groupindex.get('n')
+            if gnum is None:
+                violations.append((lang, pat[:60], 'no named group n'))
+                continue
+            seq = _sre_group_seq(pat, gnum)
+            if seq is not None and _seq_captures_can_be_empty(seq):
+                violations.append((lang, pat[:60],
+                                   'named group n can capture empty text'))
+            tree = list(_sre_parse.parse(pat))
+            if _seq_can_skip_group(tree, gnum):
+                violations.append((lang, pat[:60],
+                                   'named group n can be skipped '
+                                   '(optional position)'))
     return total, violations
 
 
@@ -2862,8 +2989,9 @@ def _run_b6_gap_tests(checker):
                and 'symlinked file skipped' in msgs,
                'b6-scan-tree: symlinked dir and file are skipped with warnings')
         else:
-            ck(True, 'b6-scan-tree: symlink branches skipped — platform denies '
-                     'symlink creation (WinError 1314, recorded in report)')
+            checker.skip('b6-scan-tree: symlink branches skipped — platform '
+                         'denies symlink creation (WinError 1314, recorded in '
+                         'report)')
 
         # ---------------------------------------------------------------
         # G6 read_source 失败分支（coverage-gap: 1112-1115,1118-1121,
@@ -2963,18 +3091,20 @@ def _run_b6_gap_tests(checker):
         calls, perr, _decls, symbols, _imps, _eps, _w = _b6_analyze_py(
             root, 'deco.py', mod)
         names = [s['qualname'] for s in symbols]
-        callees = [x[2] for x in calls]
+        receivers = [(x[2], x[3]) for x in calls]
         ck(perr is None and names == ['Outer', 'Outer.m', 'Outer.Inner',
                                       'Outer.Inner.im'],
            'b6-py: class/method decorators and nested class walked (%r)'
            % (names,))
-        # b6 发现（P2，报告 §发现）：collect_calls 只遍历子树、不判定传入节点
-        # 自身——装饰器/默认值表达式的「直接调用」形态（@dec()、x=util()）因此
-        # 不进调用边。此处把现状钉住（不静默改生产行为）。
-        ck(not any(x in callees for x in ('decorator', 'method_dec',
-                                          'default_call')),
-           'b6-py FINDING: decorator/default direct calls are not recorded '
-           '(collect_calls sees the subtree only)')
+        # 批次 7 修复：collect_calls 入口先判传入节点自身——装饰器与默认值
+        # 表达式里的直接调用形态（@dec()、x=util()）必须进调用边（带 receiver）。
+        ck(('decorator', 'base') in receivers
+           and ('default_call', 'base') in receivers,
+           'b7-py: decorator and default-value direct calls are recorded as '
+           'edges with receivers (collect_calls entry-node fix)')
+        ck('method_dec' not in [x[2] for x in calls],
+           'b7-py: bare-name decorator (@base.method_dec, no parens) is '
+           'correctly NOT a call edge')
         mod = ('import helper\n'
                '\n'
                'count: int = 0\n'
@@ -2988,9 +3118,19 @@ def _run_b6_gap_tests(checker):
         names = [s['qualname'] for s in symbols]
         ck(perr is None and names == ['count', 'ann_only', 'add'],
            'b6-py: AnnAssign symbols (with and without value) are collected')
-        ck(not any(x[2] == 'util' for x in calls),
-           'b6-py FINDING: default-value call in a def signature is not '
-           'recorded (same subtree-vs-node gap)')
+        ck(('util', 'helper') in [(x[2], x[3]) for x in calls],
+           'b7-py: default-value call in a def signature is recorded '
+           '(collect_calls entry-node fix)')
+        mod = ('import helper\n'
+               '\n'
+               '\n'
+               'def kw(*, k1=helper.util(4), k2):\n'
+               '    return k1\n')
+        calls, perr, _decls, symbols, _imps, _eps, _w = _b6_analyze_py(
+            root, 'kwonly.py', mod)
+        ck(perr is None and any(s['qualname'] == 'kw' for s in symbols)
+           and ('util', 'helper') in [(x[2], x[3]) for x in calls],
+           'b7-py: keyword-only default call is recorded (kwonly form)')
         mod = 'from ..... import distant\n'
         _calls, perr, _decls, _syms, imports, _eps, _w = _b6_analyze_py(
             root, 'beyond.py', mod)
@@ -3204,9 +3344,21 @@ def _run_b6_gap_tests(checker):
            'b6-main: bare analyze prints usage and exits 2')
         ck(_b6_run_main(['p', eng, '--lang']) == 2,
            'b6-main: trailing option without value exits 2')
-        ck(_b6_run_main(['p', eng, '--bogus', '--quiet',
-                         '--outdir', os.path.join(eng, '_b6flag')]) in (0, 1),
-           'b6-main: unknown flag warns, --quiet is accepted')
+        # 批次 7 强化：拆「in (0, 1)」宽容区间——先捕获输出断言告警文案，
+        # 再断言 rc==0（eng 有受支持文件，仅 unknown-flag 路径）。
+        old_out = sys.stdout
+        sys.stdout = io.StringIO()
+        try:
+            rc = AS.main(['p', eng, '--bogus', '--quiet',
+                          '--outdir', os.path.join(eng, '_b6flag')])
+            captured = sys.stdout.getvalue()
+        finally:
+            sys.stdout = old_out
+        ck('unknown option ignored: --bogus' in captured
+           and 'unknown option ignored: --quiet' not in captured,
+           'b7-main: unknown flag warns by name, --quiet stays silent '
+           '(captured=%r)' % captured[:120])
+        ck(rc == 0, 'b7-main: flag-only run on a supported repo exits 0')
         ck(_b6_run_main(['p', eng, '--lang', 'bogus-lang']) == 2,
            'b6-main: invalid --lang exits 2')
         empty_repo = _b6_root('empty')
@@ -3382,18 +3534,49 @@ def _run_b6_gap_tests(checker):
         #     非 go_block 模式断言「捕获组 1 存在且不可捕获空文本」；模式
         #     若被改成可空组/非捕获组，本断言必红。
         # ---------------------------------------------------------------
-        ck(all('(?P<n>' in pat for tbl in AS.LANG_TABLES.values()
-               for pat, _k, _r in tbl['decl']),
-           'b6-gap-guard: every decl pattern carries a mandatory n group, so '
-           'the "no name" guard (:2026) has no constructible input')
+        # 批次 7 强化（3c）：子串代理 → sre_parse 解析树判据；批次 7r
+        # （P1-2）：补 MANDATORY 判据（可跳过位置），与 NONNULL（可空）
+        # 合成双判据——验证者注入实证旧判据漏「组整体可选/分支内组」。
+        decl_total, decl_viol = _decl_n_guard(AS.LANG_TABLES)
+        ck(not decl_viol,
+           'b7-gap-guard: every decl pattern (all %d tables, %d patterns) '
+           'has a MANDATORY non-empty-capable named group n (sre_parse '
+           'analysis: the group can be neither skipped nor capture empty '
+           'text), so the "no name" guard (:2025-2026) has no constructible '
+           'input; violations=%r'
+           % (len(AS.LANG_TABLES), decl_total, decl_viol))
         total, violations = _imports_spec_guard(AS.LANG_TABLES)
         ck(not violations,
            'b6-gap-guard: no import pattern can capture an empty specifier '
-           '(sre_parse invariant over all %d import patterns in 16 tables: '
-           'non-go_block patterns carry a mandatory, non-empty-capable group '
+           '(sre_parse invariant over all %d import patterns in %d tables: '
+           'non-go_block patterns carry a MANDATORY, non-empty-capable group '
            '1), so the "no spec" guard (:2167-2170 —— 2167 spec = '
            'm.group(1)、2168 if not spec、2169 continue) has no '
-           'constructible input; violations=%r' % (total, violations))
+           'constructible input; violations=%r'
+           % (total, len(AS.LANG_TABLES), violations))
+
+        # 批次 7r（P1-2）：注入必红探针——两类「可跳过」变异体喂给守卫
+        # 判据，断言必被抓红。判据若被改弱（如退回只查可空），本组断言
+        # 先红，防止 :2025-2026/:2167-2170 守卫的防漂移能力静默退化。
+        _mut_decl = {'synthetic': {'decl': [
+            # 变异甲：命名组 n 裹进可选组（组整体可跳过，非空可匹配）
+            (r'\bfunction\s+(?:(?P<n>[\w$]+))?\s*\(', 're', 'decl'),
+            # 变异乙：BRANCH 内混入不含组的替代分支（走该分支即跳过组）
+            (r'\bfunction\s+(?:(?P<n>[\w$]+)|--)\s*\(', 're', 'decl')],
+            'imports': []}}
+        _mt, _mv = _decl_n_guard(_mut_decl)
+        ck(len(_mv) == 2 and all('skipped' in v[2] for v in _mv),
+           'b7r-guard-inject: _decl_n_guard catches skippable named group n '
+           '(optional-wrapper and branch-without-group variants both red); '
+           'violations=%r' % (_mv,))
+        _mut_imp = {'synthetic': {'decl': [], 'imports': [
+            # 变异丙：可选包裹内含捕获组 1（走 else 路径时 :2167 的
+            # m.group(1) 返回 None——验证者 §4.1 的原始漏判形态）
+            (r"^[ \t]*import(?:\s+['\"]([^'\"]+)['\"])?", 're', 'regex')]}}
+        _it, _iv = _imports_spec_guard(_mut_imp)
+        ck(len(_iv) == 1 and 'skipped' in _iv[0][2],
+           'b7r-guard-inject: _imports_spec_guard catches skippable group 1 '
+           '(optional-wrapper variant red); violations=%r' % (_iv,))
 
         # ---------------------------------------------------------------
         # G15 转发桩与 __main__ 守卫（coverage-gap: 3652-3657,3661）
@@ -3412,7 +3595,10 @@ def _run_b6_gap_tests(checker):
         finally:
             os.path.isfile = real_isfile
         if os.environ.get(B6_GAP_ENV) == '1':
-            ck(True, 'b6-forward: nested process skips subprocess forwarding')
+            # 批次 7r（P2-3）：嵌套进程哨兵分支改显式 skip——计数进
+            # skipped 不计 passed（ck(True) 是不可伪证的恒真断言）。
+            checker.skip('b6-forward: nested process skips subprocess '
+                         'forwarding')
         else:
             os.environ[B6_GAP_ENV] = '1'
             ck(_b6_quiet(AS.run_selftest) == 0,

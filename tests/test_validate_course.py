@@ -632,10 +632,21 @@ def test_gap_close():
         rex(r'(</section>)',
             '<div class="translate-pair"><div class="tp-head">'
             '</div></div>\\1'))
-    rc, _out = run_main(['validate_course.py', path])
-    ck(isinstance(rc, int),
-       'b6b-main: empty translate-pair inside a module runs 839 (rc=%d)'
-       % rc)
+    rc, out = run_main(['validate_course.py', path])
+    # 批次 7r 更正（P2-4，验证者）：本断言是「覆盖见证」而非 :839 的语义
+    # 守卫——空 pair 两侧皆空集，禁用 :839 continue 后循环体对空集不产生
+    # 任何可观察差异（验证者变异实证仍绿），故它证明的是「空 pair 进入配
+    # 对循环区域、被摘要计数且零错误」，不能证明「:839 在跳过它」。其判别
+    # 力在于摘要计数（只数非空 pair 的变异会红）与 rc==0。
+    _praw, _pchk = parse_example()
+    expect_pairs = len(_pchk.pairs) + 1
+    ck(rc == 0 and ('翻译块 %d 个' % expect_pairs) in out,
+       'b7-main: empty translate-pair is a coverage witness — it reaches '
+       'the pair-loop region and is counted in the summary with zero '
+       'errors (NOT a semantic guard of the :839 skip: for empty pairs '
+       'disabling the skip is unobservable by construction) (summary=%d '
+       'pairs, rc=%d)'
+       % (expect_pairs, rc))
 
     # ---- verbatim_check 全分支（662,677-700）：六种 pair 变体 ----
     vsrc = fresh_dir('vsrc')

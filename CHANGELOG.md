@@ -3,6 +3,27 @@
 本文件记录 code2course 技能包的版本变更（[Keep-a-Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 格式）。
 版本号唯一事实来源：SKILL.md frontmatter `version`；resources 三件套头部 `@version` 与此同步。
 
+## [1.17.0] — 2026-09-15
+
+遗留债务清零批次：v1.16.0 登记的 6 项 P2 债务全部处置，另含独立终验 REJECT 两项的修复与复审（deepseek 终验两轮：首轮 REJECT → 修复后 ACCEPT，终值与预测逐位一致）。产品侧两处小改，其余为测试强化与测量口径统一。三套件 **676 passed / 16 skipped / 0 failed**（诚实 skip 计数），Python 3.10 与 3.12 双解释器、严格串行验证。
+
+### Fixed
+
+- **collect_calls 入口判定**（analyze_structure.py）：入口先判 `isinstance(node, ast.Call)` 收录传入节点自身——`@decorator()`、参数默认值表达式等**直接调用形态此前整条漏出调用边**（批次 6 登记 P2）。断言由「钉现状」缺席式改正向（装饰器/默认值边必须存在 + 无括号装饰器非边的语义边界），新增 kwonly 默认值等表驱动 fixture。facts 条目形状不变（仅边增多），corpus 14 仓双跑 structure-facts.json 逐字节确定性绿实证。
+- **cmd_map 外部边计数死代码删除**（analyze_structure.py）：上游已过滤 external 边，该分支永假；dict 键形状保留。
+- **终验 REJECT 修复①（测量污染）**：自研 sys.monitoring 覆盖率工具的行事件过滤由尾名匹配改**绝对路径全等**——测试文件与产品文件同尾名碰撞产生 5 条幻影命中，使 analyze 覆盖率高估至 99.9%（1900/1901）；修正后真实终值 **1895/1901 = 99.68%**（缺口 6 行全硬理由，见 Known limitations）。哨兵环境变量预设一并删除。
+- **终验 REJECT 修复②（守卫漏判）**：decl/imports 模式守卫补「可跳过」判据——NONNULL（组能否捕获空文本）之外加 **MANDATORY**（组能否整体不参与匹配：min=0 重复体 / 分支无组替代 / 未知操作码响亮失败）双判据合成；2 条注入必红断言入套件（覆盖 3 个变异体，判据被弱化即双双变红），独立探针 15 表 94 decl + 27 imports 模式零误红。
+
+### Changed
+
+- **断言计数改 passed/failed/skipped 三元**：诚实 skip（符号链接平台守卫、语料 b 双跑见证分支等 16 条）不再计入 passed；两处恒真/宽容断言改真实判据（validate 空 pair 的可观察效果、未知旗标告警逐项断言）。
+- **覆盖率口径 v2**（取代 v1.16.0 旧读数，**新旧口径不可直比**）：① 函数 docstring 从 AST 语句行分母排除（CPython 编译期常量化，trace 双口径均无行事件）；② sys.monitoring 交叉口径证实 RecursionError except 族真实执行——stdlib trace 测不到属**测量协议限制**而非不可达（口径注记已入码）。
+
+### Known limitations
+
+- analyze_structure.py 语句覆盖 **99.68%**（1895/1901），缺口 6 行逐项：:1083/:1085/:1093/:1095 符号链接平台守卫族（本机 WinError 1314 无法构造输入）+ :2034/:2177 静态不可达守卫（机检断言钉住）。validate_course.py **100.0%**（554/554）。
+- 复审 NOTES（登记待下批）：① `_fixture_root` SIBLING 回退仍共享探针基座（pid 后缀只护探针目录一处），「三套件严禁并发」纪律继续有效；② mon 步失败回显晚于验收链日志落盘，自证链待重跑一次 mon 步补齐；③ 插桩跑进程退出码恒 0、不承担门线职责（改进方向：已知计时门白名单外 FAIL 即 exit 2）；④ 发布文案统一「2 条断言 / 3 个变异体」计数口径。
+
 ## [1.16.0] — 2026-09-15
 
 覆盖率冲刺批次：两工具语句覆盖逐项交账 + validate 独立测试套件 + 语料常驻测试层。三套件 687 断言全绿（analyze 476 / validate 99 / 语料 112），Python 3.10 与 3.12 双解释器验证。产品代码零改动（本批全部为测试与文档）。

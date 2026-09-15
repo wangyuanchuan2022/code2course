@@ -1274,17 +1274,21 @@ def default_exprs(args):
 
 
 def collect_calls(node, caller, out):
-    """收集子树中的调用点 → (line, caller, callee, receiver)。"""
+    """收集子树中的调用点 → (line, caller, callee, receiver)。
+
+    传入节点自身若是调用点同样收录（批次 7 修复：此前只看子树，
+    装饰器/参数默认值表达式里的「直接调用」形态——@dec()、x=util()——
+    会整条漏进调用边）。
+    """
+    if isinstance(node, ast.Call):
+        func = node.func
+        if isinstance(func, ast.Attribute):
+            out.append((node.lineno, caller, func.attr,
+                        dotted_text(func.value)))
+        elif isinstance(func, ast.Name):
+            out.append((node.lineno, caller, func.id, None))
     for child in ast.iter_child_nodes(node):
-        if isinstance(child, ast.Call):
-            func = child.func
-            if isinstance(func, ast.Attribute):
-                out.append((child.lineno, caller, func.attr, dotted_text(func.value)))
-            elif isinstance(func, ast.Name):
-                out.append((child.lineno, caller, func.id, None))
-            collect_calls(child, caller, out)
-        else:
-            collect_calls(child, caller, out)
+        collect_calls(child, caller, out)
 
 
 def is_main_guard(test):
@@ -1407,6 +1411,10 @@ def analyze_python(root, rel, data, text, symbols, imports, entry_points,
         # P1-3：深嵌套合法文件（超长属性链/加法链）ast.parse 能过、遍历递归爆栈
         # ——单文件隔离（F1）：按 parse-error 优雅降级，不牵连整仓。截断前已
         # 提取的符号/入口如实保留，该文件调用/import 边跳过。
+        # 覆盖率口径注（批次 7）：stdlib trace 口径下本分支行事件不可记录
+        # （递归超限时 trace 函数自身先收到 RecursionError、线程 tracer 被
+        # CPython 静默摘除）——其执行已由 sys.monitoring 交叉口径证实，
+        # 属「测量协议限制」而非不可达，见 agent-out/b7-debt-report.md。
         return [], ('RecursionError: AST traversal exceeded the recursion '
                     'limit; per-file isolation (calls/imports of this file '
                     'skipped)'), set()
@@ -3121,9 +3129,10 @@ def cmd_map(facts, depth, subdir, file_granular):
                                          'verified': 0, 'inferred': 0,
                                          'external': 0})
         edge['count'] += 1
-        if imp.get('external'):
-            edge['external'] += 1
-        elif imp.get('confidence') == CONF_VERIFIED:
+        # 批次 7：原 :3124-3125 `if imp.get('external'): edge['external'] += 1`
+        # 为死代码——上游 :3111 已把 external 边计入 unmapped 后 continue，
+        # 此处 confidence 只可能是 verified/inferred 二选一。
+        if imp.get('confidence') == CONF_VERIFIED:
             edge['verified'] += 1
         else:
             edge['inferred'] += 1

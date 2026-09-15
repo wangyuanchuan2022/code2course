@@ -90,6 +90,12 @@ class Checker(object):
             self.failures.append(label)
             print('[FAIL] %-24s %s' % (label, _asc(detail)))
 
+    def skip(self, lang, cid, detail=''):
+        """显式跳过通道（批次 7r P2-3，与主套件 SelftestChecker.skip 同纪律）：
+        见证型、不可伪证的检查计 skipped 不计 passed。"""
+        self.skipped += 1
+        print('[SKIP] %-24s %s' % ('%s/%s' % (lang, cid), _asc(detail)))
+
 
 def find_repo_root(explicit):
     """定位 analyze_structure.py 所在仓库根：--repo 优先；否则从脚本目录逐级
@@ -198,9 +204,14 @@ def check_repo(checker, repo_root, lang, repo_dir, only_tag):
             try:
                 with open(path_a, encoding='utf-8') as fh:
                     facts_a = json.load(fh)
-                checker.check(True, lang, 'b',
-                              'parsed %d top-level keys'
-                              % len(facts_a if isinstance(facts_a, dict) else {}))
+                # 批次 7r（P2-3）：解析成功本身不可伪证（失败会走 except
+                # 分支红），属见证型——改显式 skip，不再计入 passed。
+                checker.skip(lang, 'b',
+                             'parsed %d top-level keys (witness, not '
+                             'falsifiable; failure path is the b-fail '
+                             'branch)'
+                             % len(facts_a if isinstance(facts_a, dict)
+                                   else {}))
             except (OSError, ValueError) as exc:
                 checker.check(False, lang, 'b', 'facts json unreadable: %r' % exc)
         else:
