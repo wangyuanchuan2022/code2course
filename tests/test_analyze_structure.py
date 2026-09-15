@@ -2648,6 +2648,78 @@ def _b6_run_main(argv):
     return _b6_quiet(AS.main, argv)
 
 
+def _imports_spec_guard(tables):
+    """:2167-2170「空 spec 守卫」的等价不变式（6c 重写，替代空真断言）。
+
+    对全部表的每条 imports 模式断言：除 go_block（:2163-2166 提前分流、
+    不达 :2167 的 spec 行）外——
+      ① 存在捕获组 1（否则 :2167 的 m.group(1) 直接 IndexError）；
+      ② 组 1 不可能捕获空文本（sre_parse 语句树可空分析；GROUPREF 等
+        未知操作码按「可空」处理 = 响亮失败，宁可误红不可漏红）。
+    返回 (模式总数, 违规列表 [(lang, pattern 摘录, 理由)])。
+    """
+    try:
+        import re._parser as sre_parse   # Python 3.11+（re 为包）
+    except ImportError:                  # Python 3.10：re 为单模块，旧顶层名等价
+        import sre_parse
+
+    def group_seq(node, gid):
+        for op, av in node:
+            if op == sre_parse.SUBPATTERN:
+                if av[0] == gid:
+                    return av[3]
+                found = group_seq(av[3], gid)
+                if found is not None:
+                    return found
+            elif op == sre_parse.BRANCH:
+                for branch in av[1]:
+                    found = group_seq(branch, gid)
+                    if found is not None:
+                        return found
+            elif op in (sre_parse.ASSERT, sre_parse.ASSERT_NOT):
+                found = group_seq(av[1], gid)
+                if found is not None:
+                    return found
+        return None
+
+    def seq_can_be_empty(node):
+        def item(op, av):
+            if op in (sre_parse.LITERAL, sre_parse.NOT_LITERAL, sre_parse.IN,
+                      sre_parse.ANY, sre_parse.ANY_ALL):
+                return False
+            if op == sre_parse.AT or op in (sre_parse.ASSERT,
+                                            sre_parse.ASSERT_NOT):
+                return True
+            if op == sre_parse.SUBPATTERN:
+                return seq_can_be_empty(av[3])
+            if op in (sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT):
+                return True if av[0] == 0 else seq_can_be_empty(av[2])
+            if op == sre_parse.BRANCH:
+                return any(seq_can_be_empty(b) for b in av[1])
+            return True        # GROUPREF 等未知形态按可空处理（响亮失败）
+        return all(item(op, av) for op, av in node)
+
+    total, violations = 0, []
+    for lang, table in sorted(tables.items()):
+        for pat, _kind, resolver in table['imports']:
+            total += 1
+            if resolver == 'go_block':
+                continue
+            try:
+                rx = re.compile(pat)
+            except re.error as exc:
+                violations.append((lang, pat[:60], 'unparseable: %r' % (exc,)))
+                continue
+            if rx.groups < 1:
+                violations.append((lang, pat[:60], 'no capturing group 1'))
+                continue
+            seq = group_seq(sre_parse.parse(pat), 1)
+            if seq is not None and seq_can_be_empty(seq):
+                violations.append((lang, pat[:60],
+                                   'group 1 can capture empty text'))
+    return total, violations
+
+
 def _run_b6_gap_tests(checker):
     ck = checker.check
     roots = []
@@ -3304,24 +3376,24 @@ def _run_b6_gap_tests(checker):
 
         # ---------------------------------------------------------------
         # G19 缺口守卫：把「不可达」的静态理由变成可回归断言
-        #     （coverage-gap: 2026 与 2169 —— 防御性守卫，无构造输入）
+        #     （coverage-gap: 2026 与 2167-2170 —— 防御性守卫，无构造输入）
+        #     6c：imports 侧原探针循环是空真断言（probes=[] 时 all([]) 恒真），
+        #     重写为 sre_parse 语句树不变式 _imports_spec_guard——对全部
+        #     非 go_block 模式断言「捕获组 1 存在且不可捕获空文本」；模式
+        #     若被改成可空组/非捕获组，本断言必红。
         # ---------------------------------------------------------------
         ck(all('(?P<n>' in pat for tbl in AS.LANG_TABLES.values()
                for pat, _k, _r in tbl['decl']),
            'b6-gap-guard: every decl pattern carries a mandatory n group, so '
            'the "no name" guard (:2026) has no constructible input')
-        probes = []
-        for tbl in AS.LANG_TABLES.values():
-            for pat, _k, _r in tbl['imports']:
-                rx = re.compile(pat, re.MULTILINE)
-                for sample in ('import ""', "require('')", '#include ""',
-                               'import ', 'use ', 'using '):
-                    m = rx.search(sample)
-                    if m is not None:
-                        probes.append(m.group(1))
-        ck(all(p for p in probes),
-           'b6-gap-guard: no import pattern can capture an empty specifier, so '
-           'the "no spec" guard (:2169) has no constructible input')
+        total, violations = _imports_spec_guard(AS.LANG_TABLES)
+        ck(not violations,
+           'b6-gap-guard: no import pattern can capture an empty specifier '
+           '(sre_parse invariant over all %d import patterns in 16 tables: '
+           'non-go_block patterns carry a mandatory, non-empty-capable group '
+           '1), so the "no spec" guard (:2167-2170 —— 2167 spec = '
+           'm.group(1)、2168 if not spec、2169 continue) has no '
+           'constructible input; violations=%r' % (total, violations))
 
         # ---------------------------------------------------------------
         # G15 转发桩与 __main__ 守卫（coverage-gap: 3652-3657,3661）
