@@ -16,7 +16,7 @@
   v1.11：.viz-stage/.flow-svg 容器改 role="group"（可交互子元素须留在
   无障碍树内）；赌注揭晓用独立类 is-spot-bet；新增 --on-accent 与
   --code-hot-fg 对比度 token。
-  @version 1.17.0
+  @version 1.18.0
 =================================================================== -->
 <html lang="zh-CN">
 <head>
@@ -141,6 +141,18 @@
           <div class="callgraph-stage" role="group" aria-label="{{项目名}} 全景调用图"></div>
           <div class="callgraph-facts t-muted" aria-live="polite">{{初始提示，如：悬停节点或连线看事实}}</div>
         </div>
+
+        <!-- v1.18.0 理解骨架（封面必备两件，机检常开、缺一即 ERROR）：
+             ① 仓库总架构图块 —— 类名 .arch-scene（与上面的全景调用图并存），
+                回答「这个仓库整体长什么样、各模块各占哪一段」。数据块用
+                script 的 arch-data（与 callgraph-data 同型，另加 module_marks
+                标注每个课程模块覆盖哪些节点）；节点可带 desc/role/view，
+                边可带 kind（owns｜call｜dependency｜data｜control）与 detail。
+                线型仍只表示置信度（实线=实锤、虚线=推断），箭头才表示 kind。
+             ② 运行链路块 —— 类名 .run-chain：4 步以上对象级时序，每步 .rc-step
+                带 data-step 与 .rc-obj / .rc-what 两个子元素。
+             引擎与样式由 resources/app.js、resources/base.css 提供，此处不写内联脚本。
+             完整契约见 interactive-elements.md §14a。 -->
       </section>
 
       <!-- ============ 模块 1（示例：完整模块骨架） ============ -->
@@ -314,7 +326,15 @@
              学习者亲手压栈/弹栈。块型：<div class="tower-scene scene"> + tower-data JSON。
            · 🛤️ 分叉沙盘（§11）—— 分支条件/配置扩展面（3d）：fork-data JSON 预标注
              参数与分支映射，拖令牌试验不同输入。块型：<div class="fork-scene scene"> + fork-data JSON。
-      -->
+
+           v1.18.0 理解骨架（每个正式模块必备，机检常开、缺项即 ERROR）：
+           · .module-card 模块三句话卡 —— 四行 mc-row（data-key=problem｜input｜
+             output｜segment），segment 一行指明本模块对应总架构图上的哪一段。
+           · .design-qa 设计四问块 —— 四行 dq-row（data-q=what｜why｜else｜simpler），
+             按档位每模块 1／2／3 块。
+           · .vardict-scene 变量词典 —— 全课至少一个：vardict-row 的 data-var 与
+             data-stage 成对出现，var-chain 内至少两个 vc-node 描述变量生命周期。
+           三者都是静态结构（无脚本、无动画），样式同样来自 base.css。 -->
 
       <!-- 多文件模式：册间翻页（底部固定 pager，册间边界按 ←/→ 时 JS 弹非阻断
            .vol-hint 提示条）。单文件模式整块删除；首册没有上一册时删 prev 链接、
@@ -329,7 +349,10 @@
 
       <!-- ============ 结业收束段（v1.11.2 起为默认结构，删除才需要理由） ============
            独立于最后一个主题模块并进入目录导航；必含三件：主线回顾（优先可视化回放）、
-           ≥1 道跨模块综合题、下一步行动指引。收束段里的 mN 引用必须与各模块标题核对 -->
+           ≥1 道跨模块综合题、下一步行动指引。收束段里的 mN 引用必须与各模块标题核对。
+           v1.18.0 增补第四件：改造指南表（类名 .upgrade-guide）—— 每行 .ug-row 的
+           data-task 是「想做的事」，.ug-task 与 .ug-where 两格回答「去哪儿改」；
+           L1 至少 4 行、L2/L3 至少 6 行（机检常开）。静态表格，无脚本。 -->
       <section class="module" id="m-finale">
         <header>
           <h2 class="t-h1">🏁 结业：你现在应该能接手它了</h2>

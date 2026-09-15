@@ -62,10 +62,10 @@ def fresh_dir(tag):
     return path
 
 
-def make_course(tag, transform=None):
-    """把成品复制到临时目录（可选单点变异），返回路径。"""
-    with io.open(EXAMPLE, 'r', encoding='utf-8', newline='') as fh:
-        text = fh.read()
+def make_course(tag, transform=None, inject=True):
+    """把成品（默认含骨架注入，见文件末「骨架注入」节）复制到临时目录
+    （可选单点变异），返回路径。"""
+    text = example_text(inject)
     if transform is not None:
         text = transform(text)
     path = os.path.join(fresh_dir(tag), 'course.html')
@@ -92,20 +92,36 @@ def rex(pattern, repl, count=1):
 
 
 def inject_first_link_field(field_json):
-    """返回变异器：把字段注入第一个调用图 links 元素（对象内首部）。"""
+    """返回变异器：把字段注入第一个**调用图**数据块的 links 首元素。
+
+    锚点必须带 callgraph-data 类名——骨架注入后文档里还有 .arch-data 块，
+    它也带 links[]，只认第一个 "links": [ 会把字段注进不跑调用图契约的块。
+    """
     def _t(s):
-        m = re.search(r'"links"\s*:\s*\[\s*\{', s)
+        m = re.search(r'class="callgraph-data">[\s\S]*?"links"\s*:\s*\[\s*\{', s)
         if not m:
-            raise AssertionError('no links array found')
+            raise AssertionError('no callgraph links array found')
         return s[:m.end()] + field_json + s[m.end():]
     return _t
 
 
-def parse_example():
-    """解析成品 → CourseChecker（各检查函数的数据源）。"""
+def example_text(inject=True):
+    """读盘上 example；inject=True 时先做骨架注入（默认）。
+
+    盘上 example 是 v1.17.0 前的旧成品，不含 v1.18.0 理解骨架六件——检查 19-23
+    会判它红（取证见 test_example_conflict）。本套件的既定断言语义是「合规课程
+    在单点变异下变红」，故默认在**副本 + 机械骨架注入**上跑：原有 18 项断言语义
+    一字不变，同时顺带证明「既有 18 项在新组件在场时仍绿」。
+    """
     with io.open(EXAMPLE, 'r', encoding='utf-8', newline='') as fh:
-        raw = fh.read()
+        text = fh.read()
+    return inject_skeleton(text) if inject else text
+
+
+def parse_example(inject=True):
+    """解析成品（默认已注入骨架）→ CourseChecker（各检查函数的数据源）。"""
     chk = VC.CourseChecker()
+    raw = example_text(inject)
     chk.feed(raw)
     chk.close()
     return raw, chk
@@ -122,6 +138,218 @@ def graph_blocks(chk, raw):
         except ValueError:
             pass
     return out
+
+
+def arch_block(raw):
+    """抽取 .arch-data JSON（骨架注入产物内；契约 §一.1 第六类数据块）。"""
+    m = re.search(r'<script type="application/json" class="arch-data">'
+                  r'([\s\S]*?)</script>', raw)
+    if not m:
+        raise AssertionError('no .arch-data block')
+    return json.loads(m.group(1))
+
+
+def arch_json_transform(fn):
+    """返回变异器：解析 .arch-data → fn(data) → 回写（结构类变异用）。
+
+    比正则切片稳：JSON 内部缩进/换行由 json.dumps 重排，锚点不依赖字面量。
+    """
+    def _t(text):
+        def _repl(m):
+            data = json.loads(m.group(1))
+            fn(data)
+            return ('<script type="application/json" class="arch-data">\n'
+                    + json.dumps(data, ensure_ascii=False, indent=2)
+                    + '\n</script>')
+        out, n = re.subn(r'<script type="application/json" '
+                         r'class="arch-data">([\s\S]*?)</script>', _repl, text,
+                         count=1)
+        if not n:
+            raise AssertionError('no .arch-data block to mutate')
+        return out
+    return _t
+
+
+# ------------------------------------------- 骨架注入（v1.18.0 契约 §一 组件结构）
+# 盘上 example 是 v1.17.0 前的旧成品（无理解骨架六件），v1.18.0 检查 19-23 判它
+# 红（取证见 test_example_conflict）。注入是**机械**的：.arch-data 由 example 的
+# 封面调用图 JSON 派生（nodes/links 原样 + module_marks），其余五件按契约 §一 的
+# 类名与数据属性拼装。注入只新增组件、不改既有元素，故原有 18 项断言语义不变。
+# 逐件判定「盘上已有则跳过」——example 日后被课程重做会话重建为 v1.18.0 合规
+# 成品时，注入自动退化为补齐缺件（不重复注入），本套件仍可跑。
+SKEL_DESIGN_BLOCKS = 3      # 每正式模块注入的设计四问块数（同时满足 L3 下限）
+SKEL_UG_ROWS = 6            # 结业段改造指南条目数（L2/L3 下限 6）
+SKEL_RC_STEPS = 5           # 封面运行链步数（>4 下限，留出「减到 3 步」变异余量）
+
+
+def _arch_json_from_cover(text):
+    """把封面调用图 JSON 派生成 .arch-data（契约 §一.1：nodes/links + module_marks）。"""
+    m = re.search(r'<script type="application/json" class="callgraph-data">'
+                  r'([\s\S]*?)</script>', text)
+    if not m:
+        raise AssertionError('封面调用图块不存在，无法派生 .arch-data')
+    data = json.loads(m.group(1))
+    marks = [{'id': 'm%d' % (i + 1), 'label': '模块 %d' % (i + 1),
+              'covers': [n['id']]}
+             for i, n in enumerate(data.get('nodes', [])[:3])]
+    return json.dumps({'nodes': data.get('nodes', []),
+                       'links': data.get('links', []),
+                       'module_marks': marks},
+                      ensure_ascii=False, indent=2)
+
+
+def _arch_scene_html(arch_json):
+    return ('<div class="arch-scene scene">\n'
+            '<div class="arch-title t-h3">仓库总架构</div>\n'
+            '<p class="t-body">这张图回答整个程序由哪些部分组成、谁依赖谁，'
+            '以及每个模块在整条链路上的位置。</p>\n'
+            '<script type="application/json" class="arch-data">\n'
+            + arch_json + '\n</script>\n'
+            '<div class="arch-stage" role="group" aria-label="仓库总架构">'
+            '</div>\n'
+            '<div class="arch-facts t-muted" aria-live="polite">点节点看依赖'
+            '</div>\n</div>\n')
+
+
+def _run_chain_html():
+    steps = [('用户', '双击图标启动程序'),
+             ('main.py', '创建主窗口并拉起求解器线程'),
+             ('solver.py', '按截图、识别、推理、决策四步循环推进'),
+             ('vision.py', '截屏切片并把每格识别成数字或空白'),
+             ('ui/window.py', '把这一步的决策画回棋盘')][:SKEL_RC_STEPS]
+    items = ['<li class="rc-step" data-step="%d"><span class="rc-obj">%s</span>'
+             '<span class="rc-what">%s</span></li>' % (i, obj, what)
+             for i, (obj, what) in enumerate(steps, 1)]
+    return '<ol class="run-chain">\n' + '\n'.join(items) + '\n</ol>\n'
+
+
+def _module_card_html():
+    rows = [('problem', '解决什么问题', '把这一层要处理的核心矛盾说清楚'),
+            ('input', '输入是什么', '具体到数据形态，而不是笼统的用户数据'),
+            ('output', '输出是什么', '交给下一层的产物是什么形态'),
+            ('segment', '在总架构图上的位置', '对应 module_marks 里覆盖本模块的那一段')]
+    body = '\n'.join('<div class="mc-row" data-key="%s">'
+                     '<span class="mc-key">%s</span>'
+                     '<span class="mc-val">%s</span></div>' % r for r in rows)
+    return '<div class="module-card">\n' + body + '\n</div>\n'
+
+
+def _design_qa_html(idx):
+    rows = [('what', '它做什么', '这一层在链路上负责的单一职责'),
+            ('why', '为什么这么做', '这样切分的收益与代价'),
+            ('else', '不这么做会怎样', '换成另一种写法的后果'),
+            ('simpler', '为什么不用更简单的方法', '简单解法在什么条件下会失效')]
+    body = '\n'.join('<div class="dq-row" data-q="%s"><dt class="dq-key">%s</dt>'
+                     '<dd class="dq-val">%s</dd></div>' % r for r in rows)
+    return ('<div class="design-qa">\n'
+            '<div class="dq-title t-h3">设计四问 %d</div>\n'
+            '<dl class="dq-list">\n' % idx + body + '\n</dl>\n</div>\n')
+
+
+def _vardict_html():
+    rows = [('cell_value', '单格像素样本', '识别阶段产生', 'utils/vision.py · L88'),
+            ('clicks', '外围候选格', '分区阶段产生',
+             'utils/probability.py · L120')]
+    trs = []
+    for var, plain, stage, loc in rows:
+        trs.append('<tr class="vardict-row" data-var="%s" data-stage="%s">'
+                   '<td class="vd-var">%s</td><td class="vd-plain">%s</td>'
+                   '<td class="vd-stage">%s</td><td class="vd-loc">%s</td></tr>'
+                   % (var, stage, var, plain, stage, loc))
+    nodes = []
+    for i, var in enumerate([r[0] for r in rows]):
+        if i:
+            nodes.append('<span class="vc-arrow" aria-hidden="true">→</span>')
+        nodes.append('<span class="vc-node" data-var="%s">%s</span>' % (var, var))
+    return ('<div class="vardict-scene">\n'
+            '<div class="vardict-title t-h3">变量词典</div>\n'
+            '<table class="vardict-table">\n'
+            '<thead><tr><th>代码变量</th><th>人话</th><th>生命周期</th>'
+            '<th>代码位置</th></tr></thead>\n<tbody>\n'
+            + '\n'.join(trs) + '\n</tbody>\n</table>\n'
+            '<div class="var-chain" aria-label="变量生命周期链">\n'
+            + '\n'.join(nodes) + '\n</div>\n</div>\n')
+
+
+def _upgrade_guide_html():
+    rows = [('换扫雷皮肤', 'vision.py · cfg.json'),
+            ('提高识别准确率', 'utils/vision.py'),
+            ('换一套推理策略', 'utils/deduction.py'),
+            ('接入新的求解器', 'utils/solver.py'),
+            ('加一个统计面板', 'ui/window.py'),
+            ('把启发式换成模型', 'utils/probability.py')][:SKEL_UG_ROWS]
+    trs = ['<tr class="ug-row" data-task="%s"><td class="ug-task">%s</td>'
+           '<td class="ug-where">%s</td></tr>' % (task, task, where)
+           for task, where in rows]
+    return ('<table class="upgrade-guide">\n'
+            '<thead><tr><th>想做的事</th><th>去哪儿改</th></tr></thead>\n'
+            '<tbody>\n' + '\n'.join(trs) + '\n</tbody>\n</table>\n')
+
+
+def inject_skeleton(text):
+    """在 example 文本上机械注入理解骨架六件，返回注入后的 HTML 文本。
+
+    逐件判定：盘上已有该组件就跳过（example 重建为 v1.18.0 合规成品后仍然可跑）。
+    收尾 fail-loud：注入后六件必须都在场，否则报错而不是让断言悄悄失去意义。
+    """
+    out = text
+    hero_extra = ''
+    if 'class="arch-scene' not in out:
+        hero_extra += _arch_scene_html(_arch_json_from_cover(out))
+    if 'class="run-chain"' not in out:
+        hero_extra += _run_chain_html()
+    if hero_extra:
+        out2 = re.sub(r'(<section class="module hero"[^>]*>)',
+                      lambda m: m.group(1) + '\n' + hero_extra, out, count=1)
+        if out2 == out:
+            raise AssertionError('封面段锚点缺失，骨架注入无法进行')
+        out = out2
+
+    state = {'vd': 'class="vardict-scene' in out,
+             'card': 'class="module-card' in out,
+             'design': 'class="design-qa' in out,
+             'guide': 'class="upgrade-guide' in out}
+
+    def _inject_module(m):
+        open_tag, mid = m.group(1), m.group(2)
+        body = ''
+        if 'finale' in mid:
+            if not state['guide']:
+                state['guide'] = True
+                body += _upgrade_guide_html()
+            return open_tag + '\n' + body
+        if not state['card']:
+            body += _module_card_html()
+        if not state['vd']:
+            state['vd'] = True
+            body += _vardict_html()
+        if not state['design']:
+            body += ''.join(_design_qa_html(i)
+                            for i in range(1, SKEL_DESIGN_BLOCKS + 1))
+        return open_tag + '\n' + body
+
+    out = re.sub(r'(<section class="module" id="([^"]+)"[^>]*>)', _inject_module,
+                 out)
+    for cls in ('arch-scene', 'run-chain', 'module-card', 'vardict-scene',
+                'design-qa', 'upgrade-guide'):
+        if ('class="%s' % cls) not in out:
+            raise AssertionError('骨架注入后仍缺 .%s（example 形态变了？）' % cls)
+    return out
+
+
+def skeleton_course_path():
+    """「example 副本 + 骨架注入」落盘路径（本套件绿路径断言的基准产物）。"""
+    return make_course('skel')
+
+
+def run_mutant(tag, transform, tier='L2', inject=True):
+    """在（注入后的）副本上做单点变异并跑 CLI，返回 (rc, 输出文本)。"""
+    try:
+        path = make_course(tag, transform, inject)
+    except AssertionError as exc:
+        return None, 'ANCHOR-MISS %s' % exc
+    args = ['validate_course.py', path] + (['--tier', tier] if tier else [])
+    return run_main(args)
 
 
 # ----------------------------------------------------------------- 1. 用法/IO
@@ -150,19 +378,23 @@ def test_usage_and_io():
 
 # ------------------------------------------------- 2. 绿路径 + 旗标（--mask/--source）
 def test_green_and_flags():
-    rc, out = run_main(['validate_course.py', EXAMPLE, '--tier', 'L2'])
+    # v1.18.0：绿路径基准产物改为「example 副本 + 骨架注入」（见文件头「骨架注入」
+    # 节与 test_example_conflict）——盘上 example 是 v1.17.0 前的旧成品，检查 19-23
+    # 判它红。断言语义不变：合规课程在 CLI 绿路径下 exit 0。
+    green = skeleton_course_path()
+    rc, out = run_main(['validate_course.py', green, '--tier', 'L2'])
     ck(rc == 0 and '全部通过' in out,
-       'val-main: example L2 validates green (CLI contract)')
-    rc, _out = run_main(['validate_course.py', EXAMPLE, '--mask'])
+       'val-main: example+skeleton clone validates green under L2 (CLI contract)')
+    rc, _out = run_main(['validate_course.py', green, '--mask'])
     ck(rc == 0, 'val-main: --mask run stays green (mask_scan executed)')
     empty_src = fresh_dir('emptysrc')
-    rc, out = run_main(['validate_course.py', EXAMPLE, '--source', empty_src])
+    rc, out = run_main(['validate_course.py', green, '--source', empty_src])
     ck(rc in (0, 1) and out,
        'val-verbatim: --source with missing files runs verbatim_check')
-    rc, out = run_main(['validate_course.py', EXAMPLE, '--source', SOURCE_DIR])
+    rc, out = run_main(['validate_course.py', green, '--source', SOURCE_DIR])
     ck(rc in (0, 1) and out,
        'val-verbatim: --source with the real tree runs verbatim_check')
-    rc, out = run_main(['validate_course.py', EXAMPLE, '--tier', 'L3'])
+    rc, out = run_main(['validate_course.py', green, '--tier', 'L3'])
     ck(rc in (0, 1) and out,
        'val-tier: unknown tier id goes through the tier rule lookup')
 
@@ -682,6 +914,397 @@ def test_gap_close():
        'b6b-verbatim: drift and mismatch are reported (691-695,699-700)')
 
 
+# --------------------------------------- 6. v1.18.0 检查 19-23（理解骨架六件）
+def test_skeleton_green():
+    """正向可达：注入骨架的副本在 --tier L2 下全绿，汇总行逐件 ✓ 且有计数。"""
+    rc, out = run_main(['validate_course.py', skeleton_course_path(),
+                        '--tier', 'L2'])
+    ck(rc == 0 and '全部通过' in out,
+       'v18-green: example+skeleton clone is fully green under L2 (rc=%d)' % rc)
+    line = ''
+    for ln in out.splitlines():
+        if ln.startswith('理解骨架（19-23）'):
+            line = ln
+    ck(bool(line), 'v18-green: 19-23 汇总行存在（✓/✗ + 计数）')
+    ck(line.count('✓') == 6 and '✗' not in line,
+       'v18-green: 六件全 ✓（%s）' % line)
+    ck(bool(re.search(r'架构图 \d+ 张 ✓', line)) and
+       bool(re.search(r'运行链 \d+ 条 [4-9]\d* 步 ✓', line)),
+       'v18-green: 封面架构图与运行链步数落在汇总行')
+    ck(bool(re.search(r'模块卡 \d+ 张 \d+ 行 ✓', line)) and
+       bool(re.search(r'设计四问 \d+ 块 \d+ 行 ✓', line)) and
+       bool(re.search(r'改造指南 \d+ 个 \d+ 行 ✓', line)),
+       'v18-green: 模块卡/设计四问/改造指南的块与行计数落在汇总行')
+
+
+def test_skeleton_direct():
+    """直调五个新检查：真实解析状态 + 手工最小记录的边界值（含档位门）。"""
+    _raw, chk = parse_example()
+    stats = chk.module_stats
+
+    for label, fn, extra in (('19 封面架构图与运行链', VC.arch_scene_check, ()),
+                             ('20 每模块三句话卡', VC.module_card_check, ()),
+                             ('21 变量词典', VC.vardict_check, ()),
+                             ('22 设计四问（L3 加严）', VC.design_qa_check, ('L3',)),
+                             ('23 改造指南（L3 加严）',
+                              VC.upgrade_guide_check, ('L3',))):
+        errs = []
+        fn(stats, *extra, errs)
+        ck(errs == [], 'v18-direct: 注入骨架的真实统计通过 %s' % label)
+
+    ck(sum(m.get('arch', 0) for m in stats) >= 1
+       and sum(m.get('runchain', 0) for m in stats) >= 1
+       and sum(m.get('rc_steps', 0) for m in stats) >= VC.SKEL_RC_STEPS,
+       'v18-stats: arch/runchain/rc_steps 落在 module_stats')
+    ck(all(all(k in m for k in ('arch', 'runchain', 'rc_steps', 'card',
+                                'card_rows', 'vardict', 'vd_rows', 'vc_nodes',
+                                'design', 'dq_rows', 'guide', 'ug_rows'))
+           for m in stats),
+       'v18-stats: 契约 §三 的 12 个新计数字段全部落在每条 module_stats 上')
+
+    def rec(**kw):
+        base = {'id': 'm1', 'hero': False, 'pairs': 0, 'eng': 0, 'quiz': 0,
+                'cg': 0, 'text': []}
+        base.update(kw)
+        return base
+
+    for label, mod, want in (
+            ('19 边界 4 步判绿',
+             rec(id='m0', hero=True, arch=1, runchain=1, rc_steps=4), 0),
+            ('19 缺架构图判红',
+             rec(id='m0', hero=True, arch=0, runchain=1, rc_steps=5), 1),
+            ('19 缺运行链判红',
+             rec(id='m0', hero=True, arch=1, runchain=0, rc_steps=5), 1),
+            ('19 运行链 3 步判红',
+             rec(id='m0', hero=True, arch=1, runchain=1, rc_steps=3), 1)):
+        errs = []
+        VC.arch_scene_check([mod], errs)
+        ck(len(errs) == want, 'v18-19: %s（errs=%d）' % (label, len(errs)))
+    errs = []
+    VC.arch_scene_check([rec(id='m1', arch=0, runchain=0)], errs)
+    ck(errs == [], 'v18-19: 非封面模块不受检查 19 约束')
+
+    for label, mod, want in (
+            ('20 卡内 4 行判绿', rec(id='m1', card=1, card_rows=4), 0),
+            ('20 缺卡判红', rec(id='m1', card=0, card_rows=9), 1),
+            ('20 卡内 3 行判红', rec(id='m1', card=1, card_rows=3), 1),
+            ('20 两卡 7 行判红', rec(id='m1', card=2, card_rows=7), 1),
+            ('20 封面豁免', rec(id='m0', hero=True, card=0), 0),
+            ('20 结业段豁免', rec(id='m9-finale', card=0), 0),
+            ('20 无 id 豁免', rec(id=None, card=0), 0)):
+        errs = []
+        VC.module_card_check([mod], errs)
+        ck(len(errs) == want, 'v18-20: %s（errs=%d）' % (label, len(errs)))
+
+    for label, mods, want in (
+            ('21 无词典判红', [rec(id='m1')], 1),
+            ('21 一场景两行两节点判绿',
+             [rec(id='m1', vardict=1, vd_rows=2, vc_nodes=2)], 0),
+            ('21 场景空着判红',
+             [rec(id='m1', vardict=1, vd_rows=0, vc_nodes=2)], 1),
+            ('21 缺生命周期链判红',
+             [rec(id='m1', vardict=1, vd_rows=1, vc_nodes=1)], 1),
+            ('21 两场景四行四节点判绿',
+             [rec(id='m1', vardict=2, vd_rows=2, vc_nodes=4)], 0)):
+        errs = []
+        VC.vardict_check(mods, errs)
+        ck(len(errs) == want, 'v18-21: %s（errs=%d）' % (label, len(errs)))
+
+    for tier, want in (('L1', 0), ('L2', 1), ('L3', 1), ('no-such-tier', 0),
+                       (None, 0)):
+        errs = []
+        VC.design_qa_check([rec(id='m1', design=1, dq_rows=4)], tier, errs)
+        ck(len(errs) == want,
+           'v18-22: 1 块在档位 %s 下 errs=%d（L1/未给为下限 1）'
+           % (tier, len(errs)))
+    errs = []
+    VC.design_qa_check([rec(id='m1', design=1, dq_rows=3)], 'L1', errs)
+    ck(len(errs) == 1 and '设计四问缺项' in errs[0],
+       'v18-22: 块数够但四问缺项判红')
+    errs = []
+    VC.design_qa_check([rec(id='m0', hero=True, design=0),
+                        rec(id='m9-finale', design=0)], 'L3', errs)
+    ck(errs == [], 'v18-22: 封面与结业段不参与设计四问下限')
+
+    for tier, want in (('L1', 0), ('L2', 1), ('L3', 1), ('no-such-tier', 0),
+                       (None, 0)):
+        errs = []
+        VC.upgrade_guide_check([rec(id='m9-finale', guide=1, ug_rows=4)],
+                               tier, errs)
+        ck(len(errs) == want,
+           'v18-23: 4 条在档位 %s 下 errs=%d（L2/L3 加严到 6）'
+           % (tier, len(errs)))
+    errs = []
+    VC.upgrade_guide_check([rec(id='m9-finale', guide=0, ug_rows=9)], 'L2', errs)
+    ck(len(errs) == 1 and '缺改造指南' in errs[0], 'v18-23: 缺改造指南表判红')
+    errs = []
+    VC.upgrade_guide_check([rec(id='m1', guide=0, ug_rows=0)], 'L2', errs)
+    ck(errs == [], 'v18-23: 非结业段模块不参与检查 23')
+
+
+def test_skeleton_negative():
+    """注入必红：每个新检查 ≥2 个变异体，逐条断言目标 ERROR 文案。"""
+    drop_arch = rex(r'<div class="arch-scene scene">[\s\S]*?'
+                    r'aria-live="polite">[^<]*</div>\n</div>\n', '')
+    drop_chain = rex(r'<ol class="run-chain">[\s\S]*?</ol>\n', '')
+    rc_steps_3 = rex(r'<li class="rc-step" data-step="[45]">',
+                     '<li data-step="0">', count=2)
+    card_off = sub('<div class="module-card">', '<div class="module-card-off">')
+    mc_row_3 = sub('<div class="mc-row" data-key="segment">',
+                   '<div class="mc-row-off" data-key="segment">')
+    chain_off = sub('<div class="var-chain"', '<div class="var-chain-off"')
+    stage_drop = rex(r'(class="vardict-row" data-var="[^"]*") data-stage="[^"]*"',
+                     r'\1', count=2)
+    vd_off = sub('<div class="vardict-scene">', '<div class="vardict-scene-off">')
+    design_1 = rex(r'<div class="design-qa">', '<div class="design-qa-off">',
+                   count=2)
+    dq_row_3 = sub('<div class="dq-row" data-q="simpler">',
+                   '<div class="dq-row-off" data-q="simpler">')
+    ug_3 = rex(r'<tr class="ug-row" data-task="[^"]*">',
+               '<tr class="ug-row-off" data-task="x">', count=3)
+    ug_4 = rex(r'<tr class="ug-row" data-task="[^"]*">',
+               '<tr class="ug-row-off" data-task="x">', count=2)
+    ug_off = sub('<table class="upgrade-guide">',
+                 '<table class="upgrade-guide-off">')
+
+    def outside_row(text):
+        """卡内减到 3 行，再在卡外补一条游离 .mc-row（不能替卡片充数）。"""
+        text = mc_row_3(text)
+        return sub('<div class="design-qa">',
+                   '<div class="mc-row" data-key="ghost"></div>\n'
+                   '<div class="design-qa">')(text)
+
+    cases = [
+        ('19a', '删封面 .arch-scene', drop_arch, 'L2', '缺仓库总架构图'),
+        ('19b', '删封面 .run-chain', drop_chain, 'L2', '缺一次完整运行链路'),
+        ('19c', '运行链 5 步减到 3 步', rc_steps_3, 'L2', '.rc-step 仅 3 步'),
+        ('19d', '常开：删架构图（无 --tier）', drop_arch, None, '缺仓库总架构图'),
+        ('20a', '卡片类名被改（卡消失）', card_off, 'L2', '缺三句话卡'),
+        ('20b', '卡内 .mc-row 减到 3 行', mc_row_3, 'L2', '三句话卡内容不全'),
+        ('20c', '卡外游离 .mc-row 不能充数', outside_row, 'L2',
+         '三句话卡内容不全'),
+        ('20d', '常开：卡消失（无 --tier）', card_off, None, '缺三句话卡'),
+        ('21a', '删 .var-chain（生命周期链）', chain_off, 'L2', '缺生命周期链'),
+        ('21b', 'vardict-row 去掉 data-stage', stage_drop, 'L2', '有空场景'),
+        ('21c', '删 .vardict-scene', vd_off, 'L2', '全课缺变量词典'),
+        ('21d', '常开：删 var-chain（无 --tier）', chain_off, None,
+         '缺生命周期链'),
+        ('22a', '四问块 3 减到 1（L2）', design_1, 'L2', '设计四问 1 块 < 2'),
+        ('22b', '四问块 3 减到 1（L3）', design_1, 'L3', '设计四问 1 块 < 3'),
+        ('22c', '某块四问减到 3 问', dq_row_3, 'L2', '设计四问缺项'),
+        ('23a', '改造指南 6 条减到 3 条（L2）', ug_3, 'L2',
+         '改造指南条目 3 < 6'),
+        ('23b', '删 .upgrade-guide', ug_off, 'L2', '缺改造指南'),
+    ]
+    for tag, label, transform, tier, kw in cases:
+        rc, out = run_mutant('neg' + tag, transform, tier)
+        ck(rc == 1 and kw in out,
+           'v18-negative %s %s → rc=%s，目标 ERROR「%s」%s'
+           % (tag, label, rc, kw, '出现' if kw in out else '未出现'))
+
+    # 档位门：22/23 的加严下限——同一变异在 L1 缺省下限下应判绿
+    for tag, label, transform in (
+            ('22d', '四问 1 块（L1 下限 1）', design_1),
+            ('23c', '改造指南 4 条（L1 下限 4）', ug_4)):
+        rc, out = run_mutant('gate' + tag, transform, None)
+        ck(rc == 0 and '全部通过' in out,
+           'v18-tier-gate %s %s → rc=%s（无 --tier 走 L1 下限，判绿）'
+           % (tag, label, rc))
+
+
+def test_example_conflict():
+    """example 集成冲突（v1.18.0）：盘上旧成品在 L2 下必红——19-23 逐条取证。
+
+    本批按任务书**不重建 example**（重建归课程重做会话），处置不是放松门线，而是
+    把本套件全部绿路径断言改跑「副本 + 骨架注入」（见 test_green_and_flags 与
+    make_course 的 inject 缺省）——原有 18 项断言语义不变，新检查在同一产物上被
+    证绿且被证红。旧成品的红在此留证：断言到具体文案，不是只断言 rc!=0。
+    """
+    rc, out = run_mutant('pristine', None, 'L2', inject=False)
+    ck(rc == 1, 'v18-conflict: 盘上旧 example（无骨架）在 L2 下判红（rc=%s）' % rc)
+    for kw, label in (('缺仓库总架构图', '19 封面架构图'),
+                      ('缺一次完整运行链路', '19 封面运行链'),
+                      ('缺三句话卡', '20 模块卡'),
+                      ('全课缺变量词典', '21 变量词典'),
+                      ('设计四问', '22 设计四问'),
+                      ('缺改造指南', '23 改造指南')):
+        ck(kw in out,
+           'v18-conflict: 旧成品缺 %s 被点名（关键词「%s」）' % (label, kw))
+
+
+def test_cg_semantic_fields():
+    """v1.18.0 §14a/§二：节点 desc/role、边 kind/detail 并入检查 16 键集。
+
+    既有键与既有语义不动（about/call、confidence/resolved_by/resolution 照旧，
+    非闭集值照旧报错）；新增字段出现即受「非空 + 上限 + 闭集」三条约束。
+    """
+    raw, chk = parse_example()
+    data = graph_blocks(chk, raw)[0][1]
+
+    errs = []
+    d = _clone(data)
+    d['nodes'][0].update({'desc': '程序入口：拉起界面与求解器',
+                          'role': '启动与装配'})
+    d['links'][0].update({'kind': 'owns', 'detail': '持有实例并驱动一次求解'})
+    VC.callgraph_check(d, 'b6', errs, [])
+    ck(errs == [], 'v18-cg14a: desc/role/kind/detail 合规值判绿（键集已扩容）')
+
+    probes = [
+        ('desc 超长', {'nodes': [0, {'desc': 'x' * (VC.CG_DESC_MAX + 1)}]},
+         '超长'),
+        ('desc 空串', {'nodes': [0, {'desc': '   '}]}, '不是非空字符串'),
+        ('role 超长', {'nodes': [0, {'role': 'x' * (VC.CG_ROLE_MAX + 1)}]},
+         '超长'),
+        ('node view 仍是契约外键（arch 专用）',
+         {'nodes': [0, {'view': 'own'}]}, '契约外键'),
+        ('link desc 仍是契约外键', {'links': [0, {'desc': 'x'}]}, '契约外键'),
+        ('link role 仍是契约外键', {'links': [0, {'role': 'x'}]}, '契约外键'),
+        ('kind 出闭集', {'links': [0, {'kind': 'calls'}]}, '不在闭集'),
+        ('kind 空串', {'links': [0, {'kind': ''}]}, '不在闭集'),
+        ('detail 超长', {'links': [0, {'detail': 'x' * (VC.CG_DETAIL_MAX + 1)}]},
+         '超长'),
+        ('detail 非字符串', {'links': [0, {'detail': 1}]}, '不是非空字符串'),
+    ]
+    for label, spec, kw in probes:
+        d = _clone(data)
+        for coll, (idx, patch) in spec.items():
+            d[coll][idx].update(patch)
+        errs = []
+        VC.callgraph_check(d, 'b6', errs, [])
+        ck(any(kw in e for e in errs),
+           'v18-cg14a: %s 判红（关键词「%s」）' % (label, kw))
+
+    d = _clone(data)
+    d['module_marks'] = []
+    errs = []
+    VC.callgraph_check(d, 'b6', errs, [])
+    ck(any('顶层出现契约外键' in e for e in errs),
+       'v18-cg14a: callgraph-data 顶层仍只允许 nodes/links（module_marks 判红）')
+
+
+def test_arch_data_contract():
+    """v1.18.0 §一.1：.arch-data 走调用图同一套契约，差异=module_marks + 节点 4–20。"""
+    raw, chk = parse_example()
+    arch = arch_block(raw)
+
+    errs = []
+    n = VC.arch_check(arch, 'b6', errs, [])
+    ck(errs == [] and n >= 1,
+       'v18-arch: 派生 arch-data 通过契约，返回 %d 条 module_marks' % n)
+    errs = []
+    bare = _clone(arch)
+    bare.pop('module_marks', None)
+    ck(VC.arch_check(bare, 'b6', errs, []) == 0 and errs == [],
+       'v18-arch: module_marks 缺失时返回 0 且不报错（完整性由检查 19 把关）')
+
+    def probe(label, mutate, kw):
+        d = _clone(arch)
+        mutate(d)
+        errs = []
+        VC.arch_check(d, 'b6', errs, [])
+        ck(any(kw in e for e in errs), 'v18-arch: %s 判红（「%s」）' % (label, kw))
+
+    probe('module_marks 空数组',
+          lambda d: d.update({'module_marks': []}), '必须是非空数组')
+    probe('module_marks 非数组',
+          lambda d: d.update({'module_marks': 'm1'}), '必须是非空数组')
+    probe('module_marks 项非对象',
+          lambda d: d.update({'module_marks': ['m1']}), '不是对象')
+    probe('module_marks 缺 id',
+          lambda d: d['module_marks'][0].pop('id'), '缺 id')
+    probe('module_marks 缺 label',
+          lambda d: d['module_marks'][0].pop('label'), '缺 label')
+    probe('module_marks 项出现契约外键',
+          lambda d: d['module_marks'][0].update({'covers_x': []}), '契约外键')
+    probe('covers 为空数组',
+          lambda d: d['module_marks'][0].update({'covers': []}),
+          'covers 必须是非空数组')
+    probe('covers 指向不存在的节点',
+          lambda d: d['module_marks'][0].update({'covers': ['no-such-node']}),
+          '不是 nodes[].id')
+    probe('covers 元素非字符串',
+          lambda d: d['module_marks'][0].update({'covers': [1]}),
+          '不是 nodes[].id')
+    probe('节点少于 4 个',
+          lambda d: d.update({'nodes': d['nodes'][:3]}), '不在 4–20 区间')
+    probe('节点多于 20 个',
+          lambda d: d.update({'nodes': d['nodes'] * 3}), '不在 4–20 区间')
+    probe('view 出闭集',
+          lambda d: d['nodes'][0].update({'view': 'bogus'}), '不在闭集')
+    probe('节点未知键',
+          lambda d: d['nodes'][0].update({'bogus': 1}), '契约外键')
+    probe('顶层多余键',
+          lambda d: d.update({'extra': 1}), '顶层出现契约外键')
+    probe('arch-data 内的自环边',
+          lambda d: d['links'].append(
+              {'from': d['nodes'][0]['id'], 'to': d['nodes'][0]['id'],
+               'count': 1, 'confidence': 'inferred'}), '自环')
+    errs = []
+    ck(VC.arch_check(['not-an-object'], 'b6', errs, []) == 0 and bool(errs),
+       'v18-arch: 顶层非对象判红且返回 0')
+    errs = []
+    viewed = _clone(arch)
+    viewed['nodes'][0]['view'] = 'own'
+    ck(VC.arch_check(viewed, 'b6', errs, []) >= 1 and errs == [],
+       'v18-arch: 节点 view=own 判绿（arch-data 专属可选键，闭集 own/flow）')
+
+
+def test_module_marks_completeness():
+    """v1.18.0 §一.1：多个正式模块时，封面总架构图的 module_marks 不得为空。"""
+    def rec(**kw):
+        base = {'id': 'm1', 'hero': False, 'pairs': 0, 'eng': 0, 'quiz': 0,
+                'cg': 0, 'text': []}
+        base.update(kw)
+        return base
+
+    hero_ok = rec(id='m0', hero=True, arch=1, arch_marks=2, runchain=1,
+                  rc_steps=4)
+    hero_bare = rec(id='m0', hero=True, arch=1, arch_marks=0, runchain=1,
+                    rc_steps=4)
+    errs = []
+    VC.arch_scene_check([_clone(hero_bare), rec(id='m1'), rec(id='m2')], errs)
+    ck(any('缺模块归属标注' in e for e in errs),
+       'v18-19: 多正式模块而 module_marks 为空 → 判红')
+    errs = []
+    VC.arch_scene_check([_clone(hero_ok), rec(id='m1'), rec(id='m2')], errs)
+    ck(errs == [], 'v18-19: module_marks 非空判绿')
+    errs = []
+    VC.arch_scene_check([_clone(hero_bare), rec(id='m1')], errs)
+    ck(errs == [], 'v18-19: 只有一个正式模块时不要求归属标注')
+    errs = []
+    VC.arch_scene_check([_clone(hero_bare), rec(id='m1'),
+                         rec(id='m9-finale')], errs)
+    ck(errs == [], 'v18-19: 结业段不计入正式模块数（单正式模块仍免）')
+
+
+def test_arch_data_negative():
+    """注入必红（CLI 端到端）：arch-data 已注册且受契约约束。"""
+    drop_marks = arch_json_transform(lambda d: d.pop('module_marks', None))
+    ghost_cover = arch_json_transform(
+        lambda d: d['module_marks'][0].update({'covers': ['no-such-node']}))
+    three_nodes = arch_json_transform(
+        lambda d: d.update({'nodes': d['nodes'][:3]}))
+    top_extra = arch_json_transform(lambda d: d.update({'extra': 1}))
+    link_kind = arch_json_transform(
+        lambda d: d['links'][0].update({'kind': 'calls'}))
+    view_bogus = arch_json_transform(
+        lambda d: d['nodes'][0].update({'view': 'bogus'}))
+
+    cases = [
+        ('arch-marks', '删 module_marks', drop_marks, '缺模块归属标注'),
+        ('arch-cover', 'covers 指向幽灵节点', ghost_cover, '不是 nodes[].id'),
+        ('arch-nodes', '节点减到 3 个', three_nodes, '不在 4–20 区间'),
+        ('arch-top', 'arch-data 顶层多余键', top_extra, '顶层出现契约外键'),
+        ('arch-kind', '边 kind 出闭集', link_kind, '不在闭集'),
+        ('arch-view', '节点 view 出闭集', view_bogus, '不在闭集'),
+    ]
+    for tag, label, transform, kw in cases:
+        rc, out = run_mutant(tag.replace('-', ''), transform, 'L2')
+        ck(rc == 1 and kw in out,
+           'v18-arch-negative %s %s → rc=%s，目标 ERROR「%s」%s'
+           % (tag, label, rc, kw, '出现' if kw in out else '未出现'))
+
+
 def run_selftest():
     test_usage_and_io()
     test_green_and_flags()
@@ -689,6 +1312,14 @@ def run_selftest():
     test_direct_checks()
     test_deep_checks()
     test_gap_close()
+    test_skeleton_green()
+    test_skeleton_direct()
+    test_skeleton_negative()
+    test_cg_semantic_fields()
+    test_arch_data_contract()
+    test_module_marks_completeness()
+    test_arch_data_negative()
+    test_example_conflict()
     test_main_guard()
     print('validate-tests: %d passed / %d failed'
           % (len(_passed), len(_failed)))

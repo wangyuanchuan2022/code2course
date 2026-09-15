@@ -20,8 +20,14 @@
    ::after opacity 过渡；封面光晕去 blur；点亮站点文字加对比度光晕；
    移动端 SVG 文字放大；触摸目标 ≥44px；代码行号 sticky。
    赌注揭晓行改用独立类 .is-spot-bet（与探照灯 .is-spot 分离）。
+   v1.18.0 变更：新增「理解骨架」六件的外观——仓库总架构图 .arch-scene
+   （复用 §20 调用图引擎，本节只补宿主外壳 / 模块归属带 / kind 图例）、
+   一次完整运行链路 .run-chain、模块三句话卡 .module-card、变量词典
+   .vardict-scene、设计四问块 .design-qa、改造指南 .upgrade-guide。
+   全部静态结构（不新增动画引擎）、全部走既有 token（不引入新色）、
+   不新增状态类（高亮仍只认 .is-cg-hot / .is-cg-dim）。
    ===================================================================
-   @version 1.17.0 */
+   @version 1.18.0 */
 
 /* ---------- 1. 变量 ---------- */
 :root {
@@ -1061,4 +1067,200 @@ fieldset.fork-param { border: 1px dashed var(--border);
   .callgraph-svg { min-width: 560px; }
   .cg-node .cg-label, .cg-node .cg-glyph { font-size: 13px; }
   .callgraph-facts { font-size: 0.78rem; }
+}
+
+/* ---------- 21. 理解骨架组件（v1.18.0） ----------
+   仓库总架构图 .arch-scene 复用 §20 的调用图引擎（同一套分层 / 布线 / 端口 /
+   命中区 / 状态类 .is-cg-hot·.is-cg-dim），本节只补宿主外壳与五个静态组件。
+   纪律：颜色一律走既有 token——强调底上的文字只用 --on-accent*，亮底小字强调
+   用 --accent-text，正文用 --text，禁裸白字；全部是静态结构，不新增动画引擎，
+   不新增状态类（高亮仍只认 .is-cg-hot / .is-cg-dim）。 */
+
+/* --- 21.1 仓库总架构图 .arch-scene（引擎见 app.js §20，此处只补增量） --- */
+.arch-title { margin-bottom: var(--space-2); }
+.arch-stage { margin-top: var(--space-3); overflow-x: auto; }
+.arch-facts {
+  margin-top: var(--space-2); min-height: 1.6em;
+  font-family: var(--font-mono); font-size: 0.82rem;
+  white-space: pre-line; line-height: 1.55;
+}
+/* flow 视角节点（view:"flow"）：底色微暖 + 虚线描边，与 own 视角一眼可分。
+   变体类不叫 is-*，避免与状态类契约表混淆。 */
+.cg-node.arch-view-flow .cg-box {
+  fill: color-mix(in srgb, var(--accent-soft) 55%, var(--bg-card));
+  stroke-dasharray: 4 3;
+}
+/* 模块归属带：垫在最底层，虚线框圈住该模块覆盖的节点 */
+.cg-marks { pointer-events: none; }
+.cg-mark-band {
+  fill: color-mix(in srgb, var(--accent-2) 8%, transparent);
+  stroke: color-mix(in srgb, var(--accent-2) 45%, var(--border));
+  stroke-width: 1.5; stroke-dasharray: 6 5;
+}
+.cg-mark-label {
+  fill: var(--text-muted); font-family: var(--font-body);
+  font-size: 11px; font-weight: 600;
+}
+/* 节点右上角的模块编号片（说明「它属于第 N 个模块」） */
+.cg-mark-chip { fill: var(--accent-2); }
+.cg-mark-chip-t {
+  fill: var(--on-accent-2); font-family: var(--font-body);
+  font-size: 10px; font-weight: 700;
+}
+/* 图下两行静态说明：kind 图例 + 模块覆盖段 */
+.arch-legend, .arch-marks {
+  display: flex; flex-wrap: wrap; gap: var(--space-2) var(--space-4);
+  margin-top: var(--space-2);
+}
+.arch-legend { padding-top: var(--space-2); border-top: 1px dashed var(--border); }
+.al-item, .am-item {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 0.78rem; color: var(--text-muted);
+}
+.al-mark { font-size: 0.9rem; line-height: 1; color: var(--accent-text); }
+.al-text, .am-text { overflow-wrap: anywhere; }
+.am-chip {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 18px; height: 18px; flex: 0 0 auto;
+  border-radius: var(--radius-pill);
+  background: var(--accent-2); color: var(--on-accent-2);
+  font-family: var(--font-mono); font-size: 0.7rem; font-weight: 700;
+}
+/* 入场：架构图与调用图共用同一个 is-cg-in（复用既有状态类，不新增） */
+.arch-scene.is-cg-in .callgraph-svg .cg-edges,
+.arch-scene.is-cg-in .callgraph-svg .cg-nodes {
+  opacity: 1; transition: opacity 180ms var(--ease-out);
+}
+
+/* --- 21.2 一次完整运行链路 .run-chain（对象级时序，静态结构） --- */
+.run-chain {
+  list-style: none; margin: var(--space-3) 0 0; padding: 0;
+  display: flex; flex-direction: column; gap: var(--space-2);
+}
+.rc-step {
+  position: relative; display: flex; flex-wrap: wrap;
+  align-items: center; gap: var(--space-2);
+  min-height: 44px; padding: var(--space-2) var(--space-3) var(--space-2) 46px;
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: var(--radius-m); box-shadow: var(--shadow-soft);
+}
+/* 序号直接取自 data-step：写错顺序一眼看得见（不靠 CSS 计数器掩盖数据错误） */
+.rc-step::before {
+  content: attr(data-step);
+  position: absolute; left: var(--space-3); top: 50%; transform: translateY(-50%);
+  width: 22px; height: 22px; border-radius: var(--radius-pill);
+  display: flex; align-items: center; justify-content: center;
+  background: var(--accent); color: var(--on-accent);
+  font-family: var(--font-mono); font-size: 0.75rem; font-weight: 700;
+}
+.rc-obj {
+  flex: 0 0 auto; font-family: var(--font-mono); font-size: 0.82rem;
+  font-weight: 600; color: var(--accent-text);
+}
+.rc-what { font-size: 0.92rem; line-height: 1.6; overflow-wrap: anywhere; }
+
+/* --- 21.3 模块三句话卡 .module-card（S2 为四行） --- */
+.module-card {
+  margin: var(--space-3) 0; overflow: hidden;
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: var(--radius-m); box-shadow: var(--shadow-soft);
+}
+.mc-row {
+  display: grid; grid-template-columns: minmax(120px, 190px) 1fr;
+  gap: var(--space-3); align-items: baseline;
+  padding: var(--space-2) var(--space-3);
+  border-top: 1px dashed var(--border);
+}
+.mc-row:first-child { border-top: none; }
+.mc-key { font-size: 0.82rem; font-weight: 600; color: var(--text-muted); }
+.mc-val { font-size: 0.92rem; line-height: 1.6; overflow-wrap: anywhere; }
+/* 「在总架构图上的位置」一行轻着色：与 .arch-scene 的模块带同一语义 */
+.mc-row[data-key="segment"] {
+  background: color-mix(in srgb, var(--accent-2) 6%, transparent);
+}
+
+/* --- 21.4 变量词典 .vardict-scene（表格 + 生命周期链） --- */
+.vardict-scene {
+  margin: var(--space-4) 0; padding: var(--space-3);
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: var(--radius-l); box-shadow: var(--shadow-soft);
+}
+.vardict-title { margin-bottom: var(--space-3); }
+.vardict-table, .upgrade-guide {
+  width: 100%; border-collapse: collapse; font-size: 0.88rem;
+}
+.vardict-table th, .upgrade-guide th {
+  text-align: left; font-size: 0.78rem; font-weight: 600;
+  color: var(--text-muted); padding: var(--space-2);
+  border-bottom: 2px solid var(--border); white-space: nowrap;
+}
+.vardict-row td, .ug-row td {
+  padding: var(--space-2); vertical-align: top; line-height: 1.55;
+  border-bottom: 1px dashed var(--border);
+}
+/* 悬停底只上调和色（10% 强调色），文字 token 在亮/暗两套主题下都保住对比度 */
+.vardict-row:hover td, .ug-row:hover td {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.vd-var code {
+  font-family: var(--font-mono); font-size: 0.85rem;
+  font-weight: 600; color: var(--accent-text);
+}
+.vd-plain { overflow-wrap: anywhere; }
+.vd-stage { font-size: 0.82rem; color: var(--text-muted); white-space: nowrap; }
+.vd-loc {
+  font-family: var(--font-mono); font-size: 0.78rem;
+  color: var(--text-muted); overflow-wrap: anywhere;
+}
+.var-chain {
+  display: flex; flex-wrap: wrap; align-items: center;
+  gap: var(--space-2); margin-top: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  background: var(--bg-sidebar); border-radius: var(--radius-m);
+}
+.vc-node {
+  font-family: var(--font-mono); font-size: 0.82rem; font-weight: 600;
+  padding: 2px 10px; border-radius: var(--radius-s);
+  background: var(--bg-card); border: 1px solid var(--border); color: var(--text);
+}
+.vc-arrow { font-size: 0.9rem; color: var(--accent-text); }
+
+/* --- 21.5 设计四问块 .design-qa --- */
+.design-qa {
+  margin: var(--space-4) 0; padding: var(--space-3);
+  background: color-mix(in srgb, var(--accent-soft) 55%, var(--bg-card));
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
+  border-radius: var(--radius-l);
+}
+.dq-title { margin-bottom: var(--space-3); }
+.dq-list { margin: 0; display: flex; flex-direction: column; gap: var(--space-3); }
+.dq-row {
+  display: grid; grid-template-columns: minmax(120px, 200px) 1fr;
+  gap: var(--space-3); align-items: baseline;
+}
+/* 问句用正文色 + 强调色竖条（不把强调色当文字用，暗主题下也不掉对比度） */
+.dq-key {
+  font-size: 0.88rem; font-weight: 700; color: var(--text);
+  border-left: 3px solid var(--accent); padding-left: var(--space-2);
+}
+.dq-val { margin: 0; font-size: 0.92rem; line-height: 1.65;
+          overflow-wrap: anywhere; }
+
+/* --- 21.6 改造指南 .upgrade-guide（结业段） --- */
+.upgrade-guide { margin: var(--space-4) 0; }
+.upgrade-guide + .upgrade-guide { margin-top: var(--space-3); }
+.ug-task { font-weight: 600; }
+.ug-where {
+  font-family: var(--font-mono); font-size: 0.82rem;
+  color: var(--accent-text); overflow-wrap: anywhere;
+}
+
+/* 窄屏：两块表格降级为紧凑排版（列不折行也不横向溢出页面） */
+@media (max-width: 719px) {
+  .arch-stage .callgraph-svg { min-width: 560px; }
+  .arch-facts { font-size: 0.78rem; }
+  .vardict-table, .upgrade-guide { font-size: 0.8rem; }
+  .vardict-table th, .vardict-table td,
+  .upgrade-guide th, .ug-row td { padding: var(--space-1) 6px; }
+  .mc-row, .dq-row { grid-template-columns: 1fr; gap: var(--space-1); }
 }

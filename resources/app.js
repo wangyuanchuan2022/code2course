@@ -16,8 +16,15 @@
    ~40）；答题后焦点自动移入反馈条；洋葱层数上限校验；两代引擎的重复
    辅助函数合并（vizEl/ctrlEl 等成为共享实现的别名）；栈塔弹空恢复
    空栈提示；赌注支持"再押一注"。
+   v1.18.0 变更：§20 从「调用图专用」升级为「两个宿主共用一个引擎」——
+   参数化 cgLayout/cgRenderScene + 两组显式选项（调用图宿主 kinds:'explicit'
+   保持缺省逐字不变；架构图宿主 .arch-scene 按契约缺省 call 画箭头）；
+   节点新增 desc/role/view、边新增 kind/detail（kind 走箭头与事实面板，
+   线型仍只承载置信度）；新增 .arch-legend 图例、module_marks 归属带与
+   .arch-marks 行；导出 window.c2cCallgraphLayout / window.c2cArchLayout
+   供课程脚本与测试复用。未新增状态类、未新增动画引擎。
    ===================================================================
-   @version 1.17.0 */
+   @version 1.18.0 */
 (function () {
   'use strict';
 
@@ -1699,19 +1706,31 @@
   });
 
   /* ===================================================================
-     20. 调用图（call-graph）—— 把结构事实渲染成一张节点-边图（v1.13.1）
+     20. 调用图与架构图（call-graph / arch-graph）—— 把结构事实渲染成
+         一张节点-边图（v1.13.1；架构图宿主 v1.18.0）
      -------------------------------------------------------------------
-     宿主：.callgraph-scene + script(type=application/json) 的 callgraph-data 数据块
+     宿主（两个，共用本段全部引擎：分层 / 布线 / 端口 / 命中区 / 状态类）：
+       .callgraph-scene + script(type=application/json) 的 callgraph-data 数据块
+       .arch-scene      + 同型数据块 arch-data（仓库总架构图，多一个 module_marks）
      数据契约（闭集，见 references/interactive-elements.md §14）：
-       nodes[{id,label,kind,file,line}]
+       nodes[{id,label,kind,file,line}]  + 可选 desc(≤60) / role(≤40) / view(own|flow)
        links[{from,to,count,confidence,file,line,declared,back}]
+                                          + 可选 kind(owns|call|dependency|data|control)
+                                            / detail(≤80)
+       module_marks[{id,label,covers[]}] 仅 arch-data 允许（模块归属标注）
        confidence 为闭集 verified|inferred 且**不可缺省**；verified 边必须带
        发起行 file:line（诚实边不允许含糊）。
+     两条视觉通道严格分工、互不侵占：
+       线型 = confidence（verified 实线 / inferred 虚线 / 回边强调色虚线）
+       箭头 = kind（owns 无箭头 / call·dependency 实心头 / data 空心 / control 点形）
      定位：探照灯讲"跨文件怎么走"、栈塔讲"运行时纵深"，调用图讲"整体形状"——
-     谁调谁、谁被最多人调、哪些边只是推断。
+     谁调谁、谁被最多人调、哪些边只是推断；架构图再补一层"这条边是什么性质"
+     与"课程模块各覆盖哪一段"。
+     向后兼容：新字段全部可选，未声明时调用图宿主的渲染结果**逐字节不变**
+     （tests/test_render_arch.mjs 用改造前渲染串的 SHA-256 冻结基线把守）。
      确定性：布局是纯函数，不依赖时间/随机数/DOM 测量顺序——同一份 JSON 必然
      产出同一张图（长标签截断用字符推进宽度估算而非 measureText：后者随字体
-     是否就绪而变，是"同数据不同图"的源头）。
+     是否就绪而变，是"同数据不同图"的源头；箭头几何同样只由端口坐标推出）。
      layout algorithm adapted from CodeGraph (MIT, ui/src/lib/map-model.ts)
      — zero-dependency reimplementation
      =================================================================== */
@@ -1731,6 +1750,13 @@
     'entry': '▶', 'function': 'ƒ', 'method': '◇',
     'class': '◫', 'module': '▦', 'file': '▤'
   };
+  /* v1.18.0：边 kind 闭集（契约 §一/§二）与节点 view 闭集 */
+  var CG_LINK_KINDS = { owns: 1, call: 1, dependency: 1, data: 1, control: 1 };
+  /* 业务向补充字段的清洗：折叠所有空白为单空格（事实面板按行渲染，
+     文本里混进换行会把面板结构冲散），空串等价于未给 */
+  function cgNote(v) {
+    return (typeof v === 'string') ? v.replace(/\s+/g, ' ').trim() : '';
+  }
 
   /* 字符推进宽度估算：全角/CJK 12px、半角 6.6px、代理对（emoji 等）14px */
   function cgCharW(s, i) {
@@ -1788,7 +1814,8 @@
     return id.indexOf('/') !== -1 ||
       CG_TAIL_EXTS[id.slice(id.lastIndexOf('.') + 1).toLowerCase()] === 1;
   }
-  function cgLayout(data) {
+  function cgLayout(data, opts) {
+    opts = opts || CG_OPTS_CALLGRAPH;
     var cmpStr = function (a, b) { return a < b ? -1 : (a > b ? 1 : 0); };
     var nodes = Object.create(null), order = [];
     /* 降级声明计数（v1.13.4 前提）：没画什么必须说出来，不许静默——
@@ -1807,6 +1834,10 @@
         kind: (typeof n.kind === 'string') ? n.kind : '',
         file: (typeof n.file === 'string') ? n.file : '',
         line: (typeof n.line === 'number' && n.line >= 1) ? n.line : null,
+        /* v1.18.0 业务向补充字段（可选）：缺省为空串/own，不影响既有渲染 */
+        desc: cgNote(n.desc), role: cgNote(n.role),
+        view: (n.view === 'flow') ? 'flow' : 'own',
+        marks: [], chips: [],
         w: cgNum(w), x: 0, y: 0
       };
       order.push(n.id);
@@ -1831,7 +1862,12 @@
         confidence: (l.confidence === 'inferred') ? 'inferred' : 'verified',
         file: (typeof l.file === 'string') ? l.file : '',
         line: (typeof l.line === 'number' && l.line >= 1) ? l.line : null,
-        back: (l.back === true)
+        back: (l.back === true),
+        /* v1.18.0：kind/detail 走独立通道（箭头样式 + 事实面板），
+           线型仍只承载 confidence——两处语义互不侵占 */
+        kind: (CG_LINK_KINDS[l.kind] === 1) ? l.kind : 'call',
+        hasKind: CG_LINK_KINDS[l.kind] === 1,
+        detail: cgNote(l.detail)
       };
       links.push(rec);
     });
@@ -1977,41 +2013,162 @@
       if (!l.back) l.back = (layer[l.from] || 0) < (layer[l.to] || 0);
     });
 
+    /* ⑥ 模块归属标注（v1.18.0，仅架构图宿主）：module_marks[].covers 里的节点
+       被同一段框住——「模块 N 覆盖这一段」在图上直接看得见，而不是只在文字里。
+       几何全部由已算好的节点坐标推出（纯函数、零测量）；顺序 = 数据声明顺序，
+       同一份 JSON 两次渲染必然同框。覆盖不到已画节点的模块不画空框（校验器
+       负责把数据错误报出来）。 */
+    var marks = [];
+    if (opts.marks) {
+      (data.module_marks || []).forEach(function (m) {
+        if (!m || typeof m.id !== 'string' || !m.id) return;
+        if (marks.some(function (x) { return x.id === m.id; })) return;
+        var cov = [];
+        (m.covers || []).forEach(function (cid) {
+          if (typeof cid === 'string' && nodes[cid] && cov.indexOf(cid) === -1) cov.push(cid);
+        });
+        if (!cov.length) return;
+        marks.push({ id: m.id, label: cgNote(m.label) || m.id, covers: cov });
+      });
+    }
+    var vbw = contentWidth + CG_PADDING * 2;
+    var vbh = layerCount * pitch - CG_LAYER_GAP + CG_PADDING * 2;
+    marks.forEach(function (mk, i) {
+      var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      mk.covers.forEach(function (id) {
+        var n = nodes[id];
+        minX = Math.min(minX, n.x); minY = Math.min(minY, n.y);
+        maxX = Math.max(maxX, n.x + n.w); maxY = Math.max(maxY, n.y + CG_NODE_H);
+      });
+      var pad = 12 + i * 5;        /* 多模块重叠时边距错开，框线不重合 */
+      mk.x = cgNum(minX - pad); mk.y = cgNum(minY - pad);
+      mk.w = cgNum(maxX - minX + pad * 2); mk.h = cgNum(maxY - minY + pad * 2);
+      mk.textX = cgNum(minX - pad + 6); mk.textY = cgNum(maxY + pad + 14);
+      mk.covered = mk.covers.map(function (id) { return nodes[id].label; });
+      mk.covers.forEach(function (id) {
+        var n = nodes[id];
+        if (n.marks.indexOf(mk.id) === -1) n.marks.push(mk.id);
+        n.chips.push({ x: cgNum(n.x + n.w - 10 - (i % 3) * 16),
+                       y: cgNum(n.y + 9), i: i + 1, mark: mk.id });
+      });
+      vbw = Math.max(vbw, mk.x + mk.w + CG_PADDING);
+      vbh = Math.max(vbh, mk.textY + CG_PADDING);
+    });
+
     return {
       nodes: nodes, order: order, links: links, rows: rows, layer: layer,
       mode: mode, layerCount: layerCount,
       declared: declaredLinks.length, total: links.length,
       cutCount: cutCount, droppedSelfLoops: droppedSelfLoops,
       sameTailCount: sameTailCount,
-      vbw: cgNum(contentWidth + CG_PADDING * 2),
-      vbh: cgNum(layerCount * pitch - CG_LAYER_GAP + CG_PADDING * 2)
+      marks: marks,
+      vbw: cgNum(vbw),
+      vbh: cgNum(vbh)
     };
   }
 
   /* 20c. 渲染与交互（只用 createElementNS；零 innerHTML、无内联 on*、无 fetch）
      线型 = 置信度：verified 实线 / inferred 虚线 / 回边强调色虚线（base.css §20）；
-     每条边另绘同路径、透明、12px 宽的副本专供 hover（1px 线无法命中）。 */
-  document.querySelectorAll('.callgraph-scene').forEach(function (scene) {
-    var stage = scene.querySelector('.callgraph-stage');
+     每条边另绘同路径、透明、12px 宽的副本专供 hover（1px 线无法命中）。
+     宿主与渲染选项：调用图宿主（.callgraph-scene）与架构图宿主（.arch-scene）
+     共用同一套分层 / 布线 / 端口 / 命中区 / 状态类，差异一律用显式选项表达，
+     不靠"猜宿主"：
+       kinds 'explicit' 只有显式声明 kind 的边才画箭头——调用图缺省行为逐字不变；
+             'default'  未声明的边按闭集缺省值 call 画箭头（架构图，照契约默认值）
+       views true = 渲染 nodes[].view（own|flow 视觉可区分）
+       marks true = 渲染 module_marks 模块归属标注
+       legend true = 图下出 kind 图例（且只有真有声明 kind 时）
+     线型通道两处完全一致且**不因 kind 改变**：verified 实线 / inferred 虚线 /
+     回边强调色虚线——kind 只走箭头样式这条独立通道，两条语义互不侵占。 */
+  var CG_OPTS_CALLGRAPH = {
+    data: 'callgraph-data', stage: 'callgraph-stage', facts: 'callgraph-facts',
+    svg: 'callgraph-svg', label: '调用图',
+    kinds: 'explicit', views: false, marks: false, legend: false
+  };
+  var CG_OPTS_ARCH = {
+    data: 'arch-data', stage: 'arch-stage', facts: 'arch-facts',
+    svg: 'callgraph-svg arch-svg', label: '架构图',
+    kinds: 'default', views: true, marks: true, legend: true
+  };
+  /* kind -> 箭头形态（闭集；owns 无箭头）。线型仍只承载 confidence——
+     kind 与 confidence 是两条互不侵占的视觉通道。 */
+  var CG_ARROW_HEAD = { owns: 'none', call: 'solid', dependency: 'solid',
+                        data: 'hollow', control: 'dot' };
+  var CG_KIND_ORDER = ['owns', 'call', 'dependency', 'data', 'control'];
+  var CG_KIND_TEXT = {
+    owns: '持有 / 归属（无箭头）', call: '调用（实心头）',
+    dependency: '依赖（实心头）', data: '数据流（空心箭头）',
+    control: '控制流（点形头）'
+  };
+  var CG_KIND_MARK = { owns: '—', call: '▶', dependency: '▶',
+                       data: '▷', control: '●' };
+  var CG_ARROW_LEN = 11, CG_ARROW_HALF = 5, CG_ARROW_DOT = 4.5;
+
+  /* 箭头几何（纯函数、零测量）：三次贝塞尔的末端控制点与终点同 x，
+     末端切线恒为竖直——箭头方向只需比较终点与中点的 y，不必读 DOM。 */
+  function cgArrowShape(kind, tx, ty, midY) {
+    var shape = CG_ARROW_HEAD[kind] || 'none';
+    if (shape === 'none') return null;
+    var dir = (ty >= midY) ? 1 : -1;      /* 箭头指向 = 进入节点的方向 */
+    if (shape === 'dot') {
+      return { tag: 'circle', shape: shape, kind: kind,
+               cx: String(tx), cy: String(cgNum(ty - dir * 5)),
+               r: String(CG_ARROW_DOT) };
+    }
+    var by = cgNum(ty - dir * CG_ARROW_LEN);
+    return { tag: 'path', shape: shape, kind: kind,
+             d: 'M' + tx + ',' + ty
+                + ' L' + cgNum(tx - CG_ARROW_HALF) + ',' + by
+                + ' L' + cgNum(tx + CG_ARROW_HALF) + ',' + by + ' Z' };
+  }
+
+  function cgRenderScene(scene, opts) {
+    var stage = scene.querySelector('.' + opts.stage);
     if (!stage) return;
-    var facts = scene.querySelector('.callgraph-facts');
-    var data = ctrlParse(scene, 'callgraph-data');
+    var facts = scene.querySelector('.' + opts.facts);
+    var data = ctrlParse(scene, opts.data);
     if (!data || !data.nodes || !data.nodes.length) {
-      ctrlError(scene, '调用图');
+      ctrlError(scene, opts.label);
       return;
     }
-    var G = cgLayout(data);
-    if (!G.order.length) { ctrlError(scene, '调用图'); return; }
+    var G = cgLayout(data, opts);
+    if (!G.order.length) { ctrlError(scene, opts.label); return; }
     scene.setAttribute('data-cg-layer-mode', G.mode);
 
     var NS = 'http://www.w3.org/2000/svg';
     function svgEl(tag) { return document.createElementNS(NS, tag); }
 
     var svg = svgEl('svg');
-    svg.setAttribute('class', 'callgraph-svg');
+    svg.setAttribute('class', opts.svg);
     svg.setAttribute('viewBox', '0 0 ' + G.vbw + ' ' + G.vbh);
     svg.setAttribute('width', '100%');
     svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+    /* 模块归属带：垫在最底层（先入 → 在所有边与节点之下），
+       整组 pointer-events:none，不抢节点命中区 */
+    if (opts.marks && G.marks.length) {
+      var gMarks = svgEl('g');
+      gMarks.setAttribute('class', 'cg-marks');
+      gMarks.setAttribute('pointer-events', 'none');
+      G.marks.forEach(function (mk) {
+        var br = svgEl('rect');
+        br.setAttribute('class', 'cg-mark-band');
+        br.setAttribute('x', String(mk.x));
+        br.setAttribute('y', String(mk.y));
+        br.setAttribute('width', String(mk.w));
+        br.setAttribute('height', String(mk.h));
+        br.setAttribute('rx', '14');
+        br.setAttribute('pointer-events', 'none');
+        gMarks.appendChild(br);
+        var bl = svgEl('text');
+        bl.setAttribute('class', 'cg-mark-label');
+        bl.setAttribute('x', String(mk.textX));
+        bl.setAttribute('y', String(mk.textY));
+        bl.setAttribute('pointer-events', 'none');
+        bl.textContent = mk.label;
+        gMarks.appendChild(bl);
+      });
+      svg.appendChild(gMarks);
+    }
     var gEdges = svgEl('g');
     gEdges.setAttribute('class', 'cg-edges');
     var gNodes = svgEl('g');
@@ -2021,6 +2178,7 @@
 
     /* --- 边：可见路径与命中副本分两轮追加（命中副本在上，重叠边才可点） --- */
     var edgeRecs = [];
+    var arrowEls = [];
     G.links.forEach(function (l) {
       var a = G.nodes[l.from], b = G.nodes[l.to];
       var sx = cgNum(a.x + a.w * l.sf), tx = cgNum(b.x + b.w * l.tf);
@@ -2046,6 +2204,7 @@
       p.setAttribute('data-cg-to', l.to);
       p.setAttribute('data-cg-confidence', l.confidence);
       p.setAttribute('data-cg-back', l.back ? '1' : '0');
+      if (l.hasKind) p.setAttribute('data-cg-kind', l.kind);
       gEdges.appendChild(p);
 
       var hit = svgEl('path');
@@ -2059,17 +2218,43 @@
       gEdges.appendChild(hit);
 
       edgeRecs.push({ l: l, el: p, hit: hit });
+
+      /* 箭头：kind 的唯一视觉通道（实心 / 空心 / 点形 / 无箭头）。
+         kind 未声明时按宿主选项定：调用图不画（缺省行为逐字不变），
+         架构图按闭集缺省值 call 画。线型不动——箭头与虚线互不干扰。 */
+      if (opts.kinds === 'default' || l.hasKind) {
+        var head = cgArrowShape(l.kind, tx, ty, midY);
+        if (head) {
+          var ah = (head.tag === 'circle') ? svgEl('circle') : svgEl('path');
+          ah.setAttribute('class', 'cg-arrow is-' + head.shape);
+          if (head.tag === 'circle') {
+            ah.setAttribute('cx', head.cx);
+            ah.setAttribute('cy', head.cy);
+            ah.setAttribute('r', head.r);
+          } else {
+            ah.setAttribute('d', head.d);
+          }
+          ah.setAttribute('fill', (head.shape === 'hollow') ? 'none' : 'var(--text)');
+          ah.setAttribute('pointer-events', 'none');
+          ah.setAttribute('data-cg-kind', l.kind);
+          arrowEls.push(ah);
+        }
+      }
     });
+    /* 箭头统一在所有边与命中副本之后入组：连线→命中区→箭头 的层序恒定 */
+    arrowEls.forEach(function (ah) { gEdges.appendChild(ah); });
 
     /* --- 节点：圆角矩形 + 类型 glyph + 标签；空心描边，克制风格 --- */
     var nodeEls = Object.create(null);
     G.order.forEach(function (id) {
       var n = G.nodes[id];
       var g = svgEl('g');
-      g.setAttribute('class', 'cg-node is-kind-' + (n.kind || 'unknown'));
+      g.setAttribute('class', 'cg-node is-kind-' + (n.kind || 'unknown')
+                              + ((opts.views && n.view === 'flow') ? ' arch-view-flow' : ''));
       g.setAttribute('tabindex', '0');       /* 可 Tab 聚焦，聚焦即等同 hover */
       g.setAttribute('data-cg-id', id);
       g.setAttribute('data-cg-full', n.label);
+      if (opts.marks && n.marks.length) g.setAttribute('data-arch-mark', n.marks.join(' '));
 
       var ti = svgEl('title');               /* 截断时全名在这里，信息不丢 */
       ti.textContent = n.label + ' · ' + (n.file || '?')
@@ -2103,6 +2288,30 @@
       lb.textContent = n.text;
       if (n.cut) lb.setAttribute('data-cg-elided', '1');
       g.appendChild(lb);
+
+      /* 模块归属编号片：哪个模块覆盖了它，一眼可见；装饰性、不吃指针事件 */
+      if (opts.marks && n.chips.length) {
+        n.chips.forEach(function (ch) {
+          var cc = svgEl('circle');
+          cc.setAttribute('class', 'cg-mark-chip');
+          cc.setAttribute('cx', String(ch.x));
+          cc.setAttribute('cy', String(ch.y));
+          cc.setAttribute('r', '7');
+          cc.setAttribute('pointer-events', 'none');
+          cc.setAttribute('data-mark', ch.mark);
+          g.appendChild(cc);
+          var ct = svgEl('text');
+          ct.setAttribute('class', 'cg-mark-chip-t');
+          ct.setAttribute('x', String(ch.x));
+          ct.setAttribute('y', String(ch.y));
+          ct.setAttribute('text-anchor', 'middle');
+          ct.setAttribute('dominant-baseline', 'central');
+          ct.setAttribute('aria-hidden', 'true');
+          ct.setAttribute('pointer-events', 'none');
+          ct.textContent = String(ch.i);
+          g.appendChild(ct);
+        });
+      }
 
       gNodes.appendChild(g);
       nodeEls[id] = g;
@@ -2171,17 +2380,31 @@
         if (r.l.from === id) outs++;
         if (r.l.to === id) ins++;
       });
-      return n.label + ' · ' + (n.kind || '未知类型') + ' · '
-             + (n.file || '?') + (n.line ? ':' + n.line : '')
-             + ' · 出边 ' + outs + ' / 入边 ' + ins;
+      var head = n.label + ' · ' + (n.kind || '未知类型') + ' · '
+             + (n.file || '?') + (n.line ? ':' + n.line : '');
+      /* 契约 §二 的面板顺序：结构信息行 → 作用： → 调用： → 角色：
+         缺省（没有 desc/role）时仍是一行旧格式，逐字不变。 */
+      if (!n.desc && !n.role) {
+        return head + ' · 出边 ' + outs + ' / 入边 ' + ins;
+      }
+      var lines = [head];
+      if (n.desc) lines.push('作用：' + n.desc);
+      lines.push('调用：出边 ' + outs + ' / 入边 ' + ins);
+      if (n.role) lines.push('角色：' + n.role);
+      return lines.join('\n');
     }
     function edgeFacts(i) {
       var l = edgeRecs[i].l;
       var conf = (l.confidence === 'verified') ? 'verified（实锤）' : 'inferred（推断）';
       var src = l.file ? (l.file + (l.line ? ':' + l.line : ''))
                        : (l.line ? '第 ' + l.line + ' 行' : '未给依据行');
-      return G.nodes[l.from].label + ' → ' + G.nodes[l.to].label + ' · '
+      var out = G.nodes[l.from].label + ' → ' + G.nodes[l.to].label + ' · '
              + l.count + ' 个调用点 · ' + conf + ' · ' + src;
+      /* 依赖语义单列一行：kind 走文字，线型继续只承载置信度 */
+      if (l.hasKind || l.detail) {
+        out += '\n依赖：' + l.kind + (l.detail ? ' · ' + l.detail : '');
+      }
+      return out;
     }
 
     var cur = null;
@@ -2215,7 +2438,57 @@
     else lazyPlay(scene, function () { scene.classList.add('is-cg-in'); }, null);
 
     stage.appendChild(svg);
+
+    /* --- 图下两行：kind 图例 + 模块归属说明（架构图宿主专属） ---
+       图例只在「真有边声明了 kind」时出现（契约：无 kind 不渲染图例）；
+       模块归属一行一条，把「模块 N 覆盖这一段」写清楚——图上看得见段，
+       图下说得出它叫什么。两项都是静态结构，不新增任何动画与状态类。 */
+    if (opts.legend) {
+      var declaredKindCount = G.links.filter(function (l) { return l.hasKind; }).length;
+      if (declaredKindCount > 0) {
+        var lg = c2cEl('div', 'arch-legend');
+        CG_KIND_ORDER.forEach(function (k) {
+          var present = G.links.some(function (l) { return l.kind === k; });
+          if (!present) return;
+          var item = c2cEl('span', 'al-item');
+          item.setAttribute('data-kind', k);
+          var mkEl = c2cEl('span', 'al-mark kind-' + k, CG_KIND_MARK[k] || '·');
+          mkEl.setAttribute('aria-hidden', 'true');
+          item.appendChild(mkEl);
+          item.appendChild(c2cEl('span', 'al-text', k + ' · ' + (CG_KIND_TEXT[k] || '')));
+          lg.appendChild(item);
+        });
+        stage.appendChild(lg);
+      }
+    }
+    if (opts.marks && G.marks.length) {
+      var mb = c2cEl('div', 'arch-marks');
+      G.marks.forEach(function (mk, i) {
+        var row = c2cEl('span', 'am-item');
+        row.setAttribute('data-mark', mk.id);
+        row.appendChild(c2cEl('span', 'am-chip', String(i + 1)));
+        var shown = mk.covered.slice(0, 8).join('、');
+        if (mk.covered.length > 8) shown += ' 等 ' + mk.covered.length + ' 个节点';
+        row.appendChild(c2cEl('span', 'am-text', mk.label + '：覆盖 ' + shown));
+        mb.appendChild(row);
+      });
+      stage.appendChild(mb);
+    }
+
     idleFacts();
+  }
+
+  /* 两个宿主共用同一渲染函数：调用图走缺省选项（行为逐字不变），
+     架构图走 §一 契约的默认 kind / view / module_marks 选项。 */
+  document.querySelectorAll('.callgraph-scene').forEach(function (scene) {
+    cgRenderScene(scene, CG_OPTS_CALLGRAPH);
   });
+  document.querySelectorAll('.arch-scene').forEach(function (scene) {
+    cgRenderScene(scene, CG_OPTS_ARCH);
+  });
+
+  /* 纯布局函数（零 DOM）挂出来给测试与课程内联脚本用：同一份数据必然同一张图 */
+  window.c2cCallgraphLayout = function (data) { return cgLayout(data, CG_OPTS_CALLGRAPH); };
+  window.c2cArchLayout = function (data) { return cgLayout(data, CG_OPTS_ARCH); };
 
 })();

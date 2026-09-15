@@ -14,7 +14,9 @@ validate_course.py — code2course 成品课程机械校验（零依赖，Python
        本脚本只扫属性，天然豁免；xmlns 属性本身也豁免）
   3.  五类 JSON 数据块（.viz-data/.onion-data/.tower-data/.fork-data/
       .callgraph-data）全部可被 JSON.parse 解析，字符串值不含裸 </script，
-      且 note/anchor 等值内无 HTML 实体字面（JSON 是纯文本层）
+      且 note/anchor 等值内无 HTML 实体字面（JSON 是纯文本层）；
+      v1.18.0 起第六类 .arch-data（总架构图）同此解析口径，并按检查 16 的
+      调用图契约校验（见 16 末条）
   4.  每个 .translate-pair 内左右两侧 data-i 集合等长且一致
   5.  每个 .quiz 恰好一个 data-correct="true"；每个 .bet-scene 恰好一个
       data-bet-correct="true"；全部选项 data-why / data-bet-why 非空
@@ -47,7 +49,14 @@ validate_course.py — code2course 成品课程机械校验（零依赖，Python
       facts v3 派生字段（B2 移交②）：resolved_by ∈ {name,binding,qualified}
       且只属于 verified 边；resolution=self_ref 的边禁入调用图数据；
       resolution ∈ {unresolved, ambiguous} 恒 inferred，resolution=unique
-      必须 verified 且带合法 resolved_by
+      必须 verified 且带合法 resolved_by；
+      v1.18.0 契约 §二/§14a 兼容性扩展（不是新检查）：节点并入可选 desc
+      （≤60 字）/role（≤40 字），边并入可选 kind（闭集 owns/call/dependency/
+      data/control，缺省 call）/detail（≤80 字）；数据块顶层键集闭集——
+      .callgraph-data 只允许 nodes/links；
+      .arch-data（仓库总架构图）走同一套契约，唯二差异：顶层另允许
+      module_marks（每项 {id,label,covers[]}，covers 必须命中 nodes[].id）、
+      节点数 4–20，且节点另允许 view（闭集 own/flow，契约 §一.1）
   17. 调用图前置（v1.14.0 结构契约，workflow 第 5 步「调用图前置」）：
       封面（hero 模块）必须含 ≥1 张 .callgraph-scene（全项目图，模块/文件
       粒度）；每个正式模块（非封面、非结业段）必须含 ≥1 张 .callgraph-scene
@@ -55,6 +64,19 @@ validate_course.py — code2course 成品课程机械校验（零依赖，Python
   18. script 块完整性：任何 <script> 块的原文（含注释与字符串）不得含字面
       "<script" / "</script" 序列——浏览器会在此截断/嵌套解析，整个外壳
       脚本静默失效（v1.14.0 真实事故：app.js 头注释含字面 <script>）
+  19. 理解骨架·封面（v1.18.0 结构契约）：封面（hero 段）≥1 张 .arch-scene
+      （仓库总架构图）且 ≥1 条 .run-chain（链内 .rc-step ≥4 步）——缺一即 ERROR；
+      多个正式模块时 .arch-data 的 module_marks 不得为空（模块归属标注）
+  20. 理解骨架·模块卡：每个正式模块（非封面、非结业段）≥1 张 .module-card，
+      且卡内 .mc-row ≥4（四行齐全）
+  21. 理解骨架·变量词典：全课 ≥1 个 .vardict-scene；每个场景内
+      .vardict-row[data-var][data-stage] ≥1，且 .var-chain 内
+      .vc-node[data-var] ≥2（变量生命周期链）
+  22. 理解骨架·设计四问：每个正式模块 .design-qa ≥1（L1）／≥2（L2）／
+      ≥3（L3，--tier 未给按 L1），且每块内 .dq-row ≥4
+  23. 理解骨架·改造指南：结业段（id 含 finale）≥1 张 .upgrade-guide，且
+      .ug-row[data-task] ≥4（L1）／≥6（L2、L3）
+      （19/20/21 常开与档位无关；22/23 除档位下限外常开）
 
 退出码：发现 ERROR 非零退出（=1），仅 WARNING 时退出 0。
 """
@@ -111,6 +133,51 @@ class CourseChecker(HTMLParser):
                 target.append((line, ln))
             line += 1
 
+    # ---- 理解骨架六件计数（v1.18.0 结构契约 §一；归属最近的 section.module） ----
+    def _in_ancestor(self, name):
+        """当前元素是否落在某个 cls 含 name 的祖先里。
+
+        self._stack 顶是当前元素自身（handle_starttag 先压栈），故取 [:-1]。
+        """
+        return any(name in cs for _t, cs in self._stack[:-1])
+
+    def _skeleton_count(self, classes, a, top):
+        """六大骨架组件的逐元素计数（契约 §三「计数落点」字段来源）。
+
+        容器内计数：行/节点类只有落在自己的容器里才计——游离的 .mc-row 不能
+        替别的卡片充数，否则「卡内 3 行 + 卡外 1 行」会假绿（注入必红实证）。
+        带数据属性的行（vardict-row/ug-row）按契约以属性齐全为准：缺
+        data-var/data-stage/data-task 的行不计。
+        """
+        if 'arch-scene' in classes:
+            top['arch'] += 1
+        if 'run-chain' in classes:
+            top['runchain'] += 1
+        if 'rc-step' in classes and self._in_ancestor('run-chain'):
+            top['rc_steps'] += 1
+        if 'module-card' in classes:
+            top['card'] += 1
+        if 'mc-row' in classes and self._in_ancestor('module-card'):
+            top['card_rows'] += 1
+        if 'vardict-scene' in classes:
+            top['vardict'] += 1
+        if 'vardict-row' in classes and self._in_ancestor('vardict-scene') \
+                and (a.get('data-var') or '').strip() \
+                and (a.get('data-stage') or '').strip():
+            top['vd_rows'] += 1
+        if 'vc-node' in classes and self._in_ancestor('var-chain') \
+                and (a.get('data-var') or '').strip():
+            top['vc_nodes'] += 1
+        if 'design-qa' in classes:
+            top['design'] += 1
+        if 'dq-row' in classes and self._in_ancestor('design-qa'):
+            top['dq_rows'] += 1
+        if 'upgrade-guide' in classes:
+            top['guide'] += 1
+        if 'ug-row' in classes and self._in_ancestor('upgrade-guide') \
+                and (a.get('data-task') or '').strip():
+            top['ug_rows'] += 1
+
     # ---- 标签进入 ----
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
@@ -133,9 +200,17 @@ class CourseChecker(HTMLParser):
             self._in_tp_code += 1
 
         # 模块段（--tier 计数作用域）
+        # v1.18.0 理解骨架六件计数（arch…ug_rows）与 pairs/eng/quiz 同法：
+        # 归属最近的 section.module，模块关闭时随 module_stats 一并结算
         if tag == 'section' and 'module' in classes:
             self.module_stack.append({'id': a.get('id'), 'hero': 'hero' in classes,
                                       'pairs': 0, 'eng': 0, 'quiz': 0, 'cg': 0,
+                                      'arch': 0, 'runchain': 0, 'rc_steps': 0,
+                                      'arch_marks': 0,
+                                      'card': 0, 'card_rows': 0,
+                                      'vardict': 0, 'vd_rows': 0, 'vc_nodes': 0,
+                                      'design': 0, 'dq_rows': 0,
+                                      'guide': 0, 'ug_rows': 0,
                                       'text': []})
         if 'callgraph-scene' in classes:
             self.cg_scenes += 1
@@ -151,6 +226,7 @@ class CourseChecker(HTMLParser):
                 top['cg'] += 1
             if tag == 'div' and 'quiz' in classes and 'bet-scene' not in classes:
                 top['quiz'] += 1
+            self._skeleton_count(classes, a, top)
 
         # script 块原文收集（检查 18：块文本内的字面标签序列会被浏览器截断）
         if tag == 'script':
@@ -161,7 +237,7 @@ class CourseChecker(HTMLParser):
         if tag == 'script' and a.get('type') == 'application/json':
             jcls = [c for c in classes
                     if c in ('viz-data', 'onion-data', 'tower-data', 'fork-data',
-                             'callgraph-data')]
+                             'callgraph-data', 'arch-data')]
             self._json_cls = jcls[0] if jcls else '(json)'
             self._json_buf = []
             mid = self.module_stack[-1]['id'] if self.module_stack else None
@@ -321,6 +397,13 @@ class CourseChecker(HTMLParser):
         if cls == 'callgraph-data':
             callgraph_check(data, '.callgraph-data' + where, self.errors,
                             self.warnings)
+        elif cls == 'arch-data':
+            # v1.18.0：arch-data 走同一套调用图契约（多 module_marks 与节点数
+            # 4–20）；归属标注条数记到当前模块，供检查 19 判「非空」（契约 §一.1）
+            n_marks = arch_check(data, '.arch-data' + where, self.errors,
+                                 self.warnings)
+            if self.module_stack:
+                self.module_stack[-1]['arch_marks'] += n_marks
 
 
 def check_raw_text(raw, errors):
@@ -411,14 +494,27 @@ CG_CONFIDENCE = ('verified', 'inferred')
 # 出现即必须是有内容的字符串且有长度上限——事实面板一行放不下超长综述。
 CG_ABOUT_MAX = 60   # 字
 CG_CALL_MAX = 80    # 字
+# v1.18.0 契约 §二 / §14a（C 条，向后兼容）：节点新增可选 desc（它做什么）/
+# role（在系统里的角色），边新增可选 kind（闭集）/detail（怎么依赖、传什么）。
+CG_DESC_MAX = 60    # 字
+CG_ROLE_MAX = 40    # 字
+CG_DETAIL_MAX = 80  # 字
+CG_KINDS = ('owns', 'call', 'dependency', 'data', 'control')
+# 契约 §一.1：arch-data 节点另有可选 view（视图分组闭集），callgraph-data 不收
+# （普通调用图没有视图分组概念）。两侧口径分开，互不放宽。
+CG_VIEWS = ('own', 'flow')
 
 # B3 全键白名单（兑现 §14a「逐字段闭集」承诺）：nodes/links 键集以下两表为准，
 # 出现契约外未知键即报错。links 白名单含 facts v3 派生字段（B2 移交②）
 # resolved_by / resolution——它们是 B-P0-2/P0-4 消解诚实性字段的投影。
+# v1.18.0 起并入 §14a 语义字段（desc/role → 节点，kind/detail → 边）。
 CG_NODE_KEYS = frozenset(('id', 'label', 'kind', 'file', 'line',
-                          'about', 'call'))
+                          'about', 'call', 'desc', 'role'))
 CG_LINK_KEYS = frozenset(('from', 'to', 'count', 'confidence', 'file', 'line',
-                          'declared', 'back', 'resolved_by', 'resolution'))
+                          'declared', 'back', 'resolved_by', 'resolution',
+                          'kind', 'detail'))
+# arch-data 节点键集（契约 §一.1）：调用图节点全字段 + view
+CG_ARCH_NODE_KEYS = CG_NODE_KEYS | frozenset(('view',))
 
 # B3 契约升级（B2 移交②）：facts v3 消解字段在调用图数据里的语义机检。
 # resolution：unique|ambiguous|unresolved|self_ref 四值闭集（facts 侧同源）；
@@ -499,19 +595,40 @@ def _cg_is_pathish(node_id):
     return '/' in node_id or node_id.rsplit('.', 1)[-1].lower() in _CG_TAIL_EXT
 
 
-def callgraph_check(data, where, errors, warnings=None):
+def _cg_top_keys_check(data, where, errors, allow_module_marks=False):
+    """数据块顶层键集闭集（v1.18.0 契约 §二）。
+
+    callgraph-data 顶层只允许 nodes/links；arch-data 另允许 module_marks
+    （契约 §一.1：module_marks 是「仅 .arch-data 允许的第三个顶层键」）。
+    """
+    allowed = {'nodes', 'links'}
+    if allow_module_marks:
+        allowed.add('module_marks')
+    unknown = sorted(set(data) - allowed)
+    if unknown:
+        errors.append('%s 顶层出现契约外键 %s（该数据块顶层只允许 %s）'
+                      % (where, '/'.join(unknown), ', '.join(sorted(allowed))))
+
+
+def callgraph_check(data, where, errors, warnings=None,
+                    allow_module_marks=False, arch_mode=False):
     """调用图数据契约机检（规格 §7 四条 + v1.13.4 前提的 about/call 三检
-    + B3 全键白名单与 facts v3 字段语义）。
+    + B3 全键白名单与 facts v3 字段语义 + v1.18.0 §14a 语义字段）。
 
     每条独立成错、各自定位到具体节点/连线，便于"注入必红"逐条命中：
     坏 JSON 在 json.loads 处即返回（不落到这里）；缺 confidence、verified
     缺 line、node 缺 file、about 空串、about 超长、about 挂到 links 上、
-    未知键、resolved_by 闭集外、self_ref 边、降级边标 verified 等
-    各只命中对应那一条。
+    未知键、resolved_by 闭集外、self_ref 边、降级边标 verified、kind 出闭集、
+    detail 超长、顶层多余键等各只命中对应那一条。
+    v1.18.0：nodes 增可选 desc(≤60)/role(≤40)，links 增可选 kind(闭集)/detail(≤80)；
+    顶层键集闭集（callgraph-data 只允许 nodes/links）。
     """
     if not isinstance(data, dict):
         errors.append('%s 顶层必须是对象（含 nodes/links）' % where)
         return
+    # v1.18.0 契约 §二：顶层键集闭集（callgraph-data 只允许 nodes/links；
+    # arch-data 由 arch_check 以 allow_module_marks=True 放开第三个键）
+    _cg_top_keys_check(data, where, errors, allow_module_marks)
     nodes = data.get('nodes')
     links = data.get('links')
     if not isinstance(nodes, list) or not nodes:
@@ -527,13 +644,15 @@ def callgraph_check(data, where, errors, warnings=None):
             errors.append('%s nodes[%d] 不是对象' % (where, i))
             continue
         # B3 全键白名单：逐字段闭集（§14a「键集以下两表为准」的校验器兑现）
-        unknown = sorted(set(n) - CG_NODE_KEYS)
+        # arch_mode（arch-data）下节点另允许 view（契约 §一.1）
+        node_keys = CG_ARCH_NODE_KEYS if arch_mode else CG_NODE_KEYS
+        unknown = sorted(set(n) - node_keys)
         if unknown:
             who0 = n.get('id') if isinstance(n.get('id'), str) else '#%d' % i
             errors.append('%s 调用图节点「%s」出现契约外键 %s'
                           '（§14a 逐字段闭集：节点只允许 %s）'
                           % (where, who0, '/'.join(unknown),
-                             ', '.join(sorted(CG_NODE_KEYS))))
+                             ', '.join(sorted(node_keys))))
         nid = n.get('id')
         if _cg_str(nid):
             who = nid
@@ -551,9 +670,11 @@ def callgraph_check(data, where, errors, warnings=None):
         if not _cg_int(n.get('line')):
             errors.append('%s 调用图节点「%s」缺 line（或不是 ≥1 的整数）'
                           % (where, who))
-        # 5. about / call（v1.13.4 前提）：可选键，出现即必须是非空字符串
-        #    且限长（about ≤60 / call ≤80）；逐节点定位，缺谁报谁
-        for key, cap in (('about', CG_ABOUT_MAX), ('call', CG_CALL_MAX)):
+        # 5. about / call（v1.13.4 前提）+ desc / role（v1.18.0 §14a）：可选键，
+        #    出现即必须是非空字符串且限长（about ≤60 / call ≤80 / desc ≤60 /
+        #    role ≤40）；逐节点定位，缺谁报谁
+        for key, cap in (('about', CG_ABOUT_MAX), ('call', CG_CALL_MAX),
+                         ('desc', CG_DESC_MAX), ('role', CG_ROLE_MAX)):
             if key not in n:
                 continue
             v = n[key]
@@ -565,6 +686,14 @@ def callgraph_check(data, where, errors, warnings=None):
                 errors.append('%s 调用图节点「%s」的 %s 超长（%d 字 > 上限 %d 字'
                               '——事实面板一行放不下，综述请精简）'
                               % (where, who, key, len(v), cap))
+        # arch-data 专属：view 视图分组（契约 §一.1 闭集 own/flow）
+        if arch_mode and 'view' in n:
+            view = n.get('view')
+            if view not in CG_VIEWS:
+                errors.append('%s 调用图节点「%s」的 view「%s」不在闭集 '
+                              '{own, flow} 内（架构图节点的视图分组：own=自身'
+                              '拥有的，flow=数据流经过的）'
+                              % (where, who, view))
 
     for i, e in enumerate(links, 1):
         if not isinstance(e, dict):
@@ -584,6 +713,25 @@ def callgraph_check(data, where, errors, warnings=None):
                 errors.append('%s 调用图 links[%d] 出现了 %s'
                               '（about/call 只允许出现在 nodes[] 的节点上）'
                               % (where, i, key))
+        # 7. kind / detail（v1.18.0 契约 §二 / §14a 的边级语义字段）：
+        #    kind 闭集（缺省视为 call，写出来就必须合法）；detail 出现即
+        #    非空字符串且 ≤80 字（事实面板一行的长度）。
+        if 'kind' in e:
+            kind = e.get('kind')
+            if not _cg_str(kind) or kind not in CG_KINDS:
+                errors.append('%s 调用图 links[%d] 的 kind「%s」不在闭集 '
+                              '{owns, call, dependency, data, control} 内'
+                              '（缺省按 call 处理，写出来就必须在闭集内）'
+                              % (where, i, kind))
+        if 'detail' in e:
+            detail = e.get('detail')
+            if not _cg_str(detail):
+                errors.append('%s 调用图 links[%d] 的 detail 不是非空字符串'
+                              '（可选键：要么不写，写就写有内容的）' % (where, i))
+            elif len(detail) > CG_DETAIL_MAX:
+                errors.append('%s 调用图 links[%d] 的 detail 超长（%d 字 > 上限 '
+                              '%d 字——事实面板一行放不下，依赖说明请精简）'
+                              % (where, i, len(detail), CG_DETAIL_MAX))
         # 2. from / to / confidence 三者齐全且合法
         for k in ('from', 'to', 'confidence'):
             if not _cg_str(e.get(k)):
@@ -622,6 +770,74 @@ def callgraph_check(data, where, errors, warnings=None):
             if not _cg_int(e.get('line')):
                 errors.append('%s 调用图 links[%d]（%s）标了 verified 却没有 '
                               'line——实锤边必须给出发起行' % (where, i, pair))
+
+
+# ---- v1.18.0：arch-data（仓库总架构图）数据契约（契约 §一.1） ----
+CG_NODE_MIN = 4      # 架构图节点 4–20（少于 4 看不清全貌）
+CG_NODE_MAX = 20     # 多于 20 该按模块聚合收口
+ARCH_MARK_KEYS = frozenset(('id', 'label', 'covers'))
+
+
+def arch_check(data, where, errors, warnings=None):
+    """.arch-data（v1.18.0 契约 §一.1 仓库总架构图）的数据校验。
+
+    复用调用图同一套契约（键集白名单含 desc/role/kind/detail、出处、confidence
+    闭集、禁自环、self_ref 剔除、facts v3 字段语义），差异只有三处：
+      ① 顶层额外允许 module_marks（数组，每项 {id, label, covers[]}）；
+      ② 节点数 4–20（架构图粒度口径）；
+      ③ 节点另允许 view（闭集 own/flow，契约 §一.1；callgraph-data 不收）。
+    covers[] 每一项必须命中 nodes[].id——「模块归属标注」必须指向真实节点。
+
+    返回 module_marks 条数（缺失或为空返回 0），供检查 19 判「归属标注非空」。
+    """
+    if not isinstance(data, dict):
+        errors.append('%s 顶层必须是对象（含 nodes/links/module_marks）' % where)
+        return 0
+    nodes = data.get('nodes')
+    if isinstance(nodes, list) and not (CG_NODE_MIN <= len(nodes) <= CG_NODE_MAX):
+        errors.append('%s 节点 %d 个不在 %d–%d 区间（架构图粒度：少于 %d 看不清'
+                      '全貌，多于 %d 该按模块聚合收口）'
+                      % (where, len(nodes), CG_NODE_MIN, CG_NODE_MAX,
+                         CG_NODE_MIN, CG_NODE_MAX))
+    callgraph_check(data, where, errors, warnings, allow_module_marks=True,
+                    arch_mode=True)
+    marks = data.get('module_marks')
+    if marks is None:
+        return 0
+    if not isinstance(marks, list) or not marks:
+        errors.append('%s module_marks 必须是非空数组（每项 {id, label, '
+                      'covers[]}；不画模块归属时整个键省略）' % where)
+        return 0
+    ids = set()
+    if isinstance(nodes, list):
+        ids = set(n.get('id') for n in nodes
+                  if isinstance(n, dict) and _cg_str(n.get('id')))
+    for i, mk in enumerate(marks, 1):
+        if not isinstance(mk, dict):
+            errors.append('%s module_marks[%d] 不是对象' % (where, i))
+            continue
+        unknown = sorted(set(mk) - ARCH_MARK_KEYS)
+        if unknown:
+            errors.append('%s module_marks[%d] 出现契约外键 %s'
+                          '（只允许 id/label/covers）'
+                          % (where, i, '/'.join(unknown)))
+        if not _cg_str(mk.get('id')):
+            errors.append('%s module_marks[%d] 缺 id（模块锚点，非空字符串）'
+                          % (where, i))
+        if not _cg_str(mk.get('label')):
+            errors.append('%s module_marks[%d] 缺 label（模块名，非空字符串）'
+                          % (where, i))
+        covers = mk.get('covers')
+        if not isinstance(covers, list) or not covers:
+            errors.append('%s module_marks[%d] 的 covers 必须是非空数组'
+                          '（该模块覆盖架构图上的哪些节点）' % (where, i))
+            continue
+        for c in covers:
+            if not _cg_str(c) or c not in ids:
+                errors.append('%s module_marks[%d] 的 covers 元素「%s」不是 '
+                              'nodes[].id（模块归属标注必须指向真实节点）'
+                              % (where, i, c))
+    return len(marks)
 
 
 # ---- 10. --source 逐字一致强校验 ----
@@ -762,6 +978,160 @@ def callgraph_coverage_check(module_stats, errors):
                 errors.append('模块[%s] 缺前置调用图（workflow 第 5 步'
                               '「调用图前置」：每个正式模块开头必须放'
                               '本模块调用图）' % m['id'])
+
+
+# ---- 19-23. 理解骨架六件（v1.18.0 结构契约，见 agent-out/b118-contract.md §一/§三） ----
+# 阈值集中在此，与契约表逐行对照。--tier 未给时 22/23 走 L1 下限；19/20/21
+# 常开，与档位无关（契约 §三「触发范围」列）。
+SKEL_RC_STEPS = 4       # 一次完整运行链路至少 4 步
+SKEL_CARD_ROWS = 4      # 三句话卡四行齐全（问题/输入/输出/在总架构图上的位置）
+SKEL_VC_NODES = 2       # 变量生命周期链至少 2 个节点
+SKEL_DQ_ROWS = 4        # 设计四问四问齐全（做什么/为什么/不这么做/为什么不用更简单）
+SKEL_DESIGN_TIER = {'L1': 1, 'L2': 2, 'L3': 3}   # 每正式模块 .design-qa 块数
+SKEL_UG_TIER = {'L1': 4, 'L2': 6, 'L3': 6}       # 结业段 .ug-row[data-task] 条数
+
+
+def _skel_floor(table, tier):
+    """档位下限查询：tier 在闭集内取值，--tier 未给或非法回落 L1 下限。"""
+    return table.get(tier if tier in table else 'L1')
+
+
+def arch_scene_check(module_stats, errors):
+    """19. 封面「仓库总架构图 + 一次完整运行链路」（S1 开场双件，常开）。
+
+    封面（hero 段）必须 ≥1 张 .arch-scene（复用调用图引擎的全项目架构图）
+    且 ≥1 条 .run-chain（对象级时序），链内 .rc-step ≥4 步——缺一即红。
+    另：课程存在多个正式模块时，封面总架构图的 module_marks 不得为空
+    （S1 三视图之一的「模块归属标注」；条数由 arch_check 记到模块上）。
+    """
+    formal = [m for m in module_stats
+              if m['id'] and not m['hero'] and not is_finale(m)]
+    for m in module_stats:
+        if not m['hero']:
+            continue
+        label = '封面[%s]' % (m['id'] or '?')
+        if m.get('arch', 0) < 1:
+            errors.append('%s 缺仓库总架构图（v1.18.0 结构契约：封面必须放 ≥1 张 '
+                          '.arch-scene 全项目架构图，先回答「这个仓库由哪些部分'
+                          '组成、谁依赖谁」）' % label)
+        elif m.get('arch_marks', 0) < 1 and len(formal) >= 2:
+            errors.append('%s 总架构图缺模块归属标注（.arch-data 的 module_marks '
+                          '为空——S1 三视图之一：每个课程模块覆盖架构图上的哪些'
+                          '节点）' % label)
+        if m.get('runchain', 0) < 1:
+            errors.append('%s 缺一次完整运行链路（.run-chain：开场要用对象级时序'
+                          '走完一次完整运行，不是模块清单）' % label)
+        elif m.get('rc_steps', 0) < SKEL_RC_STEPS:
+            errors.append('%s 运行链路 .rc-step 仅 %d 步 < %d（少于 %d 步走不完'
+                          '一次完整运行：每个 rc-step 是一个对象级动作）'
+                          % (label, m.get('rc_steps', 0), SKEL_RC_STEPS,
+                             SKEL_RC_STEPS))
+
+
+def module_card_check(module_stats, errors):
+    """20. 每个正式模块的「三句话卡」（.module-card，常开）。
+
+    每正式模块（非封面、非结业段）≥1 张卡，且卡内 .mc-row ≥4（四行齐全：
+    解决什么问题 / 输入是什么 / 输出是什么 / 在总架构图上的位置）。
+    行数按卡内统计——卡外游离的 .mc-row 不计（不能替卡片充数）。
+    """
+    for m in module_stats:
+        if m['hero'] or not m['id'] or is_finale(m):
+            continue
+        label = '模块[%s]' % m['id']
+        card = m.get('card', 0)
+        rows = m.get('card_rows', 0)
+        if card < 1:
+            errors.append('%s 缺三句话卡（.module-card：每个正式模块至少 1 张，'
+                          '回答「解决什么问题 / 输入是什么 / 输出是什么 / 在'
+                          '总架构图上的位置」）' % label)
+        elif rows < SKEL_CARD_ROWS * card:
+            errors.append('%s 三句话卡内容不全：.mc-row %d 行 < %d（%d 张卡 × '
+                          '%d 行，四行齐全才算）'
+                          % (label, rows, SKEL_CARD_ROWS * card, card,
+                             SKEL_CARD_ROWS))
+
+
+def vardict_check(module_stats, errors):
+    """21. 变量词典与变量生命周期链（.vardict-scene，常开）。
+
+    全课 ≥1 个 .vardict-scene；每个场景内 .vardict-row[data-var][data-stage]
+    ≥1（缺 data-var/data-stage 的行不计）且 .var-chain 内 .vc-node[data-var]
+    ≥2（变量之间的传递关系要画成链）。
+
+    场景内行数由模块级聚合口径把关：每个场景至少要贡献 1 行 / 2 节点，故
+    模块内 vd_rows < 场景数、或 vc_nodes < 2×场景数，即存在空场景/缺链条。
+    """
+    if sum(m.get('vardict', 0) for m in module_stats) < 1:
+        errors.append('全课缺变量词典（.vardict-scene ≥1：变量词典是 v1.18.0 '
+                      '理解骨架六件之一，A3 变量表与 A4 生命周期链的合并载体）')
+    for m in module_stats:
+        scenes = m.get('vardict', 0)
+        if not scenes:
+            continue
+        label = '模块[%s]' % (m['id'] or '?')
+        rows = m.get('vd_rows', 0)
+        nodes = m.get('vc_nodes', 0)
+        if rows < scenes:
+            errors.append('%s 变量词典有空场景：.vardict-row[data-var]'
+                          '[data-stage] %d 行 < %d 个场景（每个场景至少 1 行；'
+                          '属性不全的行不计）' % (label, rows, scenes))
+        if nodes < SKEL_VC_NODES * scenes:
+            errors.append('%s 变量词典缺生命周期链：.var-chain 内 .vc-node'
+                          '[data-var] %d 个 < %d（%d 个场景 × %d 节点）'
+                          % (label, nodes, SKEL_VC_NODES * scenes, scenes,
+                             SKEL_VC_NODES))
+
+
+def design_qa_check(module_stats, tier, errors):
+    """22. 每个正式模块的「设计四问」块（.design-qa）。
+
+    块数下限随档位加严：L1 ≥1 / L2 ≥2 / L3 ≥3（--tier 未给按 L1）；每块内
+    .dq-row ≥4（做什么 / 为什么这么做 / 不这么做会怎样 / 为什么不用更简单的
+    方法，缺项不算——行数按块内统计）。结业段不参与（由检查 23 把关）。
+    """
+    floor = _skel_floor(SKEL_DESIGN_TIER, tier)
+    for m in module_stats:
+        if m['hero'] or not m['id'] or is_finale(m):
+            continue
+        label = '模块[%s]' % m['id']
+        blocks = m.get('design', 0)
+        rows = m.get('dq_rows', 0)
+        if blocks < floor:
+            errors.append('%s 设计四问 %d 块 < %d（档位 %s：每个正式模块至少 '
+                          '%d 个 .design-qa——只讲「是什么」不算理解，要能回答'
+                          '设计取舍）'
+                          % (label, blocks, floor, tier or 'L1（缺省）', floor))
+        elif rows < SKEL_DQ_ROWS * blocks:
+            errors.append('%s 设计四问缺项：.dq-row %d 行 < %d（%d 块 × %d 问：'
+                          '做什么/为什么这么做/不这么做会怎样/为什么不用更简单'
+                          '的方法，四问齐全才算）'
+                          % (label, rows, SKEL_DQ_ROWS * blocks, blocks,
+                             SKEL_DQ_ROWS))
+
+
+def upgrade_guide_check(module_stats, tier, errors):
+    """23. 结业段的「改造指南」（.upgrade-guide，结业段内）。
+
+    结业段（id 含 finale）内 ≥1 张 .upgrade-guide，且 .ug-row[data-task]
+    ≥4（L1）／≥6（L2、L3，--tier 未给按 L1）——读完要能上手改：想做的事
+    对应去哪儿改。行数按表内统计，缺 data-task 的行不计。
+    """
+    floor = _skel_floor(SKEL_UG_TIER, tier)
+    for m in module_stats:
+        if not is_finale(m):
+            continue
+        label = '结业段[%s]' % m['id']
+        guides = m.get('guide', 0)
+        rows = m.get('ug_rows', 0)
+        if guides < 1:
+            errors.append('%s 缺改造指南（.upgrade-guide：结业段要给「想做的事 '
+                          '→ 去哪儿改」的操作表，与主线回顾/综合题并列）'
+                          % label)
+        elif rows < floor:
+            errors.append('%s 改造指南条目 %d < %d（档位 %s：.ug-row[data-task] '
+                          '至少 %d 条；缺 data-task 的行不计）'
+                          % (label, rows, floor, tier or 'L1（缺省）', floor))
 
 
 def tier_check(module_stats, tier, errors):
@@ -911,11 +1281,41 @@ def main(argv):
     # 17. 调用图前置（封面全项目图 + 每正式模块模块图；v1.14.0 结构契约）
     callgraph_coverage_check(chk.module_stats, errors)
 
+    # 19-23. 理解骨架六件（v1.18.0 结构契约 §三）。每件独立结算错误数，
+    # 汇总行与检查 17 同处，逐件打印 ✓/✗ 与计数。
+    skel_err = []
+    for skel_fn, extra in ((arch_scene_check, ()), (module_card_check, ()),
+                           (vardict_check, ()),
+                           (design_qa_check, (opts['--tier'],)),
+                           (upgrade_guide_check, (opts['--tier'],))):
+        n0 = len(errors)
+        skel_fn(chk.module_stats, *extra, errors)
+        skel_err.append(len(errors) - n0)
+
+    def _skel_tot(key):
+        return sum(m.get(key, 0) for m in chk.module_stats)
+
+    def _skel_mark(i):
+        return '✓' if not skel_err[i] else '✗'
+
+    skel_line = (
+        '理解骨架（19-23）：架构图 %d 张 %s / 运行链 %d 条 %d 步 %s / '
+        '模块卡 %d 张 %d 行 %s / 变量词典 %d 个 %d 行 %d 节点 %s / '
+        '设计四问 %d 块 %d 行 %s / 改造指南 %d 个 %d 行 %s'
+        % (_skel_tot('arch'), _skel_mark(0),
+           _skel_tot('runchain'), _skel_tot('rc_steps'), _skel_mark(0),
+           _skel_tot('card'), _skel_tot('card_rows'), _skel_mark(1),
+           _skel_tot('vardict'), _skel_tot('vd_rows'), _skel_tot('vc_nodes'),
+           _skel_mark(2),
+           _skel_tot('design'), _skel_tot('dq_rows'), _skel_mark(3),
+           _skel_tot('guide'), _skel_tot('ug_rows'), _skel_mark(4)))
+
     quiet = '--quiet' in flags
     if not quiet:
         print('文件：%s（%.1f KB）' % (path, len(raw.encode("utf-8")) / 1024))
         print('检查：翻译块 %d 个 / 测验+赌注 %d 处 / JSON 块见上 / 模块 %d 个 / 调用图 %d 张'
               % (len(chk.pairs), len(chk.quizzes), len(chk.modules), chk.cg_scenes))
+        print(skel_line)
     for w in warnings:
         print('  ⚠️  %s' % w)
     for e in errors:

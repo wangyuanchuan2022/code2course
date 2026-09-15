@@ -625,11 +625,14 @@ document.querySelectorAll('.translate-pair').forEach(pair => {
   <script type="application/json" class="callgraph-data">
   {
     "nodes": [
-      { "id": "login", "label": "login()", "kind": "function", "file": "src/auth/login.js", "line": 14 },
-      { "id": "verify", "label": "verifyPassword()", "kind": "function", "file": "src/auth/password.js", "line": 8 }
+      { "id": "login", "label": "login()", "kind": "function", "file": "src/auth/login.js", "line": 14,
+        "desc": "校验账号密码并开一个会话", "role": "入口链路的第一站" },
+      { "id": "verify", "label": "verifyPassword()", "kind": "function", "file": "src/auth/password.js", "line": 8,
+        "desc": "把明文口令与加盐哈希比对", "role": "安全边界层" }
     ],
     "links": [
-      { "from": "login", "to": "verify", "count": 1, "confidence": "verified", "file": "src/auth/login.js", "line": 21 }
+      { "from": "login", "to": "verify", "count": 1, "confidence": "verified", "file": "src/auth/login.js", "line": 21,
+        "kind": "call", "detail": "把用户提交的口令传给校验函数" }
     ]
   }
   </script>
@@ -637,6 +640,8 @@ document.querySelectorAll('.translate-pair').forEach(pair => {
   <div class="callgraph-facts t-muted" aria-live="polite">{{初始提示，如：悬停节点或连线看事实}}</div>
 </div>
 ```
+
+> `desc`/`role`/`kind`/`detail` 是 v1.18.0 新增的**语义字段**（可选，但"总架构图"要求必填，见 §15）。它们不改变既有诚实性契约：图能不能看形状由 `confidence` 与出处保证，**看不看得懂含义**由这四个字段保证——"图能看形状、不能看含义"正是 v1.18.0 要治的缺陷。
 
 ### 14a. 数据契约（逐字段闭集：键集以下两表为准，nodes 与 links 之外不引入新键）
 
@@ -651,6 +656,8 @@ document.querySelectorAll('.translate-pair').forEach(pair => {
 | `line` | int ≥1 | 声明行（**必填**）——调用图不允许无出处的节点 |
 | `about` | string ≤60 字 | 可选。**课程作者综述**——这个符号在这门课里承担什么。综述要么可指回依据（给出对应 `file:line`），要么明确是作者的概括，不许冒充源码事实。空串/超长由 `validate_course.py` 检查 16 报错 |
 | `call` | string ≤80 字 | 可选。**结构事实**——调用关系的概括；其中每个调用关系必须能在 `links[]` 或结构事实的 `calls[]` 里找到对应边（禁止写出源码里查不到的调用）。`call` 优先由 facts 的 `calls[]` 按 (caller,callee) 聚合派生 |
+| `desc` | string ≤60 字 | 可选（v1.18.0）。**它做什么**——业务向的一句话，写给"第一次看这个仓库的人"（如"把截图里的数字读成棋盘状态"）。与 `about` 的分工：`about` 是"在这门课里承担什么"，`desc` 是"它在系统里干什么"；悬停事实面板优先显示 `desc` |
+| `role` | string ≤40 字 | 可选（v1.18.0）。**在系统里的角色**（如"决策末端的输出"、"性能瓶颈层"、"跨语言边界"）——读者靠它理解"为什么这个组件值得单独讲" |
 
 `links[]`（必填）：
 
@@ -660,6 +667,8 @@ document.querySelectorAll('.translate-pair').forEach(pair => {
 | `count` | int ≥1 | 该边承载的调用点数（缺省 1），决定线宽 |
 | `confidence` | enum | **闭集** `verified`（实锤，带 file:line 的确定调用）/ `inferred`（推断）；**缺省即为非法**——诚实边不允许含糊 |
 | `file` / `line` | string / int | 发起调用的那一行（`verified` **必须给**；`inferred` 给最可能的依据行或省略 `line`） |
+| `kind` | enum | 可选（v1.18.0）。**闭集** `owns`（持有/组成，谁拥有谁）/ `call`（调用）/ `dependency`（依赖）/ `data`（数据传递）/ `control`（控制/触发，含回边类的"结果回到界面"）；缺省按 `call` 处理。**线型仍只承载置信度**（诚实性通道不被种类挤占），种类用箭头样式与事实面板表达 |
+| `detail` | string ≤80 字 | 可选（v1.18.0）。**这条边怎么依赖、如何调用、传什么**（如"把 heatmap 结果回写为 Qt 信号"）——悬停边时显示在事实面板里 |
 | `declared` | int | 可选。这条边的"声明深度"权重，来自结构事实的 import/调用层数；覆盖率 ≥40% 才作为分层基准，否则回落 `count` 并在事实面板显式声明降级 |
 | `back` | bool | 可选。显式声明为回边，一般由算法自动判定，无需手写 |
 | `resolved_by` | enum | 可选（v3 派生字段）。**闭集** `name`（实锤·按末段名唯一命中）/ `binding`（按导入绑定）/ `qualified`（按限定名精确匹配）；仅 `verified` 边可携带，且 verified 边携带时必为三值之一——校验器机检 |
@@ -677,7 +686,8 @@ document.querySelectorAll('.translate-pair').forEach(pair => {
 - **线宽**：`min(6, 1 + log2(count) × 0.7)`——承载 700 个调用点的边明显更粗，但不会粗一百倍
 - **线型 = 置信度**：`verified` 实线、`inferred` 虚线、回边强调色虚线
 - **确定性**：同一份 JSON 必然产出同一张图（不依赖时间、随机数、DOM 测量顺序）
-- **交互**：悬停/聚焦节点 → 高亮它的所有边、淡化其余；悬停连线 → 事实面板显示 `from → to`、调用点数、置信度、`file:line`（**边从调用行长出来**）；节点可 Tab 聚焦，聚焦等同悬停；长标签截断为 `…`，全名保留在 `title` 与事实面板里，不丢信息；节点事实为多行（首行结构信息，其后为 `作用：`／`调用：`），空闲态声明分层依据与「未画」清单（自环／截断／同名疑义边，零项不出现）——面板样式必须保留换行（`.callgraph-facts` 的 `white-space: pre-line`，行高 1.55）
+- **交互**：悬停/聚焦节点 → 高亮它的所有边、淡化其余；悬停连线 → 事实面板显示 `from → to`、调用点数、置信度、`file:line`（**边从调用行长出来**）；节点可 Tab 聚焦，聚焦等同悬停；长标签截断为 `…`，全名保留在 `title` 与事实面板里，不丢信息；节点事实为多行（首行结构信息，其后为 `描述：`／`作用：`／`调用：`／`角色：`，v1.18.0 增后两项），边事实为多行（首行结构信息，其后为 `依赖：<kind> · <detail>`），空闲态声明分层依据与「未画」清单（自环／截断／同名疑义边，零项不出现）——面板样式必须保留换行（`.callgraph-facts`／`.arch-facts` 的 `white-space: pre-line`，行高 1.55）
+- **边种类（v1.18.0）**：`kind` **不改线型**（线型只承载置信度：实线=verified／虚线=inferred／强调色虚线=回边），只改**箭头样式**并在事实面板写明；架构图另在图下渲染 `.arch-legend` 说明本图出现的种类。诚实性通道与语义通道分离，互不挤占
 
 ### 14c. 状态类与分工
 
@@ -748,3 +758,188 @@ window.c2cLazyPlay(viz, function () {
 ```
 
 自查三条：零外部资源；初始静止、滚入才播；样式只依赖 base.css 变量。做出来不如模板直观就回退模板——宁可用对形式，不用新形式。
+
+## 15. 理解骨架组件（v1.18.0：总架构图 / 运行链路 / 三句话卡 / 变量词典 / 设计四问块 / 改造指南）
+
+**为什么有这一节**：v1.18.0 之前的规格里，可数的东西（翻译块/动画/测验/交互种类）是硬下限并机检，不可数的东西（架构全景、设计动机、变量语义）只是一句软要求——作者的合规最优解自然变成"凑数量"。这一节把**六件理解骨架**变成与数量同权的硬下限（`validate_course.py` 检查 19–23，缺位即 ERROR），并把它们**计入视觉与深度元素**（SKILL.md「视觉覆盖」同口径）。
+
+**工程约束（先记住再动手）**：
+
+1. **静态结构优先**：六件里除总架构图复用调用图引擎外，其余五件一律是**静态 HTML + CSS**（表/卡/dl/ol）——**不为它们写新动画引擎**，也不给它们加动效；
+2. **交互克制**：这六件存在的意义就是把篇幅从装饰性动效拿回来（判定见 workflow.md §6「交互克制原则」）；
+3. **数据诚实**：总架构图的节点/边必须来自 `analyze_structure.py` 结构事实（出处、置信度、`self_ref` 剔除、禁自环全部不豁免）；变量词典的每一个 `file:line` 必须**回源码核对**过；
+4. **类名与结构不得自创**：机检按本节类名与属性判定，改名即红。
+
+### 15a. 总架构图 `.arch-scene`（封面必配，用户第一优先级）
+
+**一句话**：读者看完封面这一张图，就该能说出"这个系统由什么组成、谁拥有谁、一次运行数据怎么流、结果怎么回到界面、每个模块讲的是哪一段"。
+
+```html
+<div class="arch-scene scene">
+  <div class="arch-title t-h3">🏛️ 这个系统怎么运转：一次「帮助」请求的全景</div>
+  <p class="t-body">这张图回答三件事：谁拥有谁（实线从属）、数据一次怎么流过（含回到界面的回边）、五个正式模块各覆盖哪一段。</p>
+  <script type="application/json" class="arch-data">
+  {
+    "nodes": [
+      { "id": "main",  "label": "main.py",  "kind": "entry",  "file": "main.py",  "line": 12,
+        "desc": "程序入口：装配 UI 与求解器", "role": "启动与装配", "view": "own" },
+      { "id": "solver","label": "Solver",   "kind": "class",  "file": "solver.py","line": 31,
+        "desc": "串起扫描→推理→决策的一次求解", "role": "总调度", "view": "own" },
+      { "id": "vision","label": "vision.py","kind": "module", "file": "vision.py","line": 1,
+        "desc": "把屏幕截图读成棋盘状态", "role": "感知层", "view": "flow" },
+      { "id": "ui",    "label": "Qt UI",    "kind": "module", "file": "main.py",  "line": 40,
+        "desc": "显示棋盘与热力图，接收用户点击", "role": "展示与输入", "view": "flow" }
+    ],
+    "links": [
+      { "from": "main", "to": "solver", "count": 1, "confidence": "verified", "file": "main.py", "line": 31,
+        "kind": "owns", "detail": "main.py 持有 Solver 实例并驱动一次求解" },
+      { "from": "solver", "to": "vision", "count": 1, "confidence": "verified", "file": "solver.py", "line": 88,
+        "kind": "call", "detail": "求解前先调 complete_scan() 读屏" },
+      { "from": "vision", "to": "ui", "count": 1, "confidence": "inferred",
+        "kind": "data", "detail": "热力图结果经信号回到界面刷新（推断：信号连接在 Qt 层注册）" }
+    ],
+    "module_marks": [
+      { "id": "m2", "label": "模块 2 · 读屏与棋盘重建", "covers": ["vision"] },
+      { "id": "m3", "label": "模块 3 · 推理与概率决策", "covers": ["solver"] }
+    ]
+  }
+  </script>
+  <div class="arch-stage" role="group" aria-label="这个系统怎么运转：一次「帮助」请求的全景"></div>
+  <div class="arch-facts t-muted" aria-live="polite">悬停节点看「它做什么」，悬停连线看「怎么依赖、传什么」</div>
+  <div class="arch-legend t-muted"></div>
+</div>
+```
+
+**三视图合一（缺一层即不合格，S1）**：
+
+| 视图 | 落在数据哪里 | 验收问法 |
+|---|---|---|
+| ① 对象从属/层次（谁拥有谁） | `links[].kind = "owns"`／`"dependency"` | 图上有"入口 → 核心对象 → 各层模块"的持有链吗？ |
+| ② 一次运行的数据流与触发（**含回边**） | `links[].kind = "call"`／`"data"`／`"control"`；回边由引擎判定画成强调色虚线 | "结果回到界面"这类边画出来了吗？只画向下的调用 = 不合格 |
+| ③ 模块归属标注 | `module_marks[]`（`id` 对应课程模块锚点、`covers[]` 列出该段覆盖的节点） | 读者知道"模块 4 为什么突然讲 C++"吗？（因为它覆盖性能瓶颈那一段） |
+
+**字段要求**：节点必填 `desc` 与 `role`（v1.18.0 语义字段在总架构图上**不是可选**）；边必填 `kind` 与 `detail`；`view: "flow"` 用于强调"数据流视角"的节点（视觉上由引擎区分，作者只管标）。**顶层键集**：`.arch-data` 只允许 `nodes` / `links` / `module_marks`——多写键校验器报错（闭集契约的延续）。
+
+**数据从哪来**：见 §15g。
+
+### 15b. 一次完整运行链路 `.run-chain`（封面必配）
+
+结构图回答"由什么组成"，链路图回答"一轮怎么跑完"——**两张都要，且都在开课处**（不是只在结业回顾）。
+
+```html
+<ol class="run-chain">
+  <li class="rc-step" data-step="1"><span class="rc-obj">用户</span><span class="rc-what">点击「帮助」按钮</span></li>
+  <li class="rc-step" data-step="2"><span class="rc-obj">main.py</span><span class="rc-what">进入 Solver.run() 开一次求解</span></li>
+  <li class="rc-step" data-step="3"><span class="rc-obj">vision.py</span><span class="rc-what">截屏并识别成棋盘数字</span></li>
+  <li class="rc-step" data-step="4"><span class="rc-obj">deduction / probability</span><span class="rc-what">按规则与概率算出候选格</span></li>
+  <li class="rc-step" data-step="5"><span class="rc-obj">decision</span><span class="rc-what">选一个格子并点击</span></li>
+  <li class="rc-step" data-step="6"><span class="rc-obj">heatmap_signal</span><span class="rc-what">把热力图结果回写界面（回边）</span></li>
+</ol>
+<p class="t-body">后面每个模块只解释其中一段——你现在看到的是全貌，接下来逐段拆开。</p>
+```
+
+契约：`data-step` 从 1 起连续；≥4 步（复杂系统建议 5–8 步）；每步对象名用**真实文件/类/函数名**（读者能在仓库里搜到）；**末尾必须能看出"结果回到哪里"**（回边意识）。
+
+### 15c. 模块三句话卡 `.module-card`（每个正式模块正文最前）
+
+```html
+<div class="module-card">
+  <div class="mc-row" data-key="problem"><span class="mc-key">解决什么问题</span><span class="mc-val">规则推理后仍有多个候选格时，按概率挑出最可能安全的一格</span></div>
+  <div class="mc-row" data-key="input"><span class="mc-key">输入是什么</span><span class="mc-val">候选格集合 <code>clicks</code>（分区后仍不确定的格子）与其数字约束 <code>set_list</code></span></div>
+  <div class="mc-row" data-key="output"><span class="mc-key">输出是什么</span><span class="mc-val">最佳点击位置 <code>pos</code> + 概率值 <code>probability</code> + 置信度</span></div>
+  <div class="mc-row" data-key="segment"><span class="mc-key">在总架构图上的位置</span><span class="mc-val">总架构图的「推理与决策」那一段（模块归属标注里的 m3）</span></div>
+</div>
+```
+
+契约：四行齐全（`problem`/`input`/`output`/`segment`）；**输入输出必须具体到数据形态或变量名**（"输入是用户数据"= 不合格）；第 4 行必须回指总架构图的模块归属标注。
+
+### 15d. 变量词典 `.vardict-scene`（交付物；变量密集模块必配）
+
+读者不该在隐喻与变量名之间来回翻译。词典是**交付给读者的查阅件**（不是作者的工作笔记），并把变量生命周期链一并给出（A3+A4）：
+
+```html
+<div class="vardict-scene">
+  <div class="vardict-title t-h3">🔤 变量词典：这一段的变量对照</div>
+  <table class="vardict-table">
+    <thead><tr><th>代码变量</th><th>人话</th><th>生命周期</th><th>代码位置</th></tr></thead>
+    <tbody>
+      <tr class="vardict-row" data-var="clicks" data-stage="分区阶段产生">
+        <td class="vd-var"><code>clicks</code></td><td class="vd-plain">外围候选格</td>
+        <td class="vd-stage">分区阶段产生</td><td class="vd-loc">utils/probability.py · L120</td></tr>
+      <tr class="vardict-row" data-var="click_list" data-stage="拼桌阶段产生">
+        <td class="vd-var"><code>click_list</code></td><td class="vd-plain">按约束关系分组后的候选格</td>
+        <td class="vd-stage">拼桌阶段产生</td><td class="vd-loc">utils/probability.py · L210</td></tr>
+    </tbody>
+  </table>
+  <div class="var-chain" aria-label="变量生命周期链">
+    <span class="vc-node" data-var="cell_value">cell_value</span>
+    <span class="vc-arrow" aria-hidden="true">→</span>
+    <span class="vc-node" data-var="clicks">clicks</span>
+    <span class="vc-arrow" aria-hidden="true">→</span>
+    <span class="vc-node" data-var="click_list">click_list</span>
+    <span class="vc-arrow" aria-hidden="true">→</span>
+    <span class="vc-node" data-var="res_list">res_list</span>
+    <span class="vc-arrow" aria-hidden="true">→</span>
+    <span class="vc-node" data-var="probability">probability</span>
+    <span class="vc-arrow" aria-hidden="true">→</span>
+    <span class="vc-node" data-var="pos">pos</span>
+  </div>
+</div>
+```
+
+契约：`.vardict-row` 必须带 `data-var` 与 `data-stage`（生命周期阶段），四个单元格齐全；`.var-chain` 至少 2 个 `.vc-node[data-var]`，节点 `data-var` 与词典行**同名对应**（读者点变量能回到表里查到位置）；触发条件 = **该模块核心变量 ≥5**（workflow.md §2.5 规则 3）。**变量生命周期图就是这条链**——它回答"数据在哪个阶段换了什么形态"，比"挑一条最重要的数据"更完整（后者是单链叙事，本体是横向盘点）。
+
+### 15e. 设计四问块 `.design-qa`（每模块 ≥2 处，L3 ≥3 处）
+
+```html
+<div class="design-qa">
+  <div class="dq-title t-h3">🎯 设计四问：为什么用概率而不是暴力枚举</div>
+  <dl class="dq-list">
+    <div class="dq-row" data-q="what"><dt class="dq-key">它做什么</dt><dd class="dq-val">在剩余候选格里按约束满足概率排序，挑最优的一格</dd></div>
+    <div class="dq-row" data-q="why"><dt class="dq-key">为什么这么做</dt><dd class="dq-val">枚举 3^N 种布雷组合在 30×16 棋盘上不可行；按约束分组后每组独立枚举，规模降到几十</dd></div>
+    <div class="dq-row" data-q="else"><dt class="dq-key">不这么做会怎样</dt><dd class="dq-val">每次点击都要等数十秒甚至卡死；玩家体验退化为随机猜</dd></div>
+    <div class="dq-row" data-q="simpler"><dt class="dq-key">为什么不用更简单的方法</dt><dd class="dq-val">"数周围已知雷"这类启发式在约束重叠时会给出错误概率（举例：同一格被两条约束共同覆盖）——简单方法在这里不是更快，而是会点错</dd></div>
+  </dl>
+</div>
+```
+
+契约：四行齐全（`what`/`why`/`else`/`simpler`），**缺任一项即不合格**；第 3 问必须写"坏什么"（后果轴），第 4 问必须写"更简单的做法为什么不够"（方案比较轴）并尽量给反例；每模块 ≥2 处，L3 ≥3 处；每问 ≤2 句、句句落回代码或数据。
+
+### 15f. 改造指南 `.upgrade-guide`（结业段必配，≥6 行真实任务）
+
+课程终点不是"看懂"，是"敢改"：
+
+```html
+<table class="upgrade-guide">
+  <thead><tr><th>想做的事</th><th>去哪儿改</th></tr></thead>
+  <tbody>
+    <tr class="ug-row" data-task="换扫雷皮肤"><td class="ug-task">换一套皮肤/主题</td><td class="ug-where"><code>vision.py</code>（模板匹配） + <code>cfg.json</code>（阈值与模板路径）</td></tr>
+    <tr class="ug-row" data-task="换概率算法"><td class="ug-task">换成别的概率算法</td><td class="ug-where"><code>utils/probability.py</code>（决策末端只消费返回的排序结果）</td></tr>
+    <tr class="ug-row" data-task="禁用 C++ 加速"><td class="ug-task">禁用 C++ 加速层</td><td class="ug-where"><code>native.py</code>（有纯 Python 回退分支）</td></tr>
+    <tr class="ug-row" data-task="修改界面"><td class="ug-task">改 UI 布局/交互</td><td class="ug-where"><code>main.py</code> + <code>ui/</code></td></tr>
+    <tr class="ug-row" data-task="增加测试"><td class="ug-task">补单元测试</td><td class="ug-where"><code>tests/</code>（纯函数在 <code>utils/</code>，可直接构造输入）</td></tr>
+    <tr class="ug-row" data-task="修改线程通信"><td class="ug-task">改求解线程与 UI 的通信</td><td class="ug-where"><code>solver.py</code> ↔ <code>main.py</code>（信号/队列两端）</td></tr>
+    <tr class="ug-row" data-task="优化性能"><td class="ug-task">优化求解性能</td><td class="ug-where"><code>bench/</code>（基线） + <code>utils/probability.py</code> + <code>cpp/</code>（热点下沉）</td></tr>
+  </tbody>
+</table>
+```
+
+契约：`data-task` 必填（机检计数用）；≥6 行真实任务（L1 ≥4），任务取自 **3d 配置与扩展面**的真实分析结论（不许凭空编"想做的事"）；"去哪儿改"必须给到**文件或目录级**（写"改后端"= 不合格），最好带一句"为什么是这里"（该处是抽象层/唯一消费点）。
+
+### 15g. 总架构图的数据从哪来（SOP）
+
+1. **先跑结构事实**：`python analyze_structure.py <仓库> --outdir work/structure-facts`（可选但强烈建议——六件里的架构图与模块归属标注都靠它）；
+2. **对象从属层次**：从 `entry` 命令的入口点出发，沿 `callees` 追 2–3 层，把"谁构造/持有谁"记成 `owns` 边（`main.py` 构造 `Solver`、`Solver` 持有 `deduction`/`probability` 等）；
+3. **数据流与回边**：用 `path <a> <b>` 与 3a 事件链的产物，写 `call`/`data`/`control` 边；**回边单独排查一遍**——凡"结果回到调用方/界面"的路径，哪怕静态只能标 `inferred`，也要画出来（宁可虚线，不可缺层）；
+4. **模块归属标注**：按第 2 步定下的模块清单，给每个模块填 `covers[]`（该模块要讲的那几个节点）；
+5. **聚合与收口**：节点保持 4–20（超了就把子系统聚成一个 module 节点）；剔除 `self_ref` 边与自环；每条边给最弱置信度；跑 `validate_course.py`（检查 16/19）看是否零错误。
+
+**自查（六件一起过一遍）**：
+
+- [ ] 封面有总架构图（三视图齐全）**与**一次完整运行链路（≥4 步，末尾能看出回到哪里）
+- [ ] 每个正式模块第一屏有三句话卡（四行，输入输出具体到数据形态，第 4 行回指架构图）
+- [ ] 变量密集模块（核心变量 ≥5）有变量词典（表 + 生命周期链，`file:line` 逐项回源码核对过）
+- [ ] 每模块 ≥2 处设计四问块（L3 ≥3），四问齐全，第 3/4 问不是凑数句子
+- [ ] 结业段有改造指南（≥6 行真实任务，"去哪儿改"给到文件/目录级）
+- [ ] 六件都是静态结构或复用调用图引擎（**没有为它们新写动画引擎**）；加了动效的地方都能通过"删掉后是否仍需重写正文"的判定
+- [ ] `validate_course.py` 检查 19–23 零错误
