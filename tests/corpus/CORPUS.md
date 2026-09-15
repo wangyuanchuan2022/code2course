@@ -22,6 +22,15 @@ python tests/corpus/fetch_corpus.py --only python,go --force --skip-smoke
 - **语料本体不入 git**（.gitignore 排除 `tests/corpus/*`，本脚本与本清单豁免），
   任意机器执行上面一条命令即可一键还原。
 
+### 常驻测试层：tests/test_corpus.py
+
+fetch 内置的一次性冒烟仅作下载自检；常规回归以 `python tests/test_corpus.py` 为准：
+对盘上 14 仓全量各跑 analyze 两次，断言 8 项/仓（exit 0、facts 可解析、schema/engine
+版本钉值、symbols >= 5、主语言检出、files 语言闭集、**双跑 structure-facts.json
+逐字节一致**）。零依赖直跑、全 ASCII 输出；语料缺失时响亮 skip 并提示 fetch 命令，
+`--require-corpus` 把 skip 升级为 fail，`--only/--repo` 支持子集。基线：112 断言 /
+约 16s（仓库根自动定位，脚本摆放位置无关）。
+
 ## 语料清单（2026-09-15 实测）
 
 | 语言 | 仓库 | 钉 ref | 子目录 | 许可证 | 源码体积 | 文件数 | 冒烟 symbols | 选取理由 |
