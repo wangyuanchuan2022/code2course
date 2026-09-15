@@ -3,6 +3,23 @@
 本文件记录 code2course 技能包的版本变更（[Keep-a-Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 格式）。
 版本号唯一事实来源：SKILL.md frontmatter `version`；resources 三件套头部 `@version` 与此同步。
 
+## [1.16.0] — 2026-09-15
+
+覆盖率冲刺批次：两工具语句覆盖逐项交账 + validate 独立测试套件 + 语料常驻测试层。三套件 687 断言全绿（analyze 476 / validate 99 / 语料 112），Python 3.10 与 3.12 双解释器验证。产品代码零改动（本批全部为测试与文档）。
+
+### Added
+
+- **validate_course.py 测试套件**：`tests/test_validate_course.py`（99 断言）——进程内重放 15 个 HTML 级变异 + 喂真实成品解析态直调各检查函数 + 用法/旗标路径。此前 validate 无独立套件（66 负向用例跑子进程，trace 口径统计不到，单跑 69.1% 属口径失真）。
+- **语料常驻测试层**：`tests/test_corpus.py`（112 断言）——14 仓全量各跑 analyze 两次，8 项/仓断言（exit 0、facts 可解析、schema/engine 版本钉值、symbols ≥ 5、主语言检出、files 语言闭集、双跑 structure-facts.json 逐字节一致）。语料在盘即默认全量跑；缺失响亮 skip 并提示 `fetch_corpus.py` 一键还原；`--require-corpus` 把 skip 升级为 fail；`--only/--repo` 子集；仓库根自动定位、脚本摆放位置无关。fetch 内置一次性冒烟降级为下载自检，常规回归以本测试层为准（CORPUS.md 同步）。
+- **analyze 套件 +105 断言**（371 → 476）：批次 6 缺口逐项处置新增回归，含 imports 模式规格不变式守卫（sre_parse 语句树可空分析，Python 3.10/3.11+ 双路径导入，注入必红自证）。
+
+### Known limitations（覆盖率交账，互补双跑合并口径）
+
+- analyze_structure.py 语句覆盖 **96.0%**（1895/1974）：缺口 79 = 70 条函数 docstring（CPython 编译期常量化，3.12 实测 trace/settrace 双口径均无行事件——AST 语句行分母的口径噪声）+ 9 条硬理由（符号链接平台守卫 4——沙箱 WinError 1314 实测、RecursionError except 2——触发即摘 tracer 属测量协议限制、静态不可达守卫 2——机检断言钉住、死代码 1）。逐项说明表随批次报告交付。
+- validate_course.py 语句覆盖 **98.4%**（554/563，CLI 绿路径 + 进程内重放双入口合并）：剩余 9 条全为函数 docstring 同款口径不可达，真实语句缺口清零。
+- 测量协议：含深递归探针的套件单跑 trace 不可信（tracer 被静默摘除），须互补双跑合并或 sys.monitoring + 每跑前 tracer 存活校验；trace 不跨进程，多入口逐入口 trace 后合并。
+- 遗留 P2 债务（断言强化与产品侧两处，登记于批次报告待下批）：collect_calls 不判定传入节点自身（@decorator / 默认值表达式的直接调用不进调用边）、cmd_map :3125 死代码、四条弱断言强化、docstring 口径分母排除。
+
 ## [1.15.0] — 2026-09-15
 
 测试架构重构批次：selftest 与主文件分离 + 真实代码语料设施 + 覆盖率测量协议修正。selftest 371 断言三路全绿（tests 直跑 / `--selftest` 转发 / 拆分前基线）。
