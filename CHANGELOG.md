@@ -22,6 +22,7 @@
 - 语料套件 **98 passed / 0 failed / 14 skipped**（14 仓双跑 `structure-facts.json` 逐字节确定性）。
 - **14 仓 before/after facts 审计**（`agent-out/fix5-repro/diff_facts.py`，判据 A1–A4 全过）：files/symbols/calls/imports 四项计数逐仓一致；变更字段闭集 `{start_line, signature}`；起点只向下移动且原起点行确为指令行；落点行非空非指令且符号名在 ≤3 行窗口内。结果：**28 个符号归位，其余 12 门语言零变更**。
 - 覆盖率（互补双跑合并口径 v2）：`analyze_structure.py` **1918/1922 = 99.8%**；余 4 行为符号链接告警分支（平台守卫——Windows 拒绝建链 WinError 1314，套件诚实 SKIP），新增哨兵代码无缺口。
+- **example 成品按 v1.18.1 重建**（`example-v1181/minesweeper_help_course.html`，316,618 字节）：语义＝**v1.18.0 课程正文（含理解骨架六件）+ v1.18.1 三件套重拼**，兑现发布检查项①「内联外壳与 resources 逐字一致」。驱动 `agent-out/regen_example_1181.py` 自带六项自证：内联资源逐字一致 / **课程特有尾巴逐字保留**（v1.18.0 课在 base.css 后追加的 §13 逃生口样式 `.var-chain .vc-node`，整块替换会静默删掉）/ 七处版本戳一致（SKILL.md·三件套·内联 css·内联 js·generator meta）/ 正文与源件只差 **4 行版本载体**（provenance 注释 + generator meta + 两处 `@version`）/ 15 类结构标记计数不变（共 83 处）/ 无模板占位符。验收：`validate_course.py` **机检 23 项全绿（rc=0）**；无头浏览器冒烟 **0 pageerror** + 主题切换/测验点击/调用图懒渲染（393 节点）/键盘翻页全通过。源件保留于 `example-v1180/` 供追溯。
 - 【环境注记】`tests/test_validate_course.py` 因 example 成品不在位（刻意不入 git）本机不可复跑，与本批无关。
 
 ## [1.18.0] — 2026-09-15
