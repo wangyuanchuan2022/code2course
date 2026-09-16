@@ -1770,6 +1770,41 @@ def _balanced_parens(text):
     return depth == 0
 
 
+_DIRECTIVE_LINE_RE = re.compile(r'[ \t]*#')
+
+
+def _decl_span_start(text, mstart, nstart):
+    """BS-5：块体声明的起点不得落在行首预处理指令行上。
+
+    C/C++ 函数模式的「返回类型前缀链」（`(?:[\\w\\*&]+[\\s\\*&]+)+` 的 `\\s` 跨行）
+    会把匹配起点锚到紧邻声明上方的指令行（#else/#endif…——剥注释后只剩裸词+
+    空白，恰为前缀链燃料），start_line/signature 随之记到指令行：实证
+    fmt-3.0.2 format.cc 的 fmt_snprintf 被记到 94 行（#else 行）、signature
+    存成 `#else  // _MSC_VER`，真实定义在 95 行（幻觉率实验 Arm B 唯一 off
+    的工具侧根源）。起点行是指令行且名字在后续行时，推进到首个「非指令、
+    非空」行行首；名字与起点同行的匹配（宏体内函数等）原样返回。
+
+    只对块体角色（func/type/impl）调用；value/bodyless（宏 #define 自身，
+    其 signature 正是指令原文）不经此路径。
+    """
+    ls = text.rfind('\n', 0, mstart) + 1
+    moved = False
+    while True:
+        le = text.find('\n', ls)
+        if le == -1:
+            le = len(text)
+        if nstart < le:
+            break                       # 名字在本行：不越过（含指令行同行形态）
+        seg = text[ls:le].strip()
+        if seg and not seg.startswith('#'):
+            break                       # 首个真实声明行
+        if le == len(text):
+            break                       # 防御：扫到文件尾仍无声明行
+        ls = le + 1
+        moved = True
+    return ls if moved else mstart
+
+
 def _line_offsets(text):
     offsets = [0]
     for m in re.finditer('\n', text):
@@ -2028,8 +2063,12 @@ def analyze_generic(root, rel, lang, data, text, symbols, imports,
                 # 多行 std::stable_sort 调用的 lambda 体）——不进符号表，其区间也
                 # 不当「声明自身」过滤（该行里的真实调用应照常产出）
                 continue
-            decl_spans.append((m.start(), m.end()))
             name = m.groupdict().get('n')
+            mstart = m.start()
+            if name and role in ('func', 'type', 'impl'):
+                # BS-5：前缀链可跨行吞掉行首指令行（#else/#endif）→ 起点回归真实声明行
+                mstart = _decl_span_start(decl_text, mstart, m.start('n'))
+            decl_spans.append((mstart, m.end()))
             if not name:
                 continue
             if name in table['decl_stops']:
@@ -2037,7 +2076,7 @@ def analyze_generic(root, rel, lang, data, text, symbols, imports,
             if name.startswith('~') or name.startswith('operator'):
                 continue                       # 析构/运算符重载：盲区不猜
             decl_names.add(name)
-            found.append((m.start(), m.end(), name,
+            found.append((mstart, m.end(), name,
                           m.groupdict().get('recv'), kind, role))
     found.sort(key=lambda item: (item[0], -item[1]))
 

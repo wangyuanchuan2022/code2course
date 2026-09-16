@@ -24,7 +24,7 @@
    .arch-marks 行；导出 window.c2cCallgraphLayout / window.c2cArchLayout
    供课程脚本与测试复用。未新增状态类、未新增动画引擎。
    ===================================================================
-   @version 1.18.0 */
+   @version 1.18.1 */
 (function () {
   'use strict';
 

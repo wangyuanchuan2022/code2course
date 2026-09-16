@@ -806,6 +806,48 @@ inline void sorter(std::vector<int>& v) {
 }
 '''
 
+# BS-5：行首条件编译指令行（#else/#endif…）紧邻的声明——返回类型前缀链跨行
+# 吞词会把 start_line/signature 记到指令行（实证 fmt-3.0.2 format.cc
+# fmt_snprintf 94↔95，幻觉率实验 Arm B 唯一 off 的工具侧根源）
+FIXTURE_CPP_DIRECTIVE = '''\
+#ifdef HAS_SNPRINTF
+# define MY_SNPRINTF snprintf
+#else  // no snprintf
+inline int my_snprintf(char *buffer, size_t size, const char *format, ...) {
+  return 0;
+}
+# define MY_SNPRINTF my_snprintf
+#endif
+
+#endif  // guard tail
+
+std::vector<int>
+multi_line_header(int x) {
+  return {};
+}
+'''
+
+# BS-5：c 表同源缺陷（同一前缀链形态）+ 指令行/空行/注释行连续穿越 +
+# 宏体内函数（名字与指令同行——哨兵不得越过名字所在行）
+FIXTURE_C_DIRECTIVE = '''\
+#ifdef FAST_PATH
+# define SCALE 2
+#else
+int scale_value(int v) {
+  return v * 1;
+}
+#endif
+
+/* block comment line */
+int after_comment(int a) {
+  return a;
+}
+
+#define WRAP_FN int wrap_fn_x(void) {
+}
+#endif
+'''
+
 # P1-a/P2-c：第三方目录名命中（vendored 提示信号）
 FIXTURE_THIRD_PARTY = '''\
 def vendored_helper(x):
@@ -864,6 +906,8 @@ def _materialize_fixture(root):
         'langs/lhelper.lua': FIXTURE_LUA_HELPER,
         'langs/cppforms.hpp': FIXTURE_CPP_FORMS,
         'langs/box.hpp': FIXTURE_CPP_CTOR,
+        'langs/cppdir.hpp': FIXTURE_CPP_DIRECTIVE,
+        'langs/cdir.c': FIXTURE_C_DIRECTIVE,
         'third_party/lib.py': FIXTURE_THIRD_PARTY,
         'src/ffi.py': FIXTURE_FFI,
         'src/ffi2.py': FIXTURE_FFI2,
@@ -1268,6 +1312,11 @@ def run_selftest():
             ('cpp', 'forms.Grid.check_any', 'method', 17, 19),
             ('cpp', 'forms.Grid.safe', 'method', 20, 22),
             ('cpp', 'PYBIND11_MODULE', 'function', 27, 29),
+            ('cpp', 'my_snprintf', 'function', 4, 6),
+            ('cpp', 'multi_line_header', 'function', 12, 15),
+            ('c', 'scale_value', 'function', 4, 6),
+            ('c', 'after_comment', 'function', 10, 12),
+            ('c', 'wrap_fn_x', 'function', 14, 15),
             ('lua', 'LIMIT', 'variable', 3, 3),
         )
         sym_langs = set()
@@ -1708,6 +1757,39 @@ def run_selftest():
                                      'end') is not None,
                       'P1-c control: calls inside the previously swallowed '
                       'multi-line call stay listed')
+        # BS-5：行首指令行紧邻声明的 start_line/signature 归位（见 fixture 注释）
+        my_sn = _find_symbol(facts, 'my_snprintf')
+        checker.check(my_sn is not None and my_sn['start_line'] == 4
+                      and my_sn['signature'] == 'inline int my_snprintf('
+                      'char *buffer, size_t size, const char *format, ...) {',
+                      'BS-5 cpp #else-adjacent fn anchored to true decl line')
+        mlh = _find_symbol(facts, 'multi_line_header')
+        checker.check(mlh is not None and mlh['start_line'] == 12
+                      and mlh['signature'] == 'std::vector<int>',
+                      'BS-5 legit multi-line header keeps return-type line '
+                      '(sentinel inert)')
+        sv = _find_symbol(facts, 'scale_value')
+        ac = _find_symbol(facts, 'after_comment')
+        checker.check(sv is not None and sv['start_line'] == 4
+                      and '#else' not in sv['signature']
+                      and ac is not None and ac['start_line'] == 10
+                      and ac['signature'] == 'int after_comment(int a) {',
+                      'BS-5 c-table #else/#endif-adjacent fns anchored to '
+                      'true lines')
+        wfx = _find_symbol(facts, 'wrap_fn_x')
+        checker.check(wfx is not None and wfx['start_line'] == 14
+                      and wfx['signature'].startswith('#define WRAP_FN'),
+                      'BS-5 macro-line fn keeps same-line start (sentinel '
+                      'never crosses the name line)')
+        sn_consts = sorted((s for s in facts['symbols']
+                            if s['name'] == 'MY_SNPRINTF'),
+                           key=lambda s: s['start_line'])
+        checker.check(len(sn_consts) == 2 and sn_consts[0]['start_line'] == 2
+                      and sn_consts[1]['start_line'] == 7
+                      and sn_consts[0]['signature'].startswith(
+                          '# define MY_SNPRINTF'),
+                      'BS-5 value-role macros untouched (directive-line sig '
+                      'by design)')
         # P1-d(B-P0-2) / A3-3：标签与证据来源绑定 + 调用边 extractor 归属
         checker.check(_conf_label(CONF_VERIFIED, RB_NAME) == '实锤(名)'
                       and _conf_label(CONF_VERIFIED, RB_BINDING) == '实锤(绑定)'

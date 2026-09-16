@@ -3,6 +3,27 @@
 本文件记录 code2course 技能包的版本变更（[Keep-a-Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 格式）。
 版本号唯一事实来源：SKILL.md frontmatter `version`；resources 三件套头部 `@version` 与此同步。
 
+## [1.18.1] — 2026-09-16
+
+缺陷修复批次：修 `analyze_structure.py` 的 **facts 行号误锚**——紧邻声明的行首预处理指令行（`#else`/`#endif`/`#ifdef`…）会被当成符号定义起点。该缺陷由幻觉率实验移交（`agent-out/hallucination-rate/results.md` §4.4：Arm B 唯一一条 off 即 facts 缺陷传导——模型忠实照抄 facts 的 94 行，真实定义在 95 行）。**facts 行号可信度是「事实不漂移」主张的地基**，故单开补丁版。
+
+### Fixed
+
+- **BS-5：指令行紧邻声明的 `start_line` / `signature` 归位**。根因＝C/C++ 函数模式的「返回类型前缀链」（`(?:[\w\*&]+[\s\*&]+)+` 的 `\s` 跨行吞词）：剥注释后指令行只剩裸词＋空白，恰为前缀链燃料，匹配起点被锚到指令行，`start_line`/`signature` 随之记错（实证 `fmt-3.0.2/format.cc` 的 `fmt_snprintf`：94 行 `#else  // _MSC_VER` ↔ 真实定义 95 行，`signature` 字段当时存成了指令原文）。修法＝声明扫描层「指令行哨兵」`_decl_span_start()`：起点行是指令行且名字在后续行时，推进到首个「非指令、非空」行行首；**名字与起点同行不越过**（宏体内函数保持原样）；只对 `func`/`type`/`impl` 角色生效，**`value`/`bodyless`（`#define` 宏自身）signature 仍为指令原文（设计如此，未改动）**。
+- 同一形态在 c 表（jq-1.4）另有 20 处、cpp 表（fmt-3.0.2）8 处，本次一并归位；**最大跨度** `jv_dtoa.c` 的 `jvp_dtoa_fmt`：`#endif`（4172 行）→ 真实定义（4205 行，返回类型行；中间 33 行为空行与块注释，剥注释后即前缀链燃料）。
+
+### Added
+
+- `tests/test_analyze_structure.py` 新增 BS-5 回归组：合成 fixture `langs/cppdir.hpp` 与 `langs/cdir.c`（`#else`/`#endif` 紧邻声明、空行与块注释连穿、合法多行函数头、宏体内函数四种形态）+ 4 条符号矩阵行 + 6 条 BS-5 断言（先红后绿闭环；旧代码即负向变异体）。
+
+### Verification
+
+- 分析套件 **489 passed / 0 failed / 2 skipped**（`--selftest` 转发的第二跑 488 passed / 0 failed / 3 skipped，rc=0）。
+- 语料套件 **98 passed / 0 failed / 14 skipped**（14 仓双跑 `structure-facts.json` 逐字节确定性）。
+- **14 仓 before/after facts 审计**（`agent-out/fix5-repro/diff_facts.py`，判据 A1–A4 全过）：files/symbols/calls/imports 四项计数逐仓一致；变更字段闭集 `{start_line, signature}`；起点只向下移动且原起点行确为指令行；落点行非空非指令且符号名在 ≤3 行窗口内。结果：**28 个符号归位，其余 12 门语言零变更**。
+- 覆盖率（互补双跑合并口径 v2）：`analyze_structure.py` **1918/1922 = 99.8%**；余 4 行为符号链接告警分支（平台守卫——Windows 拒绝建链 WinError 1314，套件诚实 SKIP），新增哨兵代码无缺口。
+- 【环境注记】`tests/test_validate_course.py` 因 example 成品不在位（刻意不入 git）本机不可复跑，与本批无关。
+
 ## [1.18.0] — 2026-09-15
 
 技能改造批次：**把"理解骨架"从软要求升为硬下限并机检**，并重排"数量 vs 深度"的权力结构（治"装饰挤占架构"）。触发于用户对成品课程的评审——课程有目录地图但没有真正的仓库总架构图、读者要在隐喻与变量之间来回翻译、解释没有系统化的"为什么"、没有"我要改这个仓库从哪开始"的导航；定性为**技能设计问题**而非课程问题（诊断全文见批次规格 `skill-reflection-v118`）。规格六文件 + resources 三件套 + validate 新增检查 19–23 + 测试注入必红。三套件 **786 passed / 16 skipped / 0 failed**（analyze 479 / validate 209 / corpus 98，Python 3.10 与 3.12 各一轮、严格串行）；validate 独立套件 **99 → 209 断言**，`validate_course.py` 语句覆盖 **100.0%（736/736）**。
