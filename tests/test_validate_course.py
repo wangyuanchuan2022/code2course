@@ -289,7 +289,11 @@ def _upgrade_guide_html():
 def inject_skeleton(text):
     """在 example 文本上机械注入理解骨架六件，返回注入后的 HTML 文本。
 
-    逐件判定：盘上已有该组件就跳过（example 重建为 v1.18.0 合规成品后仍然可跑）。
+    逐件判定（v1.19.0 E5 夹具校准）：组件按**作用域内已有量**按需补齐——
+    封面两件看全课、词典看全课、改造指南看结业段、模块卡与设计四问看模块段
+    （每正式模块缺几张补几张，design-qa 补到 SKEL_DESIGN_BLOCKS 块）。这样
+    对 v1.17 形态旧成品（六件全缺）行为与原版一致，对 v1.18.1 重建成品
+    （六件在场但每模块 design-qa 仅 2 块）精确补缺口，而不是整体跳过。
     收尾 fail-loud：注入后六件必须都在场，否则报错而不是让断言悄悄失去意义。
     """
     out = text
@@ -306,30 +310,41 @@ def inject_skeleton(text):
         out = out2
 
     state = {'vd': 'class="vardict-scene' in out,
-             'card': 'class="module-card' in out,
-             'design': 'class="design-qa' in out,
              'guide': 'class="upgrade-guide' in out}
 
+    def _count_cls(seg, cls):
+        # (?![\w-])：design-qa-off 这类改名产物不得计入已有量
+        return len(re.findall(r'class="[^"]*\b%s(?![\w-])' % cls, seg))
+
     def _inject_module(m):
-        open_tag, mid = m.group(1), m.group(2)
+        open_tag, seg = m.group(1), m.group(0)
+        if re.search(r'class="[^"]*\bhero\b', open_tag):
+            return seg                      # 封面不参与检查 20/22/23
         body = ''
-        if 'finale' in mid:
-            if not state['guide']:
+        mid = re.search(r'id="([^"]*)"', open_tag)
+        if mid and 'finale' in mid.group(1):
+            if not state['guide'] and not _count_cls(seg, 'upgrade-guide'):
                 state['guide'] = True
                 body += _upgrade_guide_html()
-            return open_tag + '\n' + body
-        if not state['card']:
+            if body:
+                return seg.replace(open_tag, open_tag + '\n' + body, 1)
+            return seg
+        if not _count_cls(seg, 'module-card'):
             body += _module_card_html()
-        if not state['vd']:
+        if not state['vd'] and not _count_cls(seg, 'vardict-scene'):
             state['vd'] = True
             body += _vardict_html()
-        if not state['design']:
-            body += ''.join(_design_qa_html(i)
-                            for i in range(1, SKEL_DESIGN_BLOCKS + 1))
-        return open_tag + '\n' + body
+        have_dq = _count_cls(seg, 'design-qa')
+        if have_dq < SKEL_DESIGN_BLOCKS:
+            body += ''.join(_design_qa_html(have_dq + i)
+                            for i in range(1, SKEL_DESIGN_BLOCKS
+                                           - have_dq + 1))
+        if body:
+            return seg.replace(open_tag, open_tag + '\n' + body, 1)
+        return seg
 
-    out = re.sub(r'(<section class="module" id="([^"]+)"[^>]*>)', _inject_module,
-                 out)
+    out = re.sub(r'(<section class="module"[^>]*>)[\s\S]*?</section>',
+                 _inject_module, out)
     for cls in ('arch-scene', 'run-chain', 'module-card', 'vardict-scene',
                 'design-qa', 'upgrade-guide'):
         if ('class="%s' % cls) not in out:
@@ -350,6 +365,112 @@ def run_mutant(tag, transform, tier='L2', inject=True):
         return None, 'ANCHOR-MISS %s' % exc
     args = ['validate_course.py', path] + (['--tier', tier] if tier else [])
     return run_main(args)
+
+
+# --------------------------------------- v1.19.0 E5：夹具校准与新检查的变异设施
+def design_keep_first():
+    """返回变异器：每个正式模块的 .design-qa 减到恰 1 块（段内第 1 块保留，
+    其余改名摘除）。
+
+    成品每模块 2 块 / 注入器补齐后每模块 3 块——两种形态下都得到「每模块
+    恰 1 块、4 行」，使 22a（L2）/22b（L3）的目标文案精确可断言（「1 块 < 2」
+    /「1 块 < 3」），并让 22d 档位门（L1 下限 1）判绿成立。
+    """
+    def _t(text):
+        def _seg(m):
+            seg = m.group(0)
+            seen = [0]
+
+            def _q(qm):
+                seen[0] += 1
+                if seen[0] == 1:
+                    return qm.group(0)
+                return qm.group(0).replace('class="design-qa"',
+                                           'class="design-qa-off"', 1)
+            return re.sub(r'<div class="design-qa">', _q, seg)
+        out, n = re.subn(r'<section class="module[^>]*>[\s\S]*?</section>',
+                         _seg, text)
+        if not n:
+            raise AssertionError('no module section for design_keep_first')
+        return out
+    return _t
+
+
+def strip_six(text):
+    """机械摘除理解骨架六件（类名改名法）→「无骨架成品」形态。
+
+    ORG 恢复的 example 已是 v1.18.1 重建合规成品（六件在场、自身全绿），
+    test_example_conflict 的原断言语义（缺六件被检查 19-23 逐件点名）改由
+    本变异承载：改名对解析层等价于摘除（各组件计数归零），不依赖组件
+    内部 HTML 形态。
+    """
+    t = text
+    for old, new in (
+            ('<div class="arch-scene', '<div class="arch-scene-off'),
+            ('<ol class="run-chain"', '<ol class="run-chain-off"'),
+            ('<div class="module-card">', '<div class="module-card-off">'),
+            ('<div class="vardict-scene">',
+             '<div class="vardict-scene-off">'),
+            ('<div class="design-qa">', '<div class="design-qa-off">'),
+            ('<table class="upgrade-guide">',
+             '<table class="upgrade-guide-off">')):
+        if old not in t:
+            raise AssertionError('strip_six anchor missing: %r' % old)
+        t = t.replace(old, new)
+    return t
+
+
+def measured_mut(files='utils/vision.py'):
+    """返回变异器：给封面运行链第 1 步注入 data-ev="measured" 主张。
+
+    files=None 时只带主张不带 data-ev-files（空主张变体）；多文件用分号
+    分隔（与 SPEC §2.5 的声明语法一致）。锚点不含收尾 `>`——属性必须
+    落在开标签内，落在外面就成了正文文本（注入必红会静默失真）。
+    """
+    def _t(text):
+        old = '<li class="rc-step" data-step="1"'
+        if old not in text:
+            raise AssertionError('rc-step #1 anchor missing')
+        extra = '' if files is None else ' data-ev-files="%s"' % files
+        return text.replace(old, old + ' data-ev="measured"' + extra + '>', 1)
+    return _t
+
+
+def write_trace(tag, files, schema='trace-facts-v2'):
+    """落盘一份最小 trace-facts-v2 采集文件，返回路径（供 --trace-facts）。"""
+    d = fresh_dir('trace' + tag)
+    path = os.path.join(d, 'trace-facts.json')
+    with io.open(path, 'w', encoding='utf-8', newline='') as fh:
+        fh.write(json.dumps({
+            'schema': schema, 'repo': '.', 'runtime': 'python',
+            'command': 'python -m click --help', 'duration_s': 1.0,
+            'files': files, 'edges': []}, ensure_ascii=False))
+    return path
+
+
+def append_body(frag):
+    """返回变异器：把片段插到 </main> 之前（构建卡/复刻线段的注入位）。"""
+    def _t(text):
+        if '</main>' not in text:
+            raise AssertionError('</main> anchor missing')
+        return text.replace('</main>', frag + '\n</main>', 1)
+    return _t
+
+
+def build_card_html(cmd_rows):
+    """构造 .build-run-card 段：cmd_rows 为 (data-cmd, data-src) 元组列表。"""
+    rows = '\n'.join('<div class="build-cmd" data-cmd="%s" data-src="%s">'
+                     '</div>' % c for c in cmd_rows)
+    return '<div class="build-run-card">\n%s\n</div>\n' % rows
+
+
+def rebuild_path_html(steps):
+    """构造 .rebuild-path 段：steps 为 (编号原文, 是否环块) 元组列表。"""
+    lis = '\n'.join(
+        '<div class="rb-step" data-step="%s"%s>step</div>'
+        % (num, ' data-cycle="true"' if cyc else '')
+        for num, cyc in steps)
+    return '<div class="rebuild-path">\n%s\n</div>\n' % lis
 
 
 # ----------------------------------------------------------------- 1. 用法/IO
@@ -1043,25 +1164,34 @@ def test_skeleton_direct():
 
 
 def test_skeleton_negative():
-    """注入必红：每个新检查 ≥2 个变异体，逐条断言目标 ERROR 文案。"""
-    drop_arch = rex(r'<div class="arch-scene scene">[\s\S]*?'
-                    r'aria-live="polite">[^<]*</div>\n</div>\n', '')
-    drop_chain = rex(r'<ol class="run-chain">[\s\S]*?</ol>\n', '')
-    rc_steps_3 = rex(r'<li class="rc-step" data-step="[45]">',
-                     '<li data-step="0">', count=2)
+    """注入必红：每个新检查 ≥2 个变异体，逐条断言目标 ERROR 文案。
+
+    v1.19.0 E5 夹具校准（基线 17 失败处置）：盘上 example 已是 v1.18.1 重建
+    合规成品（探针 agent-out/v119/e5-probe.py 实证：arch-scene×1 带 scene
+    尾类、run-chain 8 步且开标签带 aria-label、vardict-scene×2（m3 12 行 /
+    m5 7 行）、design-qa 每模块 2 块、ug-row 9 行）。因此：
+    ① 删除类变异一律改用**类名改名法**（解析层计数即归零，等价于摘除；
+      对成品/注入两种形态都命中，不再依赖注入器的内部 HTML 形态）；
+    ② 数量类变异按成品真实计数标定（8 步减到 3、9 行减到 3、每模块减到 1 块）；
+    ③ 断言语义（rc 期待 + 目标 ERROR 文案）一字未放宽。
+    """
+    drop_arch = sub('<div class="arch-scene', '<div class="arch-scene-off')
+    drop_chain = sub('<ol class="run-chain"', '<ol class="run-chain-off"')
+    rc_steps_3 = rex(r'<li class="rc-step" data-step="[45678]">',
+                     '<li class="rc-step-off" data-step="0">', count=5)
     card_off = sub('<div class="module-card">', '<div class="module-card-off">')
     mc_row_3 = sub('<div class="mc-row" data-key="segment">',
                    '<div class="mc-row-off" data-key="segment">')
     chain_off = sub('<div class="var-chain"', '<div class="var-chain-off"')
     stage_drop = rex(r'(class="vardict-row" data-var="[^"]*") data-stage="[^"]*"',
-                     r'\1', count=2)
-    vd_off = sub('<div class="vardict-scene">', '<div class="vardict-scene-off">')
-    design_1 = rex(r'<div class="design-qa">', '<div class="design-qa-off">',
-                   count=2)
+                     r'\1', count=99)
+    vd_off = sub('<div class="vardict-scene">',
+                 '<div class="vardict-scene-off">', count=99)
+    design_1 = design_keep_first()
     dq_row_3 = sub('<div class="dq-row" data-q="simpler">',
                    '<div class="dq-row-off" data-q="simpler">')
     ug_3 = rex(r'<tr class="ug-row" data-task="[^"]*">',
-               '<tr class="ug-row-off" data-task="x">', count=3)
+               '<tr class="ug-row-off" data-task="x">', count=6)
     ug_4 = rex(r'<tr class="ug-row" data-task="[^"]*">',
                '<tr class="ug-row-off" data-task="x">', count=2)
     ug_off = sub('<table class="upgrade-guide">',
@@ -1077,22 +1207,25 @@ def test_skeleton_negative():
     cases = [
         ('19a', '删封面 .arch-scene', drop_arch, 'L2', '缺仓库总架构图'),
         ('19b', '删封面 .run-chain', drop_chain, 'L2', '缺一次完整运行链路'),
-        ('19c', '运行链 5 步减到 3 步', rc_steps_3, 'L2', '.rc-step 仅 3 步'),
-        ('19d', '常开：删架构图（无 --tier）', drop_arch, None, '缺仓库总架构图'),
+        ('19c', '运行链 8 步减到 3 步', rc_steps_3, 'L2', '.rc-step 仅 3 步'),
+        ('19d', '常开：删架构图（无 --tier）', drop_arch, None,
+         '缺仓库总架构图'),
         ('20a', '卡片类名被改（卡消失）', card_off, 'L2', '缺三句话卡'),
         ('20b', '卡内 .mc-row 减到 3 行', mc_row_3, 'L2', '三句话卡内容不全'),
         ('20c', '卡外游离 .mc-row 不能充数', outside_row, 'L2',
          '三句话卡内容不全'),
         ('20d', '常开：卡消失（无 --tier）', card_off, None, '缺三句话卡'),
         ('21a', '删 .var-chain（生命周期链）', chain_off, 'L2', '缺生命周期链'),
-        ('21b', 'vardict-row 去掉 data-stage', stage_drop, 'L2', '有空场景'),
-        ('21c', '删 .vardict-scene', vd_off, 'L2', '全课缺变量词典'),
+        ('21b', 'vardict-row 全部去掉 data-stage', stage_drop, 'L2', '有空场景'),
+        ('21c', '删全部 .vardict-scene', vd_off, 'L2', '全课缺变量词典'),
         ('21d', '常开：删 var-chain（无 --tier）', chain_off, None,
          '缺生命周期链'),
-        ('22a', '四问块 3 减到 1（L2）', design_1, 'L2', '设计四问 1 块 < 2'),
-        ('22b', '四问块 3 减到 1（L3）', design_1, 'L3', '设计四问 1 块 < 3'),
+        ('22a', '四问块每模块减到 1（L2）', design_1, 'L2',
+         '设计四问 1 块 < 2'),
+        ('22b', '四问块每模块减到 1（L3）', design_1, 'L3',
+         '设计四问 1 块 < 3'),
         ('22c', '某块四问减到 3 问', dq_row_3, 'L2', '设计四问缺项'),
-        ('23a', '改造指南 6 条减到 3 条（L2）', ug_3, 'L2',
+        ('23a', '改造指南 9 条减到 3 条（L2）', ug_3, 'L2',
          '改造指南条目 3 < 6'),
         ('23b', '删 .upgrade-guide', ug_off, 'L2', '缺改造指南'),
     ]
@@ -1104,8 +1237,8 @@ def test_skeleton_negative():
 
     # 档位门：22/23 的加严下限——同一变异在 L1 缺省下限下应判绿
     for tag, label, transform in (
-            ('22d', '四问 1 块（L1 下限 1）', design_1),
-            ('23c', '改造指南 4 条（L1 下限 4）', ug_4)):
+            ('22d', '四问每模块 1 块（L1 下限 1）', design_1),
+            ('23c', '改造指南 7 条（L1 下限 4，L2 下限 6）', ug_4)):
         rc, out = run_mutant('gate' + tag, transform, None)
         ck(rc == 0 and '全部通过' in out,
            'v18-tier-gate %s %s → rc=%s（无 --tier 走 L1 下限，判绿）'
@@ -1113,15 +1246,20 @@ def test_skeleton_negative():
 
 
 def test_example_conflict():
-    """example 集成冲突（v1.18.0）：盘上旧成品在 L2 下必红——19-23 逐条取证。
+    """example 集成断言（v1.18.0 建立；v1.19.0 E5 夹具校准，语义未放宽）。
 
-    本批按任务书**不重建 example**（重建归课程重做会话），处置不是放松门线，而是
-    把本套件全部绿路径断言改跑「副本 + 骨架注入」（见 test_green_and_flags 与
-    make_course 的 inject 缺省）——原有 18 项断言语义不变，新检查在同一产物上被
-    证绿且被证红。旧成品的红在此留证：断言到具体文案，不是只断言 rc!=0。
+    原断言语义：无骨架成品在 L2 下必红，19-23 逐件点名（断到具体文案）。
+    承载方式更新：ORG 恢复的 example 已是 v1.18.1 重建合规成品（六件在场、
+    自身 rc=0——旧断言因此整体失效），故「无骨架形态」由 strip_six 机械
+    构造（类名改名 = 解析层计数归零）。另补一条正向锚：盘上成品自身在 L2
+    下全绿——夹具合规回归锚，防夹具再度漂移时静默通过。
     """
     rc, out = run_mutant('pristine', None, 'L2', inject=False)
-    ck(rc == 1, 'v18-conflict: 盘上旧 example（无骨架）在 L2 下判红（rc=%s）' % rc)
+    ck(rc == 0 and '全部通过' in out,
+       'v18-conflict: 盘上成品（v1.18.1 重建成品夹具）自身在 L2 下全绿'
+       '（rc=%s）' % rc)
+    rc, out = run_mutant('strip6', strip_six, 'L2', inject=False)
+    ck(rc == 1, 'v18-conflict: 摘除六件的无骨架成品在 L2 下判红（rc=%s）' % rc)
     for kw, label in (('缺仓库总架构图', '19 封面架构图'),
                       ('缺一次完整运行链路', '19 封面运行链'),
                       ('缺三句话卡', '20 模块卡'),
@@ -1129,7 +1267,165 @@ def test_example_conflict():
                       ('设计四问', '22 设计四问'),
                       ('缺改造指南', '23 改造指南')):
         ck(kw in out,
-           'v18-conflict: 旧成品缺 %s 被点名（关键词「%s」）' % (label, kw))
+           'v18-conflict: 无骨架成品缺 %s 被点名（关键词「%s」）' % (label, kw))
+
+
+# ------------------------------------------- v1.19.0 检查 24（实测主张锚定）
+def test_v119_measured():
+    """24a/24b 注入必红 + 全命中绿 + 无属性向后兼容（SPEC §2.5 三类别）。"""
+    # 向后兼容：无属性成品、不给 --trace-facts → 检查整体跳过，rc 不变
+    rc, out = run_main(['validate_course.py', skeleton_course_path()])
+    ck(rc == 0 and '全部通过' in out and '实测主张 0 处' in out,
+       'v119-24-compat: 无属性成品跳过检查 24（汇总行「实测主张 0 处」，rc=%d）'
+       % rc)
+
+    # 24a：有主张、未提供 --trace-facts → ERROR
+    rc, out = run_mutant('ev24a', measured_mut(), 'L2')
+    ck(rc == 1 and '实测主张缺证据' in out,
+       'v119-24a: measured 无 --trace-facts 必红（rc=%s）' % rc)
+
+    # 绿：主张 + 全命中轨迹 → rc=0；反斜杠路径声明归一后同样命中
+    tf_ok = write_trace('ok', {'utils/vision.py': [88, 120, 211]})
+    rc, out = run_main(['validate_course.py',
+                        make_course('evok', measured_mut()), '--tier', 'L2',
+                        '--trace-facts', tf_ok])
+    ck(rc == 0 and '全部通过' in out and '实测主张 1 处 ✓' in out,
+       'v119-24: 全命中轨迹判绿（rc=%s）' % rc)
+    rc, out = run_main(['validate_course.py',
+                        make_course('evbsl', measured_mut('utils\\vision.py')),
+                        '--tier', 'L2', '--trace-facts', tf_ok])
+    ck(rc == 0, 'v119-24: 反斜杠路径声明归一后命中（rc=%s）' % rc)
+
+    # 24b-1：声明文件不在 trace.files → ERROR
+    tf_miss = write_trace('miss', {'other/thing.py': [1]})
+    rc, out = run_main(['validate_course.py',
+                        make_course('evmiss', measured_mut()), '--tier', 'L2',
+                        '--trace-facts', tf_miss])
+    ck(rc == 1 and '不在轨迹中' in out,
+       'v119-24b: 声明文件不在轨迹必红（rc=%s）' % rc)
+
+    # 24b-2：键在但命中行数 0 → ERROR
+    tf_zero = write_trace('zero', {'utils/vision.py': []})
+    rc, out = run_main(['validate_course.py',
+                        make_course('evzero', measured_mut()), '--tier', 'L2',
+                        '--trace-facts', tf_zero])
+    ck(rc == 1 and '零命中' in out,
+       'v119-24b: 声明文件命中行数 0 必红（rc=%s）' % rc)
+
+    # 24b-3：多文件声明部分缺失 → 逐文件点名
+    tf_half = write_trace('half', {'utils/vision.py': [88]})
+    rc, out = run_main(['validate_course.py',
+                        make_course('evhalf', measured_mut(
+                            'utils/vision.py;utils/probability.py')),
+                        '--tier', 'L2', '--trace-facts', tf_half])
+    ck(rc == 1 and '不在轨迹中' in out and 'utils/probability.py' in out,
+       'v119-24b: 多文件声明缺失项被点名（rc=%s）' % rc)
+
+    # 24b-4：主张无 data-ev-files 配套 → 空主张不可锚定，ERROR
+    rc, out = run_main(['validate_course.py',
+                        make_course('evnof', measured_mut(files=None)),
+                        '--tier', 'L2', '--trace-facts', tf_ok])
+    ck(rc == 1 and '缺文件声明' in out,
+       'v119-24b: 无 data-ev-files 的主张必红（rc=%s）' % rc)
+
+    # 24 卫生：schema 不对 / 文件打不开 → ERROR
+    tf_bad = write_trace('bad', {'utils/vision.py': [1]}, schema='trace-v1')
+    rc, out = run_main(['validate_course.py',
+                        make_course('evbad', measured_mut()), '--tier', 'L2',
+                        '--trace-facts', tf_bad])
+    ck(rc == 1 and 'trace-facts-v2' in out,
+       'v119-24: schema 非 trace-facts-v2 必红（rc=%s）' % rc)
+    rc, out = run_main(['validate_course.py',
+                        make_course('evio', measured_mut()), '--tier', 'L2',
+                        '--trace-facts',
+                        os.path.join(fresh_dir('evio-tf'), 'no-such.json')])
+    # 注：trace 路径用独立 tag——fresh_dir 同 tag 二次调用会 rmtree 掉
+    # make_course 刚写好的课程副本（main 将 rc=2「无法读取」而非检查 24 红）
+    ck(rc == 1 and '无法解析' in out,
+       'v119-24: --trace-facts 打不开必红（rc=%s）' % rc)
+
+
+# ------------------------------------- v1.19.0 检查 25（构建卡/复刻线段结构）
+def test_v119_buildcard():
+    """25 结构 ×3 类别注入必红 + 段缺位跳过 + 环块并列绿（SPEC §2.6）。"""
+    # 段缺位：成品无两段 → 不检查（汇总行 0/0 且 rc 不变）
+    rc, out = run_main(['validate_course.py', skeleton_course_path(),
+                        '--tier', 'L2'])
+    ck(rc == 0 and '构建卡 0 张' in out and '复刻线 0 条' in out,
+       'v119-25-skip: 段缺位不检查（rc=%d）' % rc)
+
+    # 绿：完整构建卡 + 4 步复刻线 → rc=0
+    ok = append_body(
+        build_card_html([('python -m pip install -e .', 'README.md · L30')])
+        + rebuild_path_html([('1', False), ('2', False), ('3', False),
+                             ('4', False)]))
+    rc, out = run_main(['validate_course.py', make_course('bc25ok', ok),
+                        '--tier', 'L2'])
+    ck(rc == 0 and '全部通过' in out and '构建卡 1 张 1 条命令 ✓' in out
+       and '复刻线 1 条 4 步 ✓' in out,
+       'v119-25: 完整两段判绿且汇总行计数正确（rc=%s）' % rc)
+
+    # 绿：环块并列——3 个普通步 + 2 个 data-cycle 步 → 总数 5 ≥4、递增校验只看普通步
+    cyc = append_body(rebuild_path_html([('1', False), ('2', False),
+                                         ('3', False), ('2', True),
+                                         ('3', True)]))
+    rc, out = run_main(['validate_course.py', make_course('bc25cyc', cyc),
+                        '--tier', 'L2'])
+    ck(rc == 0 and '复刻线 1 条 5 步 ✓' in out,
+       'v119-25: data-cycle 环块并列模块判绿（rc=%s）' % rc)
+
+    # 25a-1：.build-run-card 段内 0 条命令 → ERROR
+    rc, out = run_main(['validate_course.py',
+                        make_course('bc25a', append_body(
+                            '<div class="build-run-card">\n</div>\n')),
+                        '--tier', 'L2'])
+    ck(rc == 1 and '缺 .build-cmd' in out,
+       'v119-25a: 空构建卡必红（rc=%s）' % rc)
+
+    # 25a-2：.build-cmd 缺 data-src → ERROR
+    rc, out = run_main(['validate_course.py',
+                        make_course('bc25a2', append_body(
+                            '<div class="build-run-card">\n'
+                            '<div class="build-cmd" data-cmd="pip install">'
+                            '</div>\n</div>\n')),
+                        '--tier', 'L2'])
+    ck(rc == 1 and '缺 data-src' in out,
+       'v119-25a: 命令缺 data-src 必红（rc=%s）' % rc)
+
+    # 25b：复刻线步骤 2 个 < 4 → ERROR
+    rc, out = run_main(['validate_course.py',
+                        make_course('bc25b', append_body(
+                            rebuild_path_html([('1', False), ('2', False)]))),
+                        '--tier', 'L2'])
+    ck(rc == 1 and '步骤仅 2 个 < 4' in out,
+       'v119-25b: 复刻线步数不足必红（rc=%s）' % rc)
+
+    # 25c：步骤编号错乱（非环块 1,1,1,1）→ ERROR
+    rc, out = run_main(['validate_course.py',
+                        make_course('bc25c', append_body(
+                            rebuild_path_html([('1', False), ('1', False),
+                                               ('1', False), ('1', False)]))),
+                        '--tier', 'L2'])
+    ck(rc == 1 and '编号错乱' in out,
+       'v119-25c: 步骤编号错乱必红（rc=%s）' % rc)
+
+    # 25c-2：data-step 非整数 → ERROR
+    rc, out = run_main(['validate_course.py',
+                        make_course('bc25c2', append_body(
+                            rebuild_path_html([('1', False), ('2', False),
+                                               ('x', False), ('4', False)]))),
+                        '--tier', 'L2'])
+    ck(rc == 1 and '不是整数' in out,
+       'v119-25c: data-step 非整数必红（rc=%s）' % rc)
+
+    # 25 卫生：段外游离 .build-cmd 不计（无 .build-run-card 容器 → 检查跳过）
+    rc, out = run_main(['validate_course.py',
+                        make_course('bc25out', append_body(
+                            '<div class="build-cmd" data-cmd="x" '
+                            'data-src="y"></div>\n')),
+                        '--tier', 'L2'])
+    ck(rc == 0 and '构建卡 0 张' in out,
+       'v119-25: 段外游离 build-cmd 不计、检查仍跳过（rc=%s）' % rc)
 
 
 def test_cg_semantic_fields():
@@ -1320,6 +1616,8 @@ def run_selftest():
     test_module_marks_completeness()
     test_arch_data_negative()
     test_example_conflict()
+    test_v119_measured()
+    test_v119_buildcard()
     test_main_guard()
     print('validate-tests: %d passed / %d failed'
           % (len(_passed), len(_failed)))

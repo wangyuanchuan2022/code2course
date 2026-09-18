@@ -3697,6 +3697,334 @@ def _run_b6_gap_tests(checker):
             sys.argv = saved_argv
         ck(exit_code == 2,
            'b6-guard: module __main__ guard exits with main() return code')
+
+        # ---------------------------------------------------------------
+        # v1.19 E3：buildcard / rebuildpath / align 三子命令（SPEC-v119 §2.1-2.3）
+        # ---------------------------------------------------------------
+        def _e3_tmp():
+            d = tempfile.mkdtemp(prefix='c2c-e3-selftest-')
+            roots.append(d)
+            try:
+                probe = os.path.join(d, 'w')
+                os.makedirs(probe)
+                return d
+            except OSError:
+                # mkdtemp 0700 症候（受限令牌 DACL）：退回兄弟目录（_fixture_root 同款）
+                sibling = d + '-w'
+                os.makedirs(sibling)
+                roots.append(sibling)
+                return sibling
+
+        def _e3_write(path, text):
+            with open(path, 'w', encoding='utf-8', newline='') as fh:
+                fh.write(text)
+
+        E3_MAKEFILE = (
+            '# e3 mini makefile\n'
+            'include config.mk\n'
+            'BIN = mocha\n'
+            'FILES = test/a.js test/b.js\n'
+            '.PHONY: all test check\n'
+            'all: build test\n'
+            'build:\n'
+            '\t@echo building\n'
+            'test: unit \\\n'
+            '      integration\n'
+            '\t@$(BIN) $(FILES)\n'
+            'unit:\n'
+            '\t@echo unit\n'
+            'integration:\n'
+            '\t@echo integration\n'
+            'check: $(FILES)\n'
+            '\t@echo check\n')
+        E3_PYPROJECT = (
+            '[project]\nname = "mini"\n\n[project.scripts]\n'
+            'mini-cli = "mini.cli:main"\n\n[tool.poetry.scripts]\n'
+            'mini-poetry = "mini.poetry:run"\n\n[tool.other]\nkey = "v"\n')
+        e3_repo = os.path.join(_e3_tmp(), 'mini')
+        os.makedirs(e3_repo)
+        _e3_write(os.path.join(e3_repo, 'Makefile'), E3_MAKEFILE)
+        _e3_write(os.path.join(e3_repo, 'package.json'),
+                  '{"name": "mini", "scripts": {"test": "make test", '
+                  '"start": "node server.js"}}')
+        _e3_write(os.path.join(e3_repo, 'pyproject.toml'), E3_PYPROJECT)
+        e3_card = AS.build_card(e3_repo)
+        ck(e3_card['schema'] == 'build-card-v1' and e3_card['repo'] == 'mini',
+           'e3-buildcard: schema and repo basename')
+        ck([s['kind'] for s in e3_card['systems']] == ['makefile', 'npm', 'pyproject'],
+           'e3-buildcard: three systems in fixed order')
+        e3_mk = e3_card['systems'][0]
+        e3_tg = dict((t['name'], t) for t in e3_mk['targets'])
+        ck([t['name'] for t in e3_mk['targets']]
+           == ['all', 'build', 'test', 'unit', 'integration', 'check'],
+           'e3-buildcard: >=3-element exact target set/order (continuation joined)')
+        ck(e3_tg['test']['deps'] == ['unit', 'integration']
+           and e3_tg['test']['phony'] is True
+           and e3_tg['test']['tool_hint'] == '@$(BIN)',
+           'e3-buildcard: continuation deps + phony + first-recipe tool_hint')
+        ck(e3_tg['check']['deps'] == ['$(FILES)']
+           and e3_tg['all']['tool_hint'] is None
+           and e3_tg['build']['phony'] is False,
+           'e3-buildcard: $(VAR) verbatim + no-recipe tool_hint None + non-phony')
+        ck(e3_card['test_commands'] == ['make test', 'npm test'],
+           'e3-buildcard: test_commands inference make-then-npm')
+        ck(any('include' in n and 'config.mk' in n for n in e3_card['notes'])
+           and any('assignment' in n for n in e3_card['notes'])
+           and any('[project.scripts]' in n for n in e3_card['notes'])
+           and any('[tool.poetry.scripts]' in n for n in e3_card['notes']),
+           'e3-buildcard: include/assignment/pyproject-section notes present')
+        ck([s['scripts'] for s in e3_card['systems'] if s['kind'] == 'pyproject'][0]
+           == {'mini-cli': 'mini.cli:main', 'mini-poetry': 'mini.poetry:run'},
+           'e3-buildcard: pyproject both script sections parsed by regex')
+        ck('npm run test: make test' in AS.render_build_card_md(e3_card)
+           and '# build card: mini' in AS.render_build_card_md(e3_card),
+           'e3-buildcard: md render is human-readable and deterministic-shaped')
+
+        e3_repo2 = os.path.join(_e3_tmp(), 'mini2')
+        os.makedirs(e3_repo2)
+        _e3_write(os.path.join(e3_repo2, 'GNUmakefile'), 'ok:\n\t@echo gnu\n')
+        _e3_write(os.path.join(e3_repo2, 'Makefile'), 'all: build\n')
+        _e3_write(os.path.join(e3_repo2, 'setup.py'), 'from setuptools import setup\n')
+        _e3_write(os.path.join(e3_repo2, 'cargo.toml'), '[package]\n')
+        e3_card2 = AS.build_card(e3_repo2)
+        ck(e3_card2['systems'][0]['file'] == 'GNUmakefile',
+           'e3-buildcard: GNU make probe order picks GNUmakefile over Makefile')
+        ck(any('setup.py' in n for n in e3_card2['notes'])
+           and any('cargo.toml' in n for n in e3_card2['notes']),
+           'e3-buildcard: metadata-without-parser recorded as notes')
+        _e3_write(os.path.join(e3_repo2, 'GNUmakefile'),
+                  'all: build\nbare garbage line\nbuild:\n\t@echo x\n')
+        try:
+            AS.build_card(e3_repo2)
+            ck(False, 'e3-buildcard: colon-less bare line must raise')
+        except AS.MakefileSyntaxError as exc:
+            ck('bare garbage' in str(exc), 'e3-buildcard: negative line fails loudly')
+        e3_repo3 = os.path.join(_e3_tmp(), 'mini3')
+        os.makedirs(e3_repo3)
+        _e3_write(os.path.join(e3_repo3, 'package.json'), '{oops')
+        e3_card3 = AS.build_card(e3_repo3)
+        ck(e3_card3['systems'] == [] and e3_card3['test_commands'] == []
+           and any(('unreadable' in n or 'unparsable' in n)
+                   for n in e3_card3['notes']),
+           'e3-buildcard: empty repo + unparsable manifest degrade to notes, '
+           'systems empty')
+
+        E3_FACTS = {'tool': 't', 'schema_version': 3, 'root_name': 'mini-repo',
+                    'languages': ['javascript'],
+                    'files': [{'path': 'lib/a.js', 'lines': 10},
+                              {'path': 'lib/router/index.js', 'lines': 20},
+                              {'path': 'lib/router/route.js', 'lines': 15},
+                              {'path': 'lib/view/view.js', 'lines': 12},
+                              {'path': 'lib/extra/loose.js', 'lines': 5},
+                              {'path': 'test/x.js', 'lines': 8}],
+                    'imports': [
+                        {'file': 'lib/a.js', 'target': 'lib/router/index.js',
+                         'confidence': 'verified', 'external': False},
+                        {'file': 'lib/router/index.js', 'target': 'lib/view/view.js',
+                         'confidence': 'verified', 'external': False},
+                        {'file': 'lib/router/route.js', 'target': 'lib/router/index.js',
+                         'confidence': 'verified', 'external': False},
+                        {'file': 'test/x.js', 'target': 'lib/view/view.js',
+                         'confidence': 'verified', 'external': False},
+                        {'file': 'lib/a.js', 'target': 'fs',
+                         'confidence': 'inferred', 'external': True}],
+                    'calls': [
+                        {'caller': None, 'callee': 'createRouter',
+                         'file': 'lib/a.js', 'line': 2,
+                         'confidence': 'verified',
+                         'to': {'file': 'lib/router/index.js', 'start_line': 3}},
+                        {'caller': 'useRoute', 'callee': 'renderView',
+                         'file': 'lib/router/index.js', 'line': 2,
+                         'confidence': 'inferred',
+                         'to': {'file': 'lib/view/view.js', 'start_line': 6}},
+                        {'caller': 'boot', 'callee': 'externalThing',
+                         'file': 'lib/a.js', 'line': 8,
+                         'confidence': 'inferred', 'to': None}]}
+        e3_rp = AS.build_rebuild_path(E3_FACTS, 'lib')
+        ck(e3_rp['schema'] == 'rebuild-path-v1.1', 'e3-rebuildpath: schema v1.1')
+        e3_got = [(o['step'], o['kind'], o.get('module'), o['depends_on'])
+                  for o in e3_rp['order']]
+        ck(e3_got == [(1, 'module', 'lib/view', []),
+                      (2, 'module', 'lib/router', ['lib/view']),
+                      (3, 'module', 'lib/(root)', ['lib/router']),
+                      (4, 'module', 'lib/extra', [])],
+           'e3-rebuildpath: 4-block exact order (SCC condensation + Kahn stable)')
+        ck(all(set(o) == {'kind', 'step', 'module', 'depends_on', 'evidence'}
+               for o in e3_rp['order']),
+           'e3-rebuildpath: module entry field closed set (v1.1 closure)')
+        ck(e3_rp['topology_valid'] is True
+           and e3_rp['coverage'] == {'modules_total': 4, 'modules_covered': 3,
+                                     'uncovered': ['lib/extra']},
+           'e3-rebuildpath: acyclic fixture topology_valid + uncovered')
+        ck(e3_rp['order'][2]['evidence'] == 'imports:1 calls:1',
+           'e3-rebuildpath: evidence counts imports/calls per module')
+
+        E3_CYC = {'tool': 't', 'schema_version': 3, 'root_name': 'cyc',
+                  'languages': ['javascript'],
+                  'files': [{'path': 'p/x/a.js', 'lines': 3},
+                            {'path': 'p/y/b.js', 'lines': 3},
+                            {'path': 'p/z/c.js', 'lines': 3}],
+                  'imports': [
+                      {'file': 'p/x/a.js', 'target': 'p/y/b.js',
+                       'confidence': 'verified', 'external': False},
+                      {'file': 'p/y/b.js', 'target': 'p/x/a.js',
+                       'confidence': 'verified', 'external': False},
+                      {'file': 'p/z/c.js', 'target': 'p/x/a.js',
+                       'confidence': 'verified', 'external': False}],
+                  'calls': []}
+        e3_cyc = AS.build_rebuild_path(E3_CYC, 'p')
+        ck(len(e3_cyc['order']) == 2
+           and e3_cyc['order'][0]['kind'] == 'scc'
+           and e3_cyc['order'][0]['modules'] == ['p/x', 'p/y'],
+           'e3-rebuildpath: 2-cycle collapses into one sorted scc block')
+        ck(e3_cyc['topology_valid'] is False,
+           'e3-rebuildpath: scc size>1 forces topology_valid false')
+        ck(e3_cyc['order'][1]['kind'] == 'module'
+           and e3_cyc['order'][1]['module'] == 'p/z'
+           and e3_cyc['order'][1]['depends_on'] == ['p/x', 'p/y'],
+           'e3-rebuildpath: downstream module follows the scc block')
+
+        E3_ROOT = {'tool': 't', 'schema_version': 3, 'root_name': 'flat',
+                   'languages': ['python'],
+                   'files': [{'path': 'core.py', 'lines': 10},
+                             {'path': 'types.py', 'lines': 6},
+                             {'path': 'utils/helpers.py', 'lines': 4}],
+                   'imports': [
+                       {'file': 'core.py', 'target': 'utils/helpers.py',
+                        'confidence': 'verified', 'external': False}],
+                   'calls': []}
+        e3_root = AS.build_rebuild_path(E3_ROOT, '.')
+        ck([(o['step'], o['kind'], o.get('module'))
+            for o in e3_root['order']] == [(1, 'module', 'utils'),
+                                           (2, 'module', '(root)')],
+           'e3-rebuildpath: --pkg . root mode groups by first-level dir')
+        try:
+            AS.build_rebuild_path(E3_FACTS, 'nosuch-pkg')
+            ck(False, 'e3-rebuildpath: empty scope must raise')
+        except AS.E3DataError:
+            ck(True, 'e3-rebuildpath: empty scope fails loudly (E3DataError)')
+        ck(json.dumps(AS.build_rebuild_path(E3_FACTS, 'lib'), sort_keys=True)
+           == json.dumps(e3_rp, sort_keys=True),
+           'e3-rebuildpath: deterministic on repeated builds')
+
+        E3_TRACE_V1 = {'schema': 'trace-facts-v1', 'repo': 'mini-repo',
+                       'runtime': 'node', 'command': 'synthetic',
+                       'duration_s': 0.0,
+                       'files': {'lib/a.js': [1, 2, 5],
+                                 'lib/router/index.js': [2, 3],
+                                 'lib/view/view.js': [6],
+                                 'lib/router/route.js': [1],
+                                 'new_module/ghost.js': [1, 2, 3]}}
+        e3_al = AS.build_align(E3_TRACE_V1, E3_FACTS, 'lib')
+        ck(e3_al['schema'] == 'align-v2'
+           and 'edge_measured' not in e3_al
+           and e3_al['edge_upgrade_candidates']['total'] == 1,
+           'e3-align: edges-empty trace keeps co-execution path, no edge_measured')
+        ck(e3_al['coverage']['total_lines'] == 62
+           and e3_al['coverage']['hit_lines'] == 7
+           and e3_al['coverage']['ratio'] == round(7 / 62, 6),
+           'e3-align: 4-module coverage totals 7/62')
+        e3_pm = [(m['module'], m['total'], m['hit'])
+                 for m in e3_al['coverage']['per_module']]
+        ck(e3_pm == [('lib/(root)', 10, 3), ('lib/extra', 5, 0),
+                     ('lib/router', 35, 3), ('lib/view', 12, 1)],
+           'e3-align: per-module exact table')
+        ck(e3_al['missing_in_facts'][0]['file'] == 'new_module/ghost.js',
+           'e3-align: ghost file lands in missing_in_facts')
+        ck(e3_al['edge_upgrade_candidates']['samples']
+           == ['useRoute@lib/router/index.js:2 -> renderView@lib/view/view.js:6'],
+           'e3-align: candidate sample format exact')
+        ck(any('co-execution' in n and 'never upgrades' in n
+               for n in e3_al['notes']),
+           'e3-align: co-execution caliber note present on the edges-empty path')
+
+        E3_TRACE_V2 = dict(E3_TRACE_V1, schema='trace-facts-v2',
+                           edges=[{'caller_file': 'lib/router/index.js',
+                                   'caller_line': 2,
+                                   'callee_file': 'lib/view/view.js',
+                                   'callee_line': 6},
+                                  {'caller_file': 'lib/router/index.js',
+                                   'caller_line': 99,
+                                   'callee_file': 'lib/view/view.js',
+                                   'callee_line': 6}])
+        e3_al2 = AS.build_align(E3_TRACE_V2, E3_FACTS, 'lib')
+        em = e3_al2.get('edge_measured') or {}
+        ck(em.get('total') == 1
+           and em.get('caliber') == 'edge-level call-event evidence'
+           and em.get('samples')
+           == ['useRoute@lib/router/index.js:2 -> renderView@lib/view/view.js:6'],
+           'e3-align: exact call-event pairing yields edge_measured with caliber')
+        ck(any('call events: 2 total, 0 same-file, 0 strict self-loop'
+               in n for n in e3_al2['notes']),
+           'e3-align: edge shape census reported in notes')
+        E3_TRACE_BAD = dict(E3_TRACE_V2, edges=[{'caller_file': 'x'}])
+        try:
+            AS.build_align(E3_TRACE_BAD, E3_FACTS, 'lib')
+            ck(False, 'e3-align: malformed trace edge must raise')
+        except AS.E3DataError:
+            ck(True, 'e3-align: malformed trace edge fails loudly (E3DataError)')
+
+        e3_selfloop = {'schema': 'trace-facts-v2', 'repo': 'flat',
+                       'runtime': 'python', 'command': 'self-loop probe',
+                       'duration_s': 0.0,
+                       'files': {'core.py': [5, 7, 9]},
+                       'edges': [
+                           {'caller_file': 'core.py', 'caller_line': 5,
+                            'callee_file': 'core.py', 'callee_line': 9},
+                           {'caller_file': 'core.py', 'caller_line': 7,
+                            'callee_file': 'core.py', 'callee_line': 7}]}
+        e3_self_facts = {'tool': 't', 'schema_version': 3, 'root_name': 'flat',
+                         'languages': ['python'],
+                         'files': [{'path': 'core.py', 'lines': 12}],
+                         'calls': [
+                             {'caller': 'main', 'callee': 'step',
+                              'file': 'core.py', 'line': 5,
+                              'confidence': 'inferred',
+                              'to': {'file': 'core.py', 'start_line': 9}},
+                             {'caller': 'step', 'callee': 'step',
+                              'file': 'core.py', 'line': 7,
+                              'confidence': 'inferred',
+                              'to': {'file': 'core.py', 'start_line': 7}}],
+                         'imports': []}
+        e3_sl = AS.build_align(e3_selfloop, e3_self_facts, '.')
+        em2 = e3_sl.get('edge_measured') or {}
+        ck(em2.get('total') == 2,
+           'e3-align: same-file and strict self-loop inferred calls both pair '
+           '(no silent drop, no crash)')
+        ck(any('call events: 2 total, 2 same-file, 1 strict self-loop' in n
+               for n in e3_sl['notes']),
+           'e3-align: self-loop shape census counted exactly')
+        ck(e3_sl['coverage']['per_module'] == [
+            {'module': '(root)', 'total': 12, 'hit': 3, 'ratio': 0.25}],
+           'e3-align: --pkg . root mode single (root) module')
+
+        e3_disjoint = AS.build_align(
+            dict(E3_TRACE_V1, files={'elsewhere/z.js': [1]}), E3_FACTS, 'lib')
+        ck(any('disjoint' in n for n in e3_disjoint['notes'])
+           and e3_disjoint['coverage']['hit_lines'] == 0,
+           'e3-align: disjoint trace warns and reports zero hits')
+        ck(json.dumps(AS.build_align(E3_TRACE_V2, E3_FACTS, 'lib'), sort_keys=True)
+           == json.dumps(e3_al2, sort_keys=True),
+           'e3-align: deterministic on repeated builds')
+
+        e3_express = os.path.join(os.path.dirname(os.path.abspath(AS.__file__)),
+                                  'tests', 'corpus', 'javascript',
+                                  'express-4.0.0')
+        if os.path.isdir(e3_express):
+            e3_real = AS.build_card(e3_express)
+            e3_mk_real = [s for s in e3_real['systems'] if s['kind'] == 'makefile']
+            e3_tg_real = dict((t['name'], t['deps'])
+                              for t in e3_mk_real[0]['targets']) if e3_mk_real else {}
+            ck(e3_tg_real.get('test') == ['test-unit', 'test-acceptance']
+               and e3_tg_real.get('test-cov') == ['lib-cov'],
+               'e3-corpus: express Makefile yields test->[test-unit,'
+               'test-acceptance] and test-cov->[lib-cov]')
+            ck(e3_real['test_commands'][:1] == ['make test'],
+               'e3-corpus: express card infers make test first')
+        else:
+            checker.skip('e3-corpus: express corpus missing; restore with '
+                         'python tests/corpus/fetch_corpus.py')
+
     finally:
         if orig_open is not None:
             if isinstance(__builtins__, dict):

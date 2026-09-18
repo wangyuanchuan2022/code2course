@@ -6,6 +6,7 @@ validate_course.py — code2course 成品课程机械校验（零依赖，Python
 用法：
     python validate_course.py <course.html> [--mask] [--quiet]
         [--source <源仓库目录>] [--tier L1|L2|L3]
+        [--trace-facts <trace-facts-v2.json>]
 
 检查项（对应 quality-gates.md 验收标准与「脱敏机检清单」）：
   1.  无 {{占位符}} 残留（含模板注释块提示词）
@@ -77,6 +78,16 @@ validate_course.py — code2course 成品课程机械校验（零依赖，Python
   23. 理解骨架·改造指南：结业段（id 含 finale）≥1 张 .upgrade-guide，且
       .ug-row[data-task] ≥4（L1）／≥6（L2、L3）
       （19/20/21 常开与档位无关；22/23 除档位下限外常开）
+  24. 实测主张锚定（v1.19.0 §2.5）：任何元素带 data-ev="measured" 时，
+      本次校验必须提供 --trace-facts <trace-facts-v2.json>（24a），且该元素
+      data-ev-files 声明的每个仓库相对路径必须在 trace.files 中且命中行数
+      ≥1（24b）；缺 data-ev-files 的 measured 主张不可锚定，同样 ERROR。
+      无 data-ev 属性 → 本检查整体跳过（向后兼容，v1.18 课零影响）
+  25. 构建卡/复刻线段结构（v1.19.0 §2.6）：.build-run-card 段存在时，
+      段内 ≥1 个 .build-cmd 行且每行 data-cmd、data-src 非空；
+      .rebuild-path 段存在时，段内带 data-step 的步骤 ≥4 个且编号从 1 起
+      连续递增（data-cycle="true" 的环块步骤并列模块、不参与递增校验）；
+      段缺位 → 不检查（不强制进入理解骨架六件）
 
 退出码：发现 ERROR 非零退出（=1），仅 WARNING 时退出 0。
 """
@@ -124,6 +135,13 @@ class CourseChecker(HTMLParser):
         # translate-pair 元数据（--source 逐字校验用）
         self.pair_meta = []            # 工作栈：运行中的翻译块
         self.pair_meta_all = []        # 持久列表：全部翻译块元数据
+        # v1.19.0 检查 24/25 收集（全课级，不归属模块）
+        self.measured_claims = []      # data-ev="measured" 的 [{files, line}]
+        self.build_cards = 0           # .build-run-card 段数
+        self.build_cmds = 0            # 段内 .build-cmd 行数
+        self.build_cmd_bad = []        # (行号, 缺的属性名) 明细
+        self.rebuild_paths = 0         # .rebuild-path 段数
+        self.rb_steps = []             # (是否环块, data-step 原文) 按文档序
 
     # ---- Markdown 纯度：正文/注释收集（getpos 取当前行号） ----
     def _md_note(self, target, data):
@@ -227,6 +245,29 @@ class CourseChecker(HTMLParser):
             if tag == 'div' and 'quiz' in classes and 'bet-scene' not in classes:
                 top['quiz'] += 1
             self._skeleton_count(classes, a, top)
+
+        # v1.19.0 检查 24/25 收集（v1.19.0 结构契约；全课级，不依赖模块段）
+        if (a.get('data-ev') or '').strip() == 'measured':
+            self.measured_claims.append({
+                'files': a.get('data-ev-files') or '',
+                'line': self.getpos()[0],
+            })
+        if 'build-run-card' in classes:
+            self.build_cards += 1
+        if 'build-cmd' in classes and self._in_ancestor('build-run-card'):
+            self.build_cmds += 1
+            cmd = (a.get('data-cmd') or '').strip()
+            src = (a.get('data-src') or '').strip()
+            if not cmd or not src:
+                self.build_cmd_bad.append((self.getpos()[0],
+                                           'data-cmd' if not cmd else
+                                           'data-src'))
+        if 'rebuild-path' in classes:
+            self.rebuild_paths += 1
+        if self._in_ancestor('rebuild-path') and 'data-step' in a:
+            self.rb_steps.append(
+                ((a.get('data-cycle') or '').strip() == 'true',
+                 (a.get('data-step') or '').strip()))
 
         # script 块原文收集（检查 18：块文本内的字面标签序列会被浏览器截断）
         if tag == 'script':
@@ -989,6 +1030,7 @@ SKEL_VC_NODES = 2       # 变量生命周期链至少 2 个节点
 SKEL_DQ_ROWS = 4        # 设计四问四问齐全（做什么/为什么/不这么做/为什么不用更简单）
 SKEL_DESIGN_TIER = {'L1': 1, 'L2': 2, 'L3': 3}   # 每正式模块 .design-qa 块数
 SKEL_UG_TIER = {'L1': 4, 'L2': 6, 'L3': 6}       # 结业段 .ug-row[data-task] 条数
+SKEL_RB_STEPS = 4                                # .rebuild-path 步骤下限（v1.19.0 §2.6）
 
 
 def _skel_floor(table, tier):
@@ -1134,6 +1176,113 @@ def upgrade_guide_check(module_stats, tier, errors):
                           % (label, rows, floor, tier or 'L1（缺省）', floor))
 
 
+def _norm_rel(p):
+    """仓库相对路径归一：剥空白、统一正斜杠、剥 ./ 前缀（检查 24 键匹配用）。"""
+    p = (p or '').strip().replace('\\', '/')
+    while p.startswith('./'):
+        p = p[2:]
+    return p
+
+
+def measured_check(claims, trace_path, errors):
+    """24. 实测主张锚定（v1.19.0 §2.5）。
+
+    data-ev="measured" 的元素主张「这一步被真实运行轨迹覆盖」，其证据链：
+      24a  本次校验必须提供 --trace-facts（trace-facts-v2 采集文件）；
+      24b  每处主张的 data-ev-files（分号分隔的仓库相对路径）都必须出现在
+           trace.files 且命中行数 ≥1；
+      无 data-ev-files 配套的主张没有可核验的文件支撑，同样 ERROR（空主张）。
+    无 data-ev 属性 → 整体跳过（向后兼容，v1.18 课零影响）。
+    """
+    if not claims:
+        return
+    if not trace_path:
+        errors.append(
+            '实测主张缺证据：data-ev="measured" 共 %d 处，但本次校验未提供 '
+            '--trace-facts（动态取证文件）——要么带轨迹复跑，要么降级为'
+            '推断徽标（移除该属性）' % len(claims))
+        return
+    try:
+        with open(trace_path, 'r', encoding='utf-8') as f:
+            trace = json.load(f)
+    except (OSError, ValueError) as e:
+        errors.append('--trace-facts 文件无法解析（%s）：%s' % (trace_path, e))
+        return
+    if not isinstance(trace, dict) or trace.get('schema') != 'trace-facts-v2':
+        errors.append('--trace-facts 的 schema 不是 trace-facts-v2：%r'
+                      % (trace.get('schema') if isinstance(trace, dict)
+                         else type(trace).__name__))
+        return
+    files = trace.get('files') or {}
+    if not isinstance(files, dict):
+        errors.append('--trace-facts 的 files 不是对象（trace-facts-v2 契约）')
+        return
+    for c in claims:
+        label = '约 L%d' % c.get('line', 0)
+        declared = [x for x in (c.get('files') or '').split(';') if x.strip()]
+        if not declared:
+            errors.append('实测主张缺文件声明：%s 的 data-ev="measured" 未带 '
+                          'data-ev-files（无文件支撑的实测主张不可锚定）' % label)
+            continue
+        for f in declared:
+            key = _norm_rel(f)
+            lines = files.get(key)
+            if lines is None:
+                errors.append(
+                    '实测主张文件不在轨迹中：%s 声明 %s，--trace-facts 的 '
+                    'files 里没有这个键（采集命令是否覆盖了它？）' % (label, f))
+            elif not any(isinstance(n, int) and n > 0
+                         for n in (lines if isinstance(lines, list) else [])):
+                errors.append('实测主张零命中：%s 声明 %s 在轨迹中命中行数 0'
+                              % (label, f))
+
+
+def buildcard_check(chk, errors):
+    """25. 构建卡/复刻线段结构（v1.19.0 §2.6，段缺位即跳过）。
+
+    .build-run-card 段在场时：段内 ≥1 个 .build-cmd 行，且每行 data-cmd、
+    data-src 非空（构建命令必须带证据文件出处）。
+    .rebuild-path 段在场时：段内带 data-step 的步骤 ≥4 个，编号从 1 起连续
+    递增（data-cycle="true" 的环块步骤并列模块，计入总数、不参与递增校验）。
+    两段都缺位 → 不检查（不强制进入理解骨架六件）。
+    """
+    n = 0
+    if getattr(chk, 'build_cards', 0):
+        if not chk.build_cmds:
+            errors.append('.build-run-card 缺 .build-cmd 行（至少 1 条构建'
+                          '命令：data-cmd 命令本体 + data-src 证据文件）')
+            n += 1
+        for line, which in chk.build_cmd_bad:
+            errors.append('.build-cmd（约 L%d）缺 %s（命令与证据文件都要有）'
+                          % (line, which))
+            n += 1
+    if getattr(chk, 'rebuild_paths', 0):
+        steps = chk.rb_steps
+        if len(steps) < SKEL_RB_STEPS:
+            errors.append('.rebuild-path 步骤仅 %d 个 < %d（复刻线至少要走完'
+                          ' %d 步：拉仓库、装依赖、构建、跑起来）'
+                          % (len(steps), SKEL_RB_STEPS, SKEL_RB_STEPS))
+            n += 1
+        seq = []
+        bad_num = False
+        for cyc, raw_v in steps:
+            if cyc:
+                continue
+            try:
+                seq.append(int(raw_v))
+            except ValueError:
+                errors.append('.rebuild-path 步骤 data-step 不是整数：%r'
+                              % raw_v)
+                n += 1
+                bad_num = True
+                break
+        if not bad_num and seq and seq != list(range(1, len(seq) + 1)):
+            errors.append('.rebuild-path 步骤编号错乱（data-step 应从 1 起连续'
+                          '递增，实测 %s）' % seq[:8])
+            n += 1
+    return n
+
+
 def tier_check(module_stats, tier, errors):
     rule = TIER_RULES.get(tier)
     if rule is None:
@@ -1161,7 +1310,7 @@ def main(argv):
         pass
     args = []
     flags = []
-    opts = {'--source': None, '--tier': None}
+    opts = {'--source': None, '--tier': None, '--trace-facts': None}
     i = 1
     while i < len(argv):
         a = argv[i]
@@ -1292,6 +1441,17 @@ def main(argv):
         skel_fn(chk.module_stats, *extra, errors)
         skel_err.append(len(errors) - n0)
 
+    # 24. 实测主张锚定（v1.19.0 §2.5；无 data-ev 属性即跳过）
+    n24 = len(errors)
+    measured_check(getattr(chk, 'measured_claims', []), opts['--trace-facts'],
+                   errors)
+    err24 = len(errors) - n24
+
+    # 25. 构建卡/复刻线段结构（v1.19.0 §2.6；段缺位即跳过）
+    n25 = len(errors)
+    err25 = buildcard_check(chk, errors)
+    err25 = len(errors) - n25
+
     def _skel_tot(key):
         return sum(m.get(key, 0) for m in chk.module_stats)
 
@@ -1310,12 +1470,23 @@ def main(argv):
            _skel_tot('design'), _skel_tot('dq_rows'), _skel_mark(3),
            _skel_tot('guide'), _skel_tot('ug_rows'), _skel_mark(4)))
 
+    dyn_line = (
+        '动态取证（24-25）：实测主张 %d 处 %s / 构建卡 %d 张 %d 条命令 %s / '
+        '复刻线 %d 条 %d 步 %s'
+        % (len(getattr(chk, 'measured_claims', [])),
+           '✓' if not err24 else '✗',
+           getattr(chk, 'build_cards', 0), getattr(chk, 'build_cmds', 0),
+           '✓' if not err25 else '✗',
+           getattr(chk, 'rebuild_paths', 0), len(getattr(chk, 'rb_steps', [])),
+           '✓' if not err25 else '✗'))
+
     quiet = '--quiet' in flags
     if not quiet:
         print('文件：%s（%.1f KB）' % (path, len(raw.encode("utf-8")) / 1024))
         print('检查：翻译块 %d 个 / 测验+赌注 %d 处 / JSON 块见上 / 模块 %d 个 / 调用图 %d 张'
               % (len(chk.pairs), len(chk.quizzes), len(chk.modules), chk.cg_scenes))
         print(skel_line)
+        print(dyn_line)
     for w in warnings:
         print('  ⚠️  %s' % w)
     for e in errors:

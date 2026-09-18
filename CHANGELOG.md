@@ -3,6 +3,29 @@
 本文件记录 code2course 技能包的版本变更（[Keep-a-Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 格式）。
 版本号唯一事实来源：SKILL.md frontmatter `version`；resources 三件套头部 `@version` 与此同步。
 
+## [1.19.0] — 2026-09-18
+
+动态取证与构建逻辑批次：仓库不再只有静态事实——采集真实执行轨迹，为「运行链路 / 最精彩之处」提供实测证据层，并新增构建卡与从零复刻线。设计与实验依据：`agent-out/v119/SPEC-v119.md`、`agent-out/v19-exp/report.md`（最小实验三验收全过）。
+
+### Added
+
+- `analyze_structure.py` 三子命令：`buildcard`（Makefile + 元数据清单 → build-card-v1 构建卡，含运行/测试命令推断口径）、`rebuildpath`（facts imports 拓扑序 → rebuild-path-v1.1，**SCC 环语义**：环块如实呈现、topology_valid=false，不硬排线性序）、`align`（轨迹 × facts：行级覆盖率 + missing_in_facts 漏抽告警 + 边级升级候选）。
+- `trace_collect.py`（python）：settrace **line+call 双事件** → trace-facts-v2；`edges[]` 为「调用点行 → 被调首行」的成对到达记录，是**边级实测的唯一合法证据源**（行级覆盖只能证「两端共执行」，永不升档——口径钉死于 workflow §11）。
+- `trace_node.mjs`（node）：NODE_V8_COVERAGE 采集编排 + V8 报告 → 行集（UTF-16 换行表 / 内层 range 语义）；`edges` 诚实置空（V8 无 call 事件）；fd stdio + 自清退宽限阶梯（Windows kill 不 flush V8 的实证对策）。
+- `validate_course.py` 检查 24「实测主张锚定」（run-chain 项 `data-ev="measured"` 必须有 `--trace-facts` 支撑且声明文件在轨迹中命中）与检查 25「构建卡 / 复刻线段结构」；两者对无相关属性的课程零影响（向后兼容），既有 23 项检查语义未动。
+- `workflow.md` §11「动态取证（选做阶段）」：showcase 发现、采集命令模板（三大坑：语料根禁 PYTHONPATH、junction+realpath、kill 不 flush V8 须自清退）、证据徽标三档（实测 > 实锤 > 推断）与共执行不升档铁律。
+- 测试：`tests/test_trace_collect.py`（16 例）+ analyze 套件 +40 例（SCC 环 / 根包 / edge_measured 精确配对 / 自环三不 / 注入必红）+ validate 套件 +37 例（含 16 条新增注入必红）。
+
+### Verified
+
+- 三套件：**analyze 529 / 0 / 2 · corpus 98 / 0 / 14 · validate 229 / 0**（均含组织者独立复跑）。
+- 真实语料 round-trip：express lib/ 轨迹行覆盖 **72.30%**（一次自清退 showcase 采集 0.4s）、click `edges=140`（116 同文件 / 48 严格自环，如实入账）；align 对自环 call 事件**不崩溃 / 不误判契约违规 / 不静默丢弃**（notes 逐字报告普查数，实证 `agent-out/v119/final-verify/align-click-selfloop.json`）。
+- validate 套件基线 17 失败（夹具缺失期间标定漂移积压）根因三分类修复：变异标定漂移 ×9、夹具形态差异 ×8、判定回归 ×0——断言语义零放宽（详见 `agent-out/v119/e5-report.md`）。
+
+### Deferred
+
+- 动态自环独立标记（`kind:"recursion"`）契约扩展提案与旧 P2 债「调用图禁自环导致递归无法表达」的闭环方案（契约层 + 检查 16 扩语义 + 负向 6 例设计）：`agent-out/v119/recursion-contract-proposal.md`，**待拍板**。
+
 ## [1.18.1] — 2026-09-16
 
 缺陷修复批次：修 `analyze_structure.py` 的 **facts 行号误锚**——紧邻声明的行首预处理指令行（`#else`/`#endif`/`#ifdef`…）会被当成符号定义起点。该缺陷由幻觉率实验移交（`agent-out/hallucination-rate/results.md` §4.4：Arm B 唯一一条 off 即 facts 缺陷传导——模型忠实照抄 facts 的 94 行，真实定义在 95 行）。**facts 行号可信度是「事实不漂移」主张的地基**，故单开补丁版。

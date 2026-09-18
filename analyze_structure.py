@@ -2796,6 +2796,9 @@ def main(argv):
     # 其余首参（含 mapx 等伪造名）按仓库路径处理——v1 命令行不破坏（AC-38）。
     if len(argv) > 1 and argv[1] in QUERY_COMMANDS:
         return run_query(argv)
+    # v1.19 E3：构建卡/复刻线/对齐三子命令（SPEC-v119 §2.1-2.3）
+    if len(argv) > 1 and argv[1] in E3_COMMANDS:
+        return run_e3_command(argv)
     if len(argv) > 1 and argv[1] == 'analyze':
         argv = [argv[0]] + argv[2:]
         if len(argv) == 1:
@@ -3704,6 +3707,911 @@ def run_selftest():
         return 2
     return subprocess.run([sys.executable, test_path]).returncode
 
+
+# ---------------------------------------------------------------- 构建卡 / 复刻线 / 对齐三子命令（v1.19 E3）
+#
+# 移植自 v1.19 实验（agent-out/v19-exp/tools/{makefile_build,build_card,
+# rebuild_path,align_gate}.py 的行为闭集），对齐本文件 CLI 惯例：手工 argv
+# 解析（不引 argparse）、exit 0=完成 / 1=数据响亮失败 / 2=用法错误、JSON
+# sort_keys+ensure_ascii+尾换行、输出全 ASCII、同输入双跑逐字节确定。
+# 契约源：agent-out/v119/SPEC-v119.md §2.1-2.3；schema：build-card-v1 /
+# rebuild-path-v1.1（order 条目 kind:module|scc）/ align-v2（edge_measured）。
+
+E3_COMMANDS = ('buildcard', 'rebuildpath', 'align')
+
+# GNU make 的 makefile 探测顺序：依次取仓库根下第一个存在的文件名
+MAKEFILE_CANDIDATES = ('GNUmakefile', 'makefile', 'Makefile')
+
+# align-v2 edge_measured 的证据等级口径（用户钉死：边级实测唯一合法升级路径）
+EDGE_MEASURED_CALIBER = 'edge-level call-event evidence'
+
+
+def _e3_parse(argv, val_opts, flag_opts):
+    """run_query 同款手工解析（F8 惯例）。返回 (flags, pos, err_message|None)。"""
+    flags = []
+    pos = []
+    i = 2
+    while i < len(argv):
+        a = argv[i]
+        if a in val_opts:
+            if i + 1 >= len(argv):
+                return None, None, 'option needs a value: %s' % a
+            val_opts[a] = argv[i + 1]
+            i += 2
+        elif a.startswith('-') and len(a) > 1:
+            if a not in flag_opts:
+                return None, None, 'unknown option: %s' % a
+            flags.append(a)
+            i += 1
+        else:
+            pos.append(a)
+            i += 1
+    return flags, pos, None
+
+
+def _e3_fail(message, code):
+    print('[FAIL] %s' % message)
+    return code
+
+
+class MakefileSyntaxError(ValueError):
+    """Makefile 中出现「非空非注释且无规则冒号」的裸行等响亮失败。"""
+
+
+class E3DataError(ValueError):
+    """E3 子命令的数据响亮失败（facts/trace 形状不符、范围空集等）：exit 1。"""
+
+
+def _e3_write_json(path, doc):
+    with open(path, 'w', encoding='utf-8', newline='') as fh:
+        fh.write(json.dumps(doc, sort_keys=True, indent=2, ensure_ascii=True) + '\n')
+
+
+def _mk_join_continuations(text):
+    """反斜杠续行接驳：行尾奇数个反斜杠 = 续行，剥反斜杠后与下行 strip 接空格。
+
+    返回 [(首行物理行号, 逻辑行), ...]；行号保留首行位置供响亮报错定位。"""
+    joined = []
+    pending = None
+    for lineno, raw in enumerate(text.splitlines(), start=1):
+        line = raw.rstrip('\r\n')
+        if pending is not None:
+            first = pending[0]
+            line = pending[1] + ' ' + line.strip()
+            pending = None
+        else:
+            first = lineno
+        right = line.rstrip()
+        n_bs = len(right) - len(right.rstrip('\\'))
+        if n_bs % 2 == 1:
+            pending = (first, right[:-1].rstrip())
+            continue
+        joined.append((first, line))
+    if pending is not None:
+        joined.append((pending[0], pending[1]))
+    return joined
+
+
+def _mk_strip_comment(line):
+    """剥未转义的 '#' 注释（'\\#' 转义不剥）；配方行不进此函数。"""
+    out = []
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if ch == '\\' and i + 1 < len(line):
+            out.append(line[i:i + 2])
+            i += 2
+            continue
+        if ch == '#':
+            break
+        out.append(ch)
+        i += 1
+    return ''.join(out)
+
+
+_MAKEFILE_ASSIGN_RE = re.compile(
+    r'^(?P<name>[^:#=\t]+?)\s*(?P<op>::=|:=|\+=|\?=|=)(?!=)\s*(?P<rest>.*)$')
+_MAKEFILE_INCLUDE_RE = re.compile(r'^(?:-{1,2})?s?include\b\s*(?P<rest>.*)$')
+_MAKEFILE_PHONY_RE = re.compile(r'^\.PHONY\s*:(?P<rest>.*)$')
+_MAKEFILE_RULE_RE = re.compile(r'^(?P<lhs>[^=]+?):(?P<rhs>.*)$')
+
+
+def parse_makefile_text(text, source='Makefile'):
+    """Makefile 文本 -> {'targets': [...], 'notes': [...]}（E1 行为闭集移植）。
+
+    targets 保持首次出现顺序，条目 {name, deps, phony, tool_hint}；$(VAR) 一律
+    保真不展开；TAB 开头行为配方，tool_hint = 首条配方首词（无配方为 None）。
+    非空非注释且缺规则冒号的裸行 -> MakefileSyntaxError（响亮失败带 source:line）。"""
+    notes = []
+    targets = {}
+    order = []
+    phony = set()
+    n_assign = 0
+    last_rule = None
+
+    def ensure(name):
+        if name not in targets:
+            targets[name] = {'name': name, 'deps': [], 'phony': False,
+                             'tool_hint': None, '_recipe_seen': False}
+            order.append(name)
+        return targets[name]
+
+    for lineno, line in _mk_join_continuations(text):
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
+            continue
+        if line.startswith('\t'):
+            if last_rule is None:
+                raise MakefileSyntaxError(
+                    '%s:%d: recipe line outside any rule: %r'
+                    % (source, lineno, stripped[:60]))
+            t0 = targets[last_rule[0]]
+            if not t0['_recipe_seen']:
+                t0['tool_hint'] = stripped.split()[0]
+                t0['_recipe_seen'] = True
+            continue
+        content = _mk_strip_comment(line).strip()
+        if not content:
+            continue
+        m = _MAKEFILE_INCLUDE_RE.match(content)
+        if m:
+            notes.append('include ignored (not followed): %s'
+                         % m.group('rest').strip()[:80])
+            continue
+        if _MAKEFILE_PHONY_RE.match(content) is None \
+                and _MAKEFILE_ASSIGN_RE.match(content):
+            n_assign += 1
+            continue
+        m = _MAKEFILE_PHONY_RE.match(content)
+        if m:
+            phony.update(m.group('rest').split())
+            continue
+        m = _MAKEFILE_RULE_RE.match(content)
+        if m:
+            names = m.group('lhs').split()
+            deps = m.group('rhs').split()
+            for name in names:
+                tgt = ensure(name)
+                for dep in deps:
+                    if dep not in tgt['deps']:
+                        tgt['deps'].append(dep)
+            last_rule = names
+            continue
+        raise MakefileSyntaxError(
+            '%s:%d: non-empty non-comment line without a rule colon: %r'
+            % (source, lineno, stripped[:60]))
+
+    for name in order:
+        targets[name]['phony'] = name in phony
+    out_targets = [{'name': t['name'], 'deps': t['deps'], 'phony': t['phony'],
+                    'tool_hint': t['tool_hint']} for t in (targets[n] for n in order)]
+    if n_assign:
+        notes.append('%d variable assignment line(s) ignored (no expansion, per spec)'
+                     % n_assign)
+    return {'targets': out_targets, 'notes': notes}
+def scan_pyproject_script_tables(text):
+    """pyproject 的正则段扫描（E1 移植；段集用本文件 PYPROJECT_SCRIPT_SECTIONS）。
+
+    返回 (scripts dict, notes)。同键碰撞取先者并记 notes；值剥一层引号保字符串。"""
+    scripts = {}
+    notes = []
+    current = None
+    section_re = re.compile(r'^\s*\[(?P<sec>[^\]]+)\]\s*$')
+    keyval_re = re.compile(r'^(?P<key>[A-Za-z0-9_.\-]+)\s*=\s*(?P<val>.+?)\s*$')
+    for line in text.splitlines():
+        m = section_re.match(line)
+        if m:
+            current = m.group('sec').strip()
+            continue
+        if current in PYPROJECT_SCRIPT_SECTIONS:
+            m = keyval_re.match(line)
+            if m:
+                key, val = m.group('key'), m.group('val').strip()
+                if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                    val = val[1:-1]
+                if key in scripts:
+                    notes.append('pyproject script key collision kept first: %s' % key)
+                else:
+                    scripts[key] = val
+    for sec in PYPROJECT_SCRIPT_SECTIONS:
+        notes.append('pyproject section scanned by regex (no TOML lib): [%s]' % sec)
+    return scripts, notes
+
+
+def build_card(repo_root):
+    """build-card-v1 装配（SPEC-v119 §2.1）。repo_root 必须是已存在的目录。
+
+    范围 = 仓库根一层（GNU make 探测序取首个 makefile；METADATA_BASENAMES 闭集
+    内逐个探测）。package.json 解析失败不响亮失败（卡是清单不是门）：记 notes 跳过。
+    确定性：所有列表构造顺序固定，无集合迭代入序。"""
+    notes = []
+    systems = []
+    mk_seen = None
+    for name in MAKEFILE_CANDIDATES:
+        path = os.path.join(repo_root, name)
+        if os.path.isfile(path):
+            mk_seen = (name, path)
+            break
+    mk_names = None
+    if mk_seen is not None:
+        with open(mk_seen[1], 'r', encoding='utf-8-sig', errors='replace',
+                  newline='') as fh:
+            parsed = parse_makefile_text(fh.read(), source=mk_seen[0])
+        mk_names = [t['name'] for t in parsed['targets']]
+        systems.append({'kind': 'makefile', 'file': mk_seen[0],
+                        'targets': parsed['targets']})
+        notes.extend(parsed['notes'])
+    else:
+        notes.append('no makefile at repo root (probed %s)'
+                     % ', '.join(MAKEFILE_CANDIDATES))
+    npm_scripts = None
+    pkg_path = os.path.join(repo_root, 'package.json')
+    if os.path.isfile(pkg_path):
+        try:
+            with open(pkg_path, 'r', encoding='utf-8-sig', errors='replace') as fh:
+                manifest = json.load(fh)
+        except (OSError, ValueError) as exc:
+            notes.append('package.json present but unreadable, skipped (%s)'
+                         % type(exc).__name__)
+            manifest = None
+        if isinstance(manifest, dict):
+            npm_scripts = manifest.get('scripts')
+            if not isinstance(npm_scripts, dict):
+                npm_scripts = {}
+            systems.append({'kind': 'npm', 'file': 'package.json',
+                            'scripts': npm_scripts})
+    py_path = os.path.join(repo_root, 'pyproject.toml')
+    if os.path.isfile(py_path):
+        with open(py_path, 'r', encoding='utf-8-sig', errors='replace',
+                  newline='') as fh:
+            py_scripts, py_notes = scan_pyproject_script_tables(fh.read())
+        systems.append({'kind': 'pyproject', 'file': 'pyproject.toml',
+                        'scripts': py_scripts})
+        notes.extend(py_notes)
+    for base in sorted(METADATA_BASENAMES):
+        if base in ('package.json', 'pyproject.toml'):
+            continue
+        if os.path.isfile(os.path.join(repo_root, base)):
+            notes.append('metadata detected, no parser in the v1 closed set: %s' % base)
+
+    test_commands = []
+    if mk_names is not None and 'test' in mk_names:
+        test_commands.append('make test')
+        notes.append('test_commands is inferred: makefile has a %r target' % 'test')
+    if npm_scripts is not None and 'test' in npm_scripts:
+        test_commands.append('npm test')
+        notes.append('test_commands is inferred: package.json has scripts.test')
+    if not test_commands:
+        notes.append('test_commands empty: no makefile %r target and no npm scripts.test'
+                     % 'test')
+    notes.append('test_commands are inferred, not executed; run_commands left empty '
+                 '(no inference rule in spec)')
+    return {'schema': 'build-card-v1',
+            'repo': os.path.basename(os.path.abspath(repo_root)) or repo_root,
+            'systems': systems, 'test_commands': test_commands,
+            'run_commands': [], 'notes': notes}
+
+
+def render_build_card_md(card):
+    """build-card.md 人读渲染（全 ASCII；确定性）。"""
+    out = ['# build card: %s' % card['repo'], '']
+    out.append('- schema: %s' % card['schema'])
+    out.append('- test_commands: %s'
+               % ('; '.join(card['test_commands']) or '(none inferred)'))
+    for system in card['systems']:
+        out.append('')
+        out.append('## system %s (%s)' % (system['kind'], system['file']))
+        if system['kind'] == 'makefile':
+            for tgt in system['targets']:
+                out.append('- %s -> [%s]%s%s'
+                           % (tgt['name'], ', '.join(tgt['deps']),
+                              ' [phony]' if tgt['phony'] else '',
+                              ' ; first recipe word: %s' % tgt['tool_hint']
+                              if tgt['tool_hint'] else ''))
+        elif system['kind'] == 'pyproject':
+            for key in sorted(system['scripts']):
+                out.append('- %s = %s' % (key, system['scripts'][key]))
+        else:
+            for key in sorted(system['scripts']):
+                out.append('- npm run %s: %s' % (key, system['scripts'][key]))
+    out.append('')
+    out.append('## notes')
+    for note in card['notes']:
+        out.append('- %s' % note)
+    return '\n'.join(out)
+def _rp_module_of(path, pkg):
+    """facts 文件路径 -> 模块键；不在 pkg 范围返回 None。
+
+    pkg='.' 根包模式：仓库根即包，一级目录分组，根级散文件归 '(root)'。"""
+    if pkg == '.':
+        rest = path
+    else:
+        prefix = pkg + '/'
+        if not path.startswith(prefix):
+            return None
+        rest = path[len(prefix):]
+    if not rest:
+        return None
+    if '/' in rest:
+        head = rest.split('/', 1)[0]
+        return head if pkg == '.' else pkg + '/' + head
+    return '(root)' if pkg == '.' else pkg + '/(root)'
+
+
+def _rp_collect_edges(facts, pkg):
+    """跨模块边收集（E1 口径）：imports external=false 且 target 在 facts 文件集内；
+    calls 仅 confidence=verified 且 to.file 跨文件。两端都需在 pkg 范围。
+    返回 (edges[(src,dst,kind)], n_skipped_external, n_self_edges)。"""
+    known = set()
+    for rec in facts['files']:
+        if isinstance(rec, dict) and 'path' in rec:
+            known.add(rec['path'])
+    edges = []
+    skipped_external = 0
+    self_edges = 0
+    for imp in facts['imports']:
+        target = imp.get('target')
+        if imp.get('external') or not isinstance(target, str) or target not in known:
+            skipped_external += 1
+            continue
+        src, dst = _rp_module_of(imp.get('file'), pkg), _rp_module_of(target, pkg)
+        if src is None or dst is None:
+            continue
+        if src == dst:
+            self_edges += 1
+            continue
+        edges.append((src, dst, 'imports'))
+    for call in facts['calls']:
+        to = call.get('to')
+        if call.get('confidence') != CONF_VERIFIED or not isinstance(to, dict):
+            continue
+        callee_file = to.get('file')
+        if not isinstance(callee_file, str) or callee_file not in known:
+            continue
+        if callee_file == call.get('file'):
+            continue
+        src, dst = _rp_module_of(call.get('file'), pkg), _rp_module_of(callee_file, pkg)
+        if src is None or dst is None:
+            continue
+        if src == dst:
+            self_edges += 1
+            continue
+        edges.append((src, dst, 'calls'))
+    return edges, skipped_external, self_edges
+
+
+def _rp_tarjan_scc(nodes, adj):
+    """迭代式 Tarjan（确定性：邻接表按 sorted 顺序探索）。返回 SCC 成员列表的列表。"""
+    index_of = {}
+    low = {}
+    on_stack = set()
+    stack = []
+    sccs = []
+    counter = [0]
+    for root in sorted(nodes):
+        if root in index_of:
+            continue
+        work = [(root, 0)]
+        while work:
+            node, pi = work[-1]
+            if pi == 0:
+                index_of[node] = low[node] = counter[0]
+                counter[0] += 1
+                stack.append(node)
+                on_stack.add(node)
+            recurse = False
+            neighbors = adj.get(node, ())
+            while pi < len(neighbors):
+                nxt = neighbors[pi]
+                pi += 1
+                work[-1] = (node, pi)
+                if nxt not in index_of:
+                    work.append((nxt, 0))
+                    recurse = True
+                    break
+                if nxt in on_stack:
+                    low[node] = min(low[node], index_of[nxt])
+            if recurse:
+                continue
+            if pi >= len(neighbors):
+                work.pop()
+                if work:
+                    parent = work[-1][0]
+                    low[parent] = min(low[parent], low[node])
+                if low[node] == index_of[node]:
+                    members = []
+                    while True:
+                        w = stack.pop()
+                        on_stack.discard(w)
+                        members.append(w)
+                        if w == node:
+                            break
+                    sccs.append(sorted(members))
+        # root 迭代结束
+    return sccs
+
+
+def build_rebuild_path(facts, pkg):
+    """rebuild-path-v1.1（SPEC-v119 §2.2）。环以 SCC 块呈现：任一 scc size>1
+    => topology_valid=false。排序 = SCC 缩点后 Kahn，被依赖多者优先、字典序破平。"""
+    pkg = (pkg or '.').rstrip('/') or '.'
+    edges, skipped_external, self_edges = _rp_collect_edges(facts, pkg)
+    modules = {}
+    for rec in facts['files']:
+        if isinstance(rec, dict) and 'path' in rec:
+            mod = _rp_module_of(rec['path'], pkg)
+            if mod is not None:
+                modules[mod] = modules.get(mod, 0) + 1
+    if not modules:
+        raise E3DataError('no facts file under pkg=%r; pass --pkg <dir> or "." '
+                          'for root-package repos' % pkg)
+    ev_imp = dict((m, 0) for m in modules)
+    ev_call = dict((m, 0) for m in modules)
+    depends = dict((m, set()) for m in modules)
+    depended_by = dict((m, set()) for m in modules)
+    for src, dst, kind in edges:
+        ev_imp[src] += 1 if kind == 'imports' else 0
+        ev_call[src] += 1 if kind == 'calls' else 0
+        depends[src].add(dst)
+        depended_by[dst].add(src)
+    # SCC（环块）：按前驱->依赖方向建邻接（src 依赖 dst，环检测在依赖图上）
+    adj = {}
+    for src, dst, _kind in edges:
+        adj.setdefault(src, [])
+        adj[src].append(dst)
+    scc_list = [m for m in _rp_tarjan_scc(sorted(modules), adj)]
+    members_of = {}
+    block_of = {}
+    for members in scc_list:
+        key = members[0]
+        members_of[key] = list(members)
+        for m in members:
+            block_of[m] = key
+    block_depends = {}
+    block_depended_by = {}
+    block_keys = sorted(members_of)
+    for key in block_keys:
+        block_depends[key] = set()
+        block_depended_by[key] = set()
+    for src, dst, _kind in edges:
+        bs, bd = block_of[src], block_of[dst]
+        if bs == bd:
+            continue
+        block_depends[bs].add(bd)
+        block_depended_by[bd].add(bs)
+    emitted = set()
+    remaining = set(block_keys)
+    order_entries = []
+    step = 0
+    while remaining:
+        ready = [k for k in remaining if block_depends[k] <= emitted]
+        if not ready:
+            raise E3DataError('internal: condensation graph unexpectedly cyclic')
+        pick = min(ready, key=lambda k: (-len(block_depended_by[k]), k))
+        emitted.add(pick)
+        remaining.discard(pick)
+        step += 1
+        members = members_of[pick]
+        prereq_members = set()
+        for dep_key in block_depends[pick]:
+            prereq_members.update(members_of[dep_key])
+        evidence = 'imports:%d calls:%d' % (
+            sum(ev_imp[m] for m in members), sum(ev_call[m] for m in members))
+        if len(members) > 1:
+            order_entries.append({'kind': 'scc', 'step': step,
+                                  'modules': members,
+                                  'depends_on': sorted(prereq_members),
+                                  'evidence': evidence})
+        else:
+            order_entries.append({'kind': 'module', 'step': step,
+                                  'module': members[0],
+                                  'depends_on': sorted(prereq_members),
+                                  'evidence': evidence})
+    step_of_block = {}
+    for entry in order_entries:
+        members = entry['modules'] if entry['kind'] == 'scc' else [entry['module']]
+        for m in members:
+            step_of_block[m] = entry['step']
+    # 拓扑合法复核：任一跨模块边（src 依赖 dst）要求 step(dst) < step(src)，
+    # 且任一 scc 块 size>1 即直接不合法（SPEC-v119 §2.2 钉死）。
+    topo_valid = all(len(members_of[k]) == 1 for k in block_keys)
+    if topo_valid:
+        for src, dst, _kind in edges:
+            if step_of_block.get(dst, 0) >= step_of_block.get(src, 0):
+                topo_valid = False
+                break
+    cross_pairs = set((s, d) for s, d, _k in edges)
+    uncovered = sorted(m for m in modules
+                       if not any(m in pair for pair in cross_pairs))
+    notes = [
+        'module granularity: first-level dir under pkg=%s%s; loose files -> %s'
+        % (pkg, '' if pkg != '.' else ' (root-package mode: repo root is the pkg)',
+           '(root)'),
+        'order rule: SCC condensation then Kahn, most-depended-on first, '
+        'lexicographic tie-break (stable, not unique)',
+        'scc semantics: a cycle block is emitted as one kind=scc entry with its '
+        'member modules sorted; any scc with size>1 forces topology_valid=false',
+        'evidence counts = edges originating from the member modules inside pkg '
+        'scope (intra-module included; calls counted only when verified)',
+        'uncovered = modules with no cross-module edge inside pkg scope',
+        'imports resolution: external=false AND target in facts files[] '
+        '(%d skipped); intra-module/self edges excluded from ordering (%d)'
+        % (skipped_external, self_edges),
+    ]
+    return {'schema': 'rebuild-path-v1.1',
+            'repo': facts.get('root_name') or facts.get('repo') or '',
+            'pkg': pkg,
+            'order': order_entries,
+            'coverage': {'modules_total': len(modules),
+                         'modules_covered': len(modules) - len(uncovered),
+                         'uncovered': uncovered},
+            'topology_valid': topo_valid,
+            'notes': notes}
+
+
+def render_rebuild_path_md(doc):
+    out = ['# rebuild path: %s (pkg=%s)' % (doc['repo'], doc['pkg']), '']
+    out.append('- schema: %s' % doc['schema'])
+    out.append('- topology_valid: %s' % doc['topology_valid'])
+    cov = doc['coverage']
+    out.append('- modules: %d total / %d covered / uncovered: %s'
+               % (cov['modules_total'], cov['modules_covered'],
+                  ', '.join(cov['uncovered']) or '(none)'))
+    for entry in doc['order']:
+        head = '%2d. [%s] %s' % (entry['step'], entry['kind'],
+                                 ' + '.join(entry.get('modules', []))
+                                 or entry.get('module', ''))
+        out.append('%s | deps: %s | %s'
+                   % (head, ', '.join(entry['depends_on']) or '-', entry['evidence']))
+    return '\n'.join(out)
+TRACE_SCHEMAS = ('trace-facts-v1', 'trace-facts-v2')
+
+
+def load_trace(path):
+    """读 trace JSON（E4 产物或实验版）。返回 (trace|None, err|None)。
+
+    v1（仅行覆盖，node 臂）/ v2（含 edges 边级 call 事件）都收；v2 缺 edges 键
+    按空表处理并在 notes 里声明。行号表归一为升序去重。"""
+    if not os.path.isfile(path):
+        return None, 'trace file not found: %s' % path
+    try:
+        with open(path, 'r', encoding='utf-8') as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as exc:
+        return None, 'cannot read trace (%s): %r' % (path, exc)
+    if not isinstance(data, dict) or data.get('schema') not in TRACE_SCHEMAS:
+        got = data.get('schema') if isinstance(data, dict) else type(data).__name__
+        return None, ('trace schema mismatch: expected one of %s, got %r'
+                      % ('/'.join(TRACE_SCHEMAS), got))
+    files = data.get('files')
+    if not isinstance(files, dict):
+        return None, 'trace.files missing or not an object'
+    norm = {}
+    for fpath, lines in files.items():
+        if not isinstance(lines, list):
+            return None, 'trace.files[%r] is not a line list' % fpath
+        try:
+            norm[fpath] = sorted(set(int(n) for n in lines))
+        except (TypeError, ValueError):
+            return None, 'trace.files[%r] contains a non-integer line' % fpath
+    data = dict(data)
+    data['files'] = norm
+    raw_edges = data.get('edges')
+    if raw_edges is None:
+        data['edges'] = []
+        data.setdefault('notes', [])
+        if isinstance(data['notes'], list):
+            data['notes'].append('edges key absent: treated as empty (line-level '
+                                 'trace only)')
+        else:
+            data['notes'] = ['edges key absent: treated as empty (line-level '
+                             'trace only)']
+    elif not isinstance(raw_edges, list):
+        return None, 'trace.edges is not a list'
+    return data, None
+
+
+def _align_module_of(path, pkg):
+    """align 的模块键：pkg='.' 根包模式时**全部文件单归 '(root)'**（实验版口径）；
+    前缀模式下与 rebuildpath 同规则。"""
+    if pkg == '.':
+        return '(root)'
+    return _rp_module_of(path, pkg)
+
+
+def build_align(trace, facts, pkg):
+    """align-v2（SPEC-v119 §2.3）。字段闭集 = align-v1 只增不改。
+
+    trace.edges 非空（python 臂）：facts 推断调用（带可解析单目标 to）与边级
+    call 事件按 caller/callee 文件:行精确配对 -> edge_measured（边级实测口径）。
+    edges 为空（node 臂）：仅 edge_upgrade_candidates（行级共执行，永不升档）。"""
+    pkg = (pkg or '.').rstrip('/') or '.'
+    notes = []
+    fmeta = {}
+    for rec in facts['files']:
+        if isinstance(rec, dict) and 'path' in rec:
+            fmeta[rec['path']] = int(rec.get('lines') or 0)
+    trace_files = trace['files']
+    known = set(fmeta)
+    root_mode = pkg == '.'
+
+    per_mod = {}
+    total_lines = 0
+    hit_lines = 0
+    for fpath in sorted(known):
+        if not root_mode and not fpath.startswith(pkg + '/'):
+            continue
+        lines = fmeta[fpath]
+        hitset = [n for n in trace_files.get(fpath, ())
+                  if isinstance(n, int) and 1 <= n <= lines]
+        mod = _align_module_of(fpath, pkg)
+        agg = per_mod.setdefault(mod, {'total': 0, 'hit': 0})
+        agg['total'] += lines
+        agg['hit'] += len(hitset)
+        total_lines += lines
+        hit_lines += len(hitset)
+    per_module = [{'module': m, 'total': v['total'], 'hit': v['hit'],
+                   'ratio': (round(v['hit'] / v['total'], 6)
+                             if v['total'] else 0.0)}
+                  for m, v in sorted(per_mod.items())]
+    ratio = round(hit_lines / total_lines, 6) if total_lines else 0.0
+    if total_lines == 0:
+        raise E3DataError('no facts file under pkg=%r; pass --pkg <dir> or "." '
+                          'for root-package repos' % pkg)
+
+    touched = any(trace_files.get(p) for p in known)
+    if not touched:
+        notes.append('WARNING: trace and facts are completely disjoint (0 hit '
+                     'lines) -- check path convention or trace collection')
+
+    missing = [{'file': f, 'hit_lines': len(ls),
+                'note': 'trace hit but facts files[] has no such entry '
+                        '(possible facts extraction miss)'}
+               for f, ls in sorted(trace_files.items()) if f not in known]
+
+    trace_edges = trace.get('edges') or []
+    edge_set = set()
+    for idx, e in enumerate(trace_edges):
+        if not isinstance(e, dict) or not isinstance(e.get('caller_line'), int) \
+                or not isinstance(e.get('callee_line'), int):
+            raise E3DataError('trace.edges[%d] is malformed (need caller_file/'
+                              'caller_line/callee_file/callee_line ints)' % idx)
+        edge_set.add((e.get('caller_file'), e['caller_line'],
+                      e.get('callee_file'), e['callee_line']))
+
+    cand_total = 0
+    cand_samples = []
+    if trace_edges:
+        # 自环形态普查（ORG 2026-09-18 钉死三不要求之三「不静默丢弃」）：
+        # 同文件/严格自环只是证据形态，不是调用图禁自环契约的违规，
+        # 计数如实入 notes；配对逻辑对其零特判。
+        same_file = sum(1 for e in trace_edges
+                        if e.get('caller_file') == e.get('callee_file'))
+        strict_self = sum(1 for e in trace_edges
+                          if e.get('caller_file') == e.get('callee_file')
+                          and e['caller_line'] == e['callee_line'])
+        notes.append('call events: %d total, %d same-file, %d strict self-loop '
+                     '(self-loop shapes are evidence, not contract violations)'
+                     % (len(trace_edges), same_file, strict_self))
+    for call in facts['calls']:
+        if call.get('confidence') != CONF_INFERRED:
+            continue
+        to = call.get('to')
+        if not isinstance(to, dict):
+            continue
+        caller_line, callee_line = call.get('line'), to.get('start_line')
+        if not isinstance(caller_line, int) or not isinstance(callee_line, int):
+            continue
+        if caller_line in trace_files.get(call.get('file'), ()) and \
+                callee_line in trace_files.get(to.get('file'), ()):
+            cand_total += 1
+            if len(cand_samples) < 10:
+                cand_samples.append('%s@%s:%d -> %s@%s:%d'
+                                    % (call.get('caller') or '(module)',
+                                       call.get('file'), caller_line,
+                                       call.get('callee'), to.get('file'),
+                                       callee_line))
+
+    doc = {'schema': 'align-v2',
+           'repo': trace.get('repo') or facts.get('root_name') or '',
+           'coverage': {'pkg_dir': pkg, 'total_lines': total_lines,
+                        'hit_lines': hit_lines, 'ratio': ratio,
+                        'per_module': per_module},
+           'missing_in_facts': missing,
+           'edge_upgrade_candidates': {'total': cand_total,
+                                       'samples': cand_samples},
+           'notes': notes}
+    if trace_edges:
+        meas_total = 0
+        meas_samples = []
+        for call in facts['calls']:
+            if call.get('confidence') != CONF_INFERRED:
+                continue
+            to = call.get('to')
+            if not isinstance(to, dict):
+                continue
+            key = (call.get('file'), call.get('line'),
+                   to.get('file'), to.get('start_line'))
+            if key in edge_set:
+                meas_total += 1
+                if len(meas_samples) < 10:
+                    meas_samples.append('%s@%s:%d -> %s@%s:%d'
+                                        % (call.get('caller') or '(module)',
+                                           key[0], key[1], call.get('callee'),
+                                           key[2], key[3]))
+        doc['edge_measured'] = {'total': meas_total, 'samples': meas_samples,
+                                'caliber': EDGE_MEASURED_CALIBER}
+        notes.append('edge_measured pairs facts inferred calls with trace-facts-v2 '
+                     'call events by exact caller/callee file:line; caliber=%r '
+                     '(the only legal path from co-execution to edge-level '
+                     'measurement)' % EDGE_MEASURED_CALIBER)
+    else:
+        notes.append('trace has no edges (line-level trace): edge_measured omitted; '
+                     'edge_upgrade_candidates is co-execution evidence only and '
+                     'never upgrades an edge (caliber: line-level, not edge-level)')
+    if root_mode:
+        notes.append('root-package mode: --pkg %r puts ALL facts files in scope '
+                     'under the single module %r' % (pkg, '(root)'))
+    notes.append('total_lines = facts files[].lines (physical lines); hit = '
+                 '|trace line-set INTERSECT [1..lines]|; same source both sides')
+    return doc
+
+
+def render_align_md(doc):
+    out = ['# align: %s (pkg=%s)' % (doc['repo'], doc['coverage']['pkg_dir']), '']
+    cov = doc['coverage']
+    out.append('- schema: %s' % doc['schema'])
+    out.append('- coverage: %d/%d lines (%.4f)' % (cov['hit_lines'],
+                                                   cov['total_lines'], cov['ratio']))
+    for m in cov['per_module']:
+        out.append('  - %s: %d/%d (%.4f)' % (m['module'], m['hit'],
+                                             m['total'], m['ratio']))
+    out.append('- missing_in_facts: %d' % len(doc['missing_in_facts']))
+    for m in doc['missing_in_facts']:
+        out.append('  - %s (%d hit lines)' % (m['file'], m['hit_lines']))
+    cand = doc['edge_upgrade_candidates']
+    out.append('- edge_upgrade_candidates (co-execution, never upgrades): %d'
+               % cand['total'])
+    for s in cand['samples']:
+        out.append('  - %s' % s)
+    if 'edge_measured' in doc:
+        meas = doc['edge_measured']
+        out.append('- edge_measured (%s): %d' % (meas['caliber'], meas['total']))
+        for s in meas['samples']:
+            out.append('  - %s' % s)
+    return '\n'.join(out)
+def _run_buildcard(argv):
+    """buildcard <repo> [--outdir DIR] [--quiet]（SPEC-v119 §2.1）。
+
+    exit：0=卡已写（含零系统 WARN->1 的降级情形单列）；1=Makefile 解析响亮
+    失败 / 无任何构建系统；2=用法错误。产物 build-card.json + build-card.md。"""
+    val_opts = {'--outdir': None}
+    flags, pos, err = _e3_parse(argv, val_opts, ('--quiet',))
+    if err:
+        return _e3_fail(err, 2)
+    quiet = '--quiet' in flags
+    if len(pos) != 1:
+        return _e3_fail('buildcard expects exactly one positional <repo>', 2)
+    repo = pos[0]
+    if not os.path.isdir(repo):
+        return _e3_fail('not a directory: %s' % repo, 2)
+    try:
+        card = build_card(repo)
+    except MakefileSyntaxError as exc:
+        return _e3_fail(str(exc), 1)
+    outdir = val_opts['--outdir'] or os.path.join(os.getcwd(), 'structure-facts')
+    os.makedirs(outdir, exist_ok=True)
+    json_path = os.path.join(outdir, 'build-card.json')
+    md_path = os.path.join(outdir, 'build-card.md')
+    try:
+        _e3_write_json(json_path, card)
+        with open(md_path, 'w', encoding='utf-8', newline='') as fh:
+            fh.write(render_build_card_md(card) + '\n')
+    except OSError as exc:
+        return _e3_fail('cannot write build card: %s' % exc, 1)
+    if not quiet:
+        print('[OK] repo=%s systems=%d test_commands=%d'
+              % (card['repo'], len(card['systems']), len(card['test_commands'])))
+        print('[OK] wrote %s' % json_path)
+        print('[OK] wrote %s' % md_path)
+    if not card['systems']:
+        if not quiet:
+            print('[WARN] no build system detected (card written anyway)')
+        return 1
+    return 0
+
+
+def _run_rebuildpath(argv):
+    """rebuildpath --facts F [--pkg P] [--out F] [--format md|json] [--quiet]
+    （SPEC-v119 §2.2，rebuild-path-v1.1）。缺 --pkg 视为 '.'（根包模式）。"""
+    val_opts = {'--facts': None, '--pkg': None, '--out': None, '--format': None}
+    flags, _pos, err = _e3_parse(argv, val_opts, ('--quiet',))
+    if err:
+        return _e3_fail(err, 2)
+    quiet = '--quiet' in flags
+    if not val_opts['--facts']:
+        return _e3_fail('rebuildpath needs --facts F', 2)
+    facts, facts_err = load_facts(val_opts['--facts'])
+    if facts_err is not None:
+        return _e3_fail(facts_err, 1)
+    pkg = (val_opts['--pkg'] or '.').rstrip('/') or '.'
+    try:
+        doc = build_rebuild_path(facts, pkg)
+    except E3DataError as exc:
+        return _e3_fail(str(exc), 1)
+    fmt = val_opts['--format'] or 'json'
+    if fmt not in ('md', 'json'):
+        return _e3_fail('--format must be md or json: %s' % fmt, 2)
+    if val_opts['--out']:
+        try:
+            _e3_write_json(val_opts['--out'], doc)
+        except OSError as exc:
+            return _e3_fail('cannot write rebuild path: %s' % exc, 1)
+        if not quiet:
+            print('[OK] wrote %s (blocks=%d topology_valid=%s)'
+                  % (val_opts['--out'], len(doc['order']), doc['topology_valid']))
+        return 0
+    if fmt == 'md':
+        print(render_rebuild_path_md(doc))
+    else:
+        print(json.dumps(doc, sort_keys=True, indent=2, ensure_ascii=True))
+    return 0
+
+
+def _run_align(argv):
+    """align --trace T --facts F --pkg P [--out F] [--format md|json] [--quiet]
+    （SPEC-v119 §2.3，align-v2）。"""
+    val_opts = {'--trace': None, '--facts': None, '--pkg': None,
+                '--out': None, '--format': None}
+    flags, _pos, err = _e3_parse(argv, val_opts, ('--quiet',))
+    if err:
+        return _e3_fail(err, 2)
+    quiet = '--quiet' in flags
+    if not val_opts['--trace'] or not val_opts['--facts'] or not val_opts['--pkg']:
+        return _e3_fail('align needs --trace T --facts F --pkg P', 2)
+    trace, trace_err = load_trace(val_opts['--trace'])
+    if trace_err is not None:
+        return _e3_fail(trace_err, 1)
+    facts, facts_err = load_facts(val_opts['--facts'])
+    if facts_err is not None:
+        return _e3_fail(facts_err, 1)
+    pkg = val_opts['--pkg'].rstrip('/') or '.'
+    try:
+        doc = build_align(trace, facts, pkg)
+    except E3DataError as exc:
+        return _e3_fail(str(exc), 1)
+    fmt = val_opts['--format'] or 'json'
+    if fmt not in ('md', 'json'):
+        return _e3_fail('--format must be md or json: %s' % fmt, 2)
+    if val_opts['--out']:
+        try:
+            _e3_write_json(val_opts['--out'], doc)
+        except OSError as exc:
+            return _e3_fail('cannot write align doc: %s' % exc, 1)
+        if not quiet:
+            cov = doc['coverage']
+            extra = (' edge_measured=%d' % doc['edge_measured']['total']) \
+                if 'edge_measured' in doc else ''
+            print('[OK] wrote %s (hit=%d/%d missing=%d candidates=%d%s)'
+                  % (val_opts['--out'], cov['hit_lines'], cov['total_lines'],
+                     len(doc['missing_in_facts']),
+                     doc['edge_upgrade_candidates']['total'], extra))
+        return 0
+    if fmt == 'md':
+        print(render_align_md(doc))
+    else:
+        print(json.dumps(doc, sort_keys=True, indent=2, ensure_ascii=True))
+    return 0
+
+
+def run_e3_command(argv):
+    """E3 三子命令分发（buildcard/rebuildpath/align）。argv = [prog, <cmd>, ...]。"""
+    cmd = argv[1]
+    if cmd == 'buildcard':
+        return _run_buildcard(argv)
+    if cmd == 'rebuildpath':
+        return _run_rebuildpath(argv)
+    return _run_align(argv)
 
 if __name__ == '__main__':
     sys.exit(main(sys.argv))
